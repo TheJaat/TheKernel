@@ -21,7 +21,7 @@ jmp start		; jmp after the includes
 ;; Parameters passed from the bootloader through register.
 ; EAX - Multiboot Magic
 ; EBX - Contains address of the multiboot structure, but
-;		it should be located in stack aswell.
+;		it should be located in stack as well.
 ; EDX - Contains address of the os boot structure
 start:
 	cli
