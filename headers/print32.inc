@@ -6,7 +6,7 @@ BITS 32
 %define VGA_DEFAULT_MEM_ADDR	0xb8000
 
 %define VGA_ROW		80
-%define VGA_COLOUMN	25
+%define VGA_COLUMN	25
 
 ; 80*25 Colors
 %define 		BLACK		0x0
@@ -41,10 +41,13 @@ ClearScreen32:
 	pushad		; Push the complete state
 	
 	mov esi, VGA_DEFAULT_MEM_ADDR
-	mov ecx, VGA_ROW * VGA_COLOUMN
+	mov ecx, VGA_ROW * VGA_COLUMN
 .ClearScreen32Loop:
 	mov byte [esi], ' '		; Space
-	mov byte [esi + 1], 0x07	; default color - lightgrey on black
+	mov al, bh
+	shl al, 4
+	or al, bl
+	mov byte [esi + 1], al	; default color - lightgrey on black
 	
 	add esi, 2			; Increment VGA memory pointer by 2 bytes.
 
@@ -64,33 +67,32 @@ ret
 ; 	- Conserves all the registers
 ; **************************
 PrintString32:
-	pushad		; push all 32 bit registers onto the stack
-	
-	mov ecx, VGA_ROW * VGA_COLOUMN
-	mov edi, VGA_DEFAULT_MEM_ADDR
-	
-	shl bh, 4
-	or bl, bh
-	
-.PrintString32Loop:
-	lodsb		; it reads character from the esi to al
-	test al, al
-	je .PrintString32Done
+    pushad                      ; Save all 32-bit registers onto the stack (preserving state)
+    
+    mov ecx, VGA_ROW * VGA_COLUMN    ; Set ECX to number of character cells in VGA text mode (80x25 = 2000 cells)
+    mov edi, VGA_DEFAULT_MEM_ADDR   ; Set EDI to the starting address of VGA memory (0xB8000)
 
-	;; The first byte in 80*25 ie. mode 0x3 has to be the character
-	;; followed by the color,
-	;; 	which is lower 4 bits for foreground color
-	;; 	upper 4 bits for background color
-	mov [edi], al			; Write the character
-	mov byte [edi + 1], bl;0x07	; color
-	
-	add edi, 2
-	
-	loop .PrintString32Loop
+    ; Combine background and foreground colors from BL and BH
+    shl bh, 4                       ; Shift the background color in BH to the upper 4 bits
+    or bl, bh                        ; Combine foreground color (BL) with background color (upper 4 bits from BH)
+    
+.PrintString32Loop:
+    lodsb                           ; Load the next byte (character) from the source string (ESI) into AL
+    test al, al                     ; Test if the character is NULL (end of string)
+    je .PrintString32Done           ; If it's NULL, jump to the done label
+
+    ; Write the character to the VGA memory
+    mov [edi], al                   ; Store the character (AL) at the current VGA memory address (EDI)
+    mov byte [edi + 1], bl          ; Store the color byte (BL: combined foreground and background) at the next byte
+
+    add edi, 2                      ; Move the VGA memory pointer to the next character cell (each cell is 2 bytes)
+
+    loop .PrintString32Loop         ; Repeat the loop for each character until ECX is decremented to zero
+
 .PrintString32Done:
-	
-	popad		; pop all saved 32-bit register from the stack
-ret
+    popad                           ; Restore the state of all 32-bit registers by popping from the stack
+    ret                             ; Return from the function
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 

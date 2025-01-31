@@ -59,7 +59,7 @@ $(BUILD_DIR):
 # Assemble root ASM sources
 $(BUILD_DIR)/%.o: %.asm
 	@echo "Assembling $<..."
-	$(ASM) -f elf -I $(KERNEL_INCLUDE) $< -o $@
+	$(ASM) -f elf32 -I $(KERNEL_INCLUDE) $< -o $@
 
 # Build kernel
 kernel: $(SUBDIRS) $(ROOT_OBJECTS)
@@ -77,11 +77,20 @@ kernel: $(SUBDIRS) $(ROOT_OBJECTS)
 #%.o: %.asm
 #	nasm -f elf32 -I $(BOOT_STAGE2_INCLUDE) $< -o build/$(notdir $@)
 
+grub:
+	mkdir -p iso/boot/grub
+	cp $(BUILD_DIR)/kernel.elf iso/boot/
+	cp grub.cfg iso/boot/grub/
+	grub-mkrescue -o build/TheKernel.iso iso
+	qemu-system-i386 -cdrom build/TheKernel.iso -monitor stdio
+
+
 # Clean up generated files
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf iso
 #	for dir in $(SUBDIRS); do $(MAKE) -C $$dir ROOT_DIR=$(ROOT_DIR) clean; done
 
 # Phony targets
-.PHONY: all clean $(SUBDIRS) kernel
+.PHONY: all clean $(SUBDIRS) kernel grub
 
