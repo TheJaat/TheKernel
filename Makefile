@@ -77,12 +77,14 @@ kernel: $(SUBDIRS) $(ROOT_OBJECTS)
 #%.o: %.asm
 #	nasm -f elf32 -I $(BOOT_STAGE2_INCLUDE) $< -o build/$(notdir $@)
 
+
+## Make the kernel Multiboot iso and run it
 grub:
 	mkdir -p iso/boot/grub
 	cp $(BUILD_DIR)/kernel.elf iso/boot/
 	cp grub.cfg iso/boot/grub/
-	grub-mkrescue -o build/TheKernel.iso iso
-	qemu-system-i386 -cdrom build/TheKernel.iso -monitor stdio
+	grub-mkrescue -o $(BUILD_DIR)/TheKernel.iso iso
+	qemu-system-i386 -cdrom $(BUILD_DIR)/TheKernel.iso -monitor stdio
 
 
 # Clean up generated files
