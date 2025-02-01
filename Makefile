@@ -31,7 +31,7 @@ ASM_OBJECTS := $(ASM_SOURCES:.asm=.o)
 OBJECTS := $(C_OBJECTS) $(ASM_OBJECTS)
 
 # Default target
-all: $(BUILD_DIR) kernel
+all: $(BUILD_DIR) tools increase-build kernel
 
 
 ## Generates the ELF executable type file,
@@ -77,6 +77,22 @@ kernel: $(SUBDIRS) $(ROOT_OBJECTS)
 #%.o: %.asm
 #	nasm -f elf32 -I $(BOOT_STAGE2_INCLUDE) $< -o build/$(notdir $@)
 
+tools:
+	@echo "$(GREEN)Building kernel tools...$(RESET)"
+	$(MAKE) -C tools ROOT_DIR=$(ROOT_DIR)
+
+# Just increment the build version in every build
+increase-build:
+	@echo "$(CYAN)Incrementing kernel build version...$(RESET)"
+	$(BUILD_DIR)/tools/revision/revision build gcc
+
+# Run revision tool with parameters
+## make run-revision ARGS="build gcc" // for increasing build version
+## make run-revision ARGS="major gcc"
+## make run-revision ARGS="minor gcc"
+run-revision:
+	@echo "$(CYAN)Running kernel revision tool...$(RESET)"
+	$(BUILD_DIR)/tools/revision/revision $(ARGS)
 
 ## Make the kernel Multiboot iso and run it
 grub:
@@ -94,5 +110,5 @@ clean:
 #	for dir in $(SUBDIRS); do $(MAKE) -C $$dir ROOT_DIR=$(ROOT_DIR) clean; done
 
 # Phony targets
-.PHONY: all clean $(SUBDIRS) kernel grub
+.PHONY: all clean $(SUBDIRS) kernel grub tools
 
