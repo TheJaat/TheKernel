@@ -19,6 +19,8 @@ multiboot_header:
 section .text
 global kernel_entry
 
+extern kmain
+
 
 kernel_entry:            ; Label for the kernel entry point.
     cli
@@ -55,6 +57,9 @@ start:
     ;; Print the welcome message
     mov esi, sKernelWelcomeStatement
     call PrintString32
+
+    ;; Call the kernel main
+    call kmain
 hlt
 jmp $		; Infinite loop to halt execution after printing the message.
 
