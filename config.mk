@@ -1,8 +1,11 @@
+export TOOLCHAIN_DIR=../toolchain/i686
+export PATH := $(abspath $(TOOLCHAIN_DIR))/bin:$(PATH)
+
 # Compiler and tools
 ASM = nasm
-LD = ld
-CC = gcc
-CXX = g++
+LD = i686-elf-ld
+CC = i686-elf-gcc
+CXX = i686-elf-g++
 
 # Flags
 STAGE1_ASFLAGS = -f bin
