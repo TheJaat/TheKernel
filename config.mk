@@ -2,6 +2,7 @@
 ASM = nasm
 LD = ld
 CC = gcc
+CXX = g++
 
 # Flags
 STAGE1_ASFLAGS = -f bin
@@ -10,6 +11,8 @@ LDFLAGS = -m elf_i386
 
 # GCC
 GCC_FLAGS = -m32 -fno-pie -ffreestanding -nostdlib
+
+CXX_FLAGS = -m32 -fno-pie -ffreestanding -nostdlib -fno-exceptions -fno-rtti
 
 ## Header includes
 # Common

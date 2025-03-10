@@ -51,10 +51,10 @@ $(BUILD_DIR):
 #$(SUBDIRS):
 #	$(MAKE) -C $@ ROOT_DIR=$(ROOT_DIR)
 
-# Compile root C sources
-$(BUILD_DIR)/%.o: %.c
+# Compile root C++ sources
+$(BUILD_DIR)/%.o: %.cpp
 	@echo "Compiling $<..."
-	$(CC) -m32 -c $< -o $@ $(CFLAGS) $(INCLUDES) -I $(KERNEL_INCLUDE)
+	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I $(KERNEL_INCLUDE)
 
 # Assemble root ASM sources
 $(BUILD_DIR)/%.o: %.asm
