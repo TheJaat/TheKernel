@@ -6,7 +6,7 @@
 ### Requirements:
 - **NASM**: An assembler for x86 programs.
 - **CROSS Compiler**: x86 cross compiler.
-- **QEMU**: An emulator to test the bootloader.
+- **QEMU**: An emulator to test the kernel.
 
 ### Build Steps:
 1. Clone the repository:
