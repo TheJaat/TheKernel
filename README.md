@@ -1,5 +1,5 @@
 # TheKernel
-The Kernel for the TheTaaJ Os.
+The Kernel for the TheTaaJ OS.
 
 ## Current Status
 
