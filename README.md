@@ -2,6 +2,7 @@
 The Kernel for the TheTaaJ OS.
 
 ## Current Status
+- [x] Print welcome text
 
 ## How to Build and Run
 ### Requirements:
