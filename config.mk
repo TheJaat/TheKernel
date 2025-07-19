@@ -1,7 +1,7 @@
 # Compiler and tools
 ASM = nasm
-LD = ld
-CC = gcc
+LD = i686-elf-ld #x86_64-ld #ld
+CC = i686-elf-gcc #x86_64-elf-gcc #gcc
 
 # Flags
 STAGE1_ASFLAGS = -f bin
@@ -22,6 +22,7 @@ BOOT_STAGE2_C_INCLUDE = headers/boot/stage2/c_includes/
 BOOT_STAGE2_C_STD_INCLUDE = headers/boot/stage2/c_includes/std/
 
 KERNEL_INCLUDE = headers/
+KERNEL_LIBC = $(KERNEL_INCLUDE)/libc
 
 # Common Directories
 OUTPUT_DIR = ../../build

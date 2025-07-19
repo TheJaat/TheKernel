@@ -1,4 +1,7 @@
-void kmain() {
+#include <boot/datastructure.h>
+
+void kmain(Multiboot_t* BootInfo, BootDescriptor_t bootDescriptor) {
+    
     unsigned short* vidMem = (unsigned short*)0xb8000;
     unsigned char attribute = (1 << 4) | 15; // Blue background, white text
     

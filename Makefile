@@ -54,7 +54,7 @@ $(BUILD_DIR):
 # Compile root C sources
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling $<..."
-	$(CC) -m32 -c $< -o $@ $(CFLAGS) $(INCLUDES) -I $(KERNEL_INCLUDE)
+	$(CC) -m32 -c $< -o $@ $(CFLAGS) $(INCLUDES) -I $(KERNEL_INCLUDE) -I $(KERNEL_LIBC)
 
 # Assemble root ASM sources
 $(BUILD_DIR)/%.o: %.asm
@@ -64,7 +64,7 @@ $(BUILD_DIR)/%.o: %.asm
 # Build kernel
 kernel: $(SUBDIRS) $(ROOT_OBJECTS)
 	@echo "Linking kernel..."
-	ld $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o
+	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o
 
 #kernel.bin: $(OBJECTS)
 #	ld -m elf_i386 -Ttext 0xB000 --oformat binary -o build/$@ build/kernel_entry.o build/kernel_main.o build/idt.o build/idt_asm.o build/isr.o build/isr_asm.o build/vga.o build/kernel_utilities.o
