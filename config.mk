@@ -28,6 +28,7 @@ BOOT_STAGE2_C_INCLUDE = headers/boot/stage2/c_includes/
 BOOT_STAGE2_C_STD_INCLUDE = headers/boot/stage2/c_includes/std/
 
 KERNEL_INCLUDE = headers/
+KERNEL_LIBC = $(KERNEL_INCLUDE)/libc
 
 # Common Directories
 OUTPUT_DIR = ../../build

@@ -49,6 +49,10 @@ start:
     mov esp, 0x9F000
     mov ebp, esp
 
+    ; Place the multiboot structure and boot descriptor structure on the stack
+    push edx
+    push ebx
+
     ;; Clear the screen to white background
     mov bh, 0xf     ; White background
     mov bl, 0x0     ; Black background
