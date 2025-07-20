@@ -12,11 +12,14 @@ include $(ROOT_DIR)/config.mk
 BUILD_DIR = $(ROOT_DIR)/build
 
 # Define directories
-SUBDIRS =
+SUBDIRS = driver terminal
 
 # Define source files in the root directory
 ROOT_ASM_SOURCES = kernel_entry.asm
 ROOT_C_SOURCES = kmain.c
+
+# Collect all static libraries
+STATIC_LIBS = $(shell find $(BUILD_DIR)/lib -name '*.a' 2>/dev/null)
 
 # Define object files in the root directory
 ROOT_ASM_OBJECTS = $(ROOT_ASM_SOURCES:%.asm=$(BUILD_DIR)/%.o)
@@ -48,13 +51,13 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Recursively call make in each subdirectory
-#$(SUBDIRS):
-#	$(MAKE) -C $@ ROOT_DIR=$(ROOT_DIR)
+$(SUBDIRS):
+	$(MAKE) -C $@ ROOT_DIR=$(ROOT_DIR)
 
 # Compile root C++ sources
 $(BUILD_DIR)/%.o: %.cpp
 	@echo "Compiling $<..."
-	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I $(KERNEL_INCLUDE) -I $(KERNEL_LIBC)
+	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER)
 
 # Assemble root ASM sources
 $(BUILD_DIR)/%.o: %.asm
@@ -62,9 +65,9 @@ $(BUILD_DIR)/%.o: %.asm
 	$(ASM) -f elf32 -I $(KERNEL_INCLUDE) $< -o $@
 
 # Build kernel
-kernel: $(SUBDIRS) $(ROOT_OBJECTS)
+kernel: $(SUBDIRS) $(ROOT_OBJECTS) $(STATIC_LIBS)
 	@echo "Linking kernel..."
-	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o
+	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o $(STATIC_LIBS)
 
 #kernel.bin: $(OBJECTS)
 #	ld -m elf_i386 -Ttext 0xB000 --oformat binary -o build/$@ build/kernel_entry.o build/kernel_main.o build/idt.o build/idt_asm.o build/isr.o build/isr_asm.o build/vga.o build/kernel_utilities.o

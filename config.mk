@@ -6,6 +6,7 @@ ASM = nasm
 LD = i686-elf-ld
 CC = i686-elf-gcc
 CXX = i686-elf-g++
+AR = i686-elf-ar
 
 # Flags
 STAGE1_ASFLAGS = -f bin
@@ -14,7 +15,6 @@ LDFLAGS = -m elf_i386
 
 # GCC
 GCC_FLAGS = -m32 -fno-pie -ffreestanding -nostdlib
-
 CXX_FLAGS = -m32 -fno-pie -ffreestanding -nostdlib -fno-exceptions -fno-rtti
 
 ## Header includes
@@ -27,8 +27,9 @@ BOOT_STAGE2_ASM_INCLUDE = headers/boot/stage2/asm_includes/
 BOOT_STAGE2_C_INCLUDE = headers/boot/stage2/c_includes/
 BOOT_STAGE2_C_STD_INCLUDE = headers/boot/stage2/c_includes/std/
 
-KERNEL_INCLUDE = headers/
+KERNEL_INCLUDE = $(ROOT_DIR)/headers
 KERNEL_LIBC = $(KERNEL_INCLUDE)/libc
+KERNEL_DRIVER = $(KERNEL_INCLUDE)/driver
 
 # Common Directories
 OUTPUT_DIR = ../../build
