@@ -9,3 +9,9 @@ typedef struct {
     void (*clear)(void*, uint32_t color);
     void* context;
 } VideoDriver;
+
+enum VideoModeType {
+    VIDEO_NONE = 0x0,
+    VIDEO_TEXT = 0x1,
+    VIDEO_GRAPHICS = 0x2
+};

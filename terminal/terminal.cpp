@@ -18,10 +18,14 @@ void TerminalPutChar(Terminal* term, int ch) {
         term->cursorY += FontHeight;
     } else {
         term->driver->drawChar(term->driver->context, term->cursorX, term->cursorY, ch, term->fgColor, term->bgColor);
-        term->cursorX += FontWidth;
-        if (term->cursorX + FontWidth >= term->width) {
-            term->cursorX = 0;
-            term->cursorY += FontHeight;
+        if (term->videoModeType == VIDEO_TEXT) {
+            term->cursorX++;
+        } else {
+            term->cursorX += FontWidth;
+            if (term->cursorX + FontWidth >= term->width) {
+                term->cursorX = 0;
+                term->cursorY += FontHeight;
+            }
         }
     }
 

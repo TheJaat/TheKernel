@@ -15,8 +15,24 @@ void InitializeVideo(Multiboot_t* BootInfo) {
     int width = 80, height = 25;
 
     if (BootInfo->VbeMode == 0 || BootInfo->VbeMode == 1) {
+        // Test it by commenting two lines in the stage2.asm
+        /*
+            call VesaSetup
+            &&
+            call VesaFinish
+        */
+        static VgaContext s_vgaContext;
+        s_vgaContext.mode.frameBufferAddress = 0xb8000;
+        s_vgaContext.mode.width = 80;
+        int vgaHeight = (BootInfo->VbeMode == 1) ? 50 : 25;
+        s_vgaContext.mode.height = vgaHeight;
+        height = vgaHeight;
+        s_vgaContext.mode.fgColor = 0xF0;
+        s_vgaContext.mode.bgColor = 0;
+
+        VGA_DRIVER.context = &s_vgaContext;
+        BootTerminal.videoModeType = VIDEO_TEXT;
         driver = &VGA_DRIVER;
-        height = (BootInfo->VbeMode == 1) ? 50 : 25;
     } else {
         VbeMode_t* vbe = (VbeMode_t*)BootInfo->VbeModeInfo;
 
@@ -24,6 +40,7 @@ void InitializeVideo(Multiboot_t* BootInfo) {
         s_vbeContext.mode = *vbe;
 
         VBE_DRIVER.context = &s_vbeContext;
+        BootTerminal.videoModeType = VIDEO_GRAPHICS;
 
         driver = &VBE_DRIVER;
         width = vbe->XResolution;

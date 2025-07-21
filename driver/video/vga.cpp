@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <video/vga.h>
 
 #define VGA_WIDTH 80;
@@ -29,4 +30,13 @@ void VgaClearScreen(unsigned char color) {
 			vgaMem[index] = blank;
 		}
 	}
+}
+
+void VgaDrawCharacter(VgaContext* ctx, int character, unsigned cursorX, unsigned cursorY, uint8_t color) {
+	uint16_t* video = nullptr;
+	uint16_t Data = ((uint16_t)color << 8) | (uint8_t)(character & 0xFF);
+
+	video = (uint16_t*)ctx->mode.frameBufferAddress + (cursorY + ctx->mode.width + cursorX);
+
+	*video = Data;
 }
