@@ -4,11 +4,11 @@
 #define _KERNEL_REVISION_H_
 
 #define BUILD_DATE "21 July 2025"
-#define BUILD_TIME "17:45:44"
+#define BUILD_TIME "17:55:45"
 
 #define BUILD_SYSTEM "gcc"
 #define REVISION_MAJOR 0
 #define REVISION_MINOR 2
-#define REVISION_BUILD 28
+#define REVISION_BUILD 30
 
 #endif //!_KERNEL_REVISION_H_

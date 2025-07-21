@@ -16,6 +16,7 @@ void InitializeVideo(Multiboot_t* BootInfo) {
 
     if (BootInfo->VbeMode == 0 || BootInfo->VbeMode == 1) {
         // Test it by commenting two lines in the stage2.asm
+        // Note: Comment Both because VbeMode is set in the VesaSetup function
         /*
             call VesaSetup
             &&

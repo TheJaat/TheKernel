@@ -13,7 +13,7 @@ SUBDIRS =
 # Define source files
 ASM_SOURCES =
 C_SOURCES =
-CPP_SOURCES = font8x16.cpp init_video.cpp vbe.cpp vbe_driver.cpp vga.cpp vga_driver.cpp
+CPP_SOURCES = init_video.cpp vbe.cpp vbe_driver.cpp vga.cpp vga_driver.cpp
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
 LIB_NAME := lib$(subst /,_,$(REL_DIR)).a

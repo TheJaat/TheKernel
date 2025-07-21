@@ -12,7 +12,7 @@ SUBDIRS = # Add your subdirectories here if any
 
 # Define source files
 C_SOURCES =
-CPP_SOURCES = terminal.cpp
+CPP_SOURCES = terminal.cpp font8x16.cpp
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
 LIB_NAME := lib$(subst /,_,$(REL_DIR)).a
