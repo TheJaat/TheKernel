@@ -2,7 +2,7 @@
 The Kernel for the TheTaaJ OS.
 
 ## Current Status
-- [x] Print welcome text
+- [x] Modular and scalable Logging Terminal
 
 ## How to Build and Run
 ### Requirements:
