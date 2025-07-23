@@ -1,5 +1,5 @@
 # TheKernel
-The Kernel for the TheTaaJ OS.
+The Kernel for the `TheTaaJ` OS.
 
 ## Current Status
 - [x] Modular and scalable Logging Terminal
