@@ -4,6 +4,9 @@ The Kernel for the `TheTaaJ` OS.
 ## Current Status
 - [x] Video Terminal
 
+## TODO
+- POSIX Complaint Kernel
+
 ## How to Build and Run
 ### Requirements:
 - **NASM**: An assembler for x86 programs.
