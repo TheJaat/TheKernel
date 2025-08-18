@@ -24,6 +24,8 @@
 #endif
 #endif
 
+#define offsetof(type, member) ((size_t)&(((type *)0)->member))
+
  /*
  * For C++: NULL might be defined as 0 because C++ supports 0 as a null pointer constant.
  * For C: NULL is typically defined as '(void*)0' to ensure that it is treated as a

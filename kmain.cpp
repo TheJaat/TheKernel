@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <system/log.h>
 
+// GDT
+#include <arch/x86/x32/gdt.h>
+
 BootInfo_t x86BootInfo;
 
 const char* kernelInfo = "TheTaaJKernel Version 0.0.1, Author: TheJat";
@@ -43,6 +46,10 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     for(int i = 1; i < 60; i++) {
         LogDebug("kmain", "i = %d", i);
     }
+
+    // Initialize the GDT
+	GdtInitialize();
+
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 
     

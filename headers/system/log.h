@@ -35,6 +35,11 @@ typedef enum LogLevel
 #define LOG_TYPE_DEBUG				0x02
 #define LOG_TYPE_FATAL				0x03
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Functions
 void LogInit(void);
 // void LogUpgrade(size_t Size);
@@ -47,5 +52,9 @@ void LogRaw(const char *Message, ...);
 void LogInformation(const char *System, const char *Message, ...);
 void LogDebug(const char *System, const char *Message, ...);
 void LogFatal(const char *System, const char *Message, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
