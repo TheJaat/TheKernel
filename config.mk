@@ -30,6 +30,7 @@ BOOT_STAGE2_C_STD_INCLUDE = headers/boot/stage2/c_includes/std/
 KERNEL_INCLUDE = $(ROOT_DIR)/headers
 KERNEL_LIBC = $(KERNEL_INCLUDE)/libc
 KERNEL_DRIVER = $(KERNEL_INCLUDE)/driver
+KERNEL_LIB = $(KERNEL_INCLUDE)/lib
 
 # Common Directories
 OUTPUT_DIR = ../../build

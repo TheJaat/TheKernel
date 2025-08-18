@@ -7,12 +7,12 @@ ROOT_DIR ?= $(abspath .)
 include $(ROOT_DIR)/config.mk
 
 # Define directories
-BUILD_DIR ?= $(ROOT_DIR)/arch/x86/x32
+BUILD_DIR ?= $(ROOT_DIR)/arch/x86/interrupts
 SUBDIRS =
 
 # Define source files
-ASM_SOURCES = gdt_asm.asm tss_asm.asm idt_asm.asm irq.asm
-C_SOURCES = gdt.c idt.c
+ASM_SOURCES =
+C_SOURCES = interrupts.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
@@ -58,7 +58,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(info KERNEL_DRIVER=$(KERNEL_DRIVER))
 
 # 	$(CXX) -I$(KERNEL_INCLUDE) -I $(KERNEL_LIBC) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
-	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
 
 
 # Assemble ASM sources

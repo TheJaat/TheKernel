@@ -8,6 +8,8 @@
 
 // GDT
 #include <arch/x86/x32/gdt.h>
+// IDT
+#include <arch/x86/x32/idt.h>
 
 BootInfo_t x86BootInfo;
 
@@ -43,12 +45,29 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     Log("Kmain address = %p", &kmain);
     LogDebug("kmain", "Log debug");
 
+    LogFatal("kmain", "Testing fatal log");
+
     for(int i = 1; i < 60; i++) {
         LogDebug("kmain", "i = %d", i);
     }
 
     // Initialize the GDT
 	GdtInitialize();
+
+    // Initialize the IDT
+	IdtInitialize();
+	// Generate the division by zero exception.
+	int a = 0;
+	int b = 1;
+	// int result = b/a;
+
+    // Generate the interrupt manually, for it uncomment below lines.
+	// asm volatile (
+	// "int $0x35"
+	// :
+	// :
+	// :
+	// );
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

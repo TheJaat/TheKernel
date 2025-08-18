@@ -231,7 +231,7 @@ void LogInternalPrint(int LogType, const char *Header, const char *Message)
 
 		/* Sanity */
 		if (LogType != LOG_TYPE_FATAL)
-			// VideoGetTerminal()->FgColor = LOG_COLOR_DEFAULT;
+			VideoGetTerminal()->fgColor = LOG_COLOR_DEFAULT;
 
 		/* Print */
 		if (LogType == LOG_TYPE_RAW)
@@ -240,7 +240,7 @@ void LogInternalPrint(int LogType, const char *Header, const char *Message)
 			printf("%s\n", Message);
 
 		/* Restore */
-		// VideoGetTerminal()->FgColor = LOG_COLOR_DEFAULT;
+		VideoGetTerminal()->fgColor = LOG_COLOR_DEFAULT;
 	}
 	else if (GlbLogTarget == LogFile) {
 		// TODO
