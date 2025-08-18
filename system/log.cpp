@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <video/interface/video_interface.h>
+
 // Globals
 // UUId_t GlbLogFileHandle = UUID_INVALID;
 // BufferObject_t *GlbLogBuffer = NULL;
@@ -125,12 +127,12 @@ void LogFlush(LogTarget_t Output)
 				memcpy(TempBuffer, StartPtr, HeaderLen);
 
 				/* Select Color */
-				// if (Type == LOG_TYPE_INFORMATION)
-				// 	// VideoGetTerminal()->FgColor = LOG_COLOR_INFORMATION;
-				// else if (Type == LOG_TYPE_DEBUG)
-				// 	// VideoGetTerminal()->FgColor = LOG_COLOR_DEBUG;
-				// else if (Type == LOG_TYPE_FATAL)
-				// 	// VideoGetTerminal()->FgColor = LOG_COLOR_ERROR;
+				if (Type == LOG_TYPE_INFORMATION)
+					VideoGetTerminal()->fgColor = LOG_COLOR_INFORMATION;
+				else if (Type == LOG_TYPE_DEBUG)
+					VideoGetTerminal()->fgColor = LOG_COLOR_DEBUG;
+				else if (Type == LOG_TYPE_FATAL)
+					VideoGetTerminal()->fgColor = LOG_COLOR_ERROR;
 
 				/* Print header */
 				printf("[%s] ", (const char*)&TempBuffer[0]);
@@ -216,12 +218,12 @@ void LogInternalPrint(int LogType, const char *Header, const char *Message)
 		if (LogType != LOG_TYPE_RAW)
 		{
 			// Select Color: TODO
-			// if (LogType == LOG_TYPE_INFORMATION)
-			// 	// VideoGetTerminal()->FgColor = LOG_COLOR_INFORMATION;
-			// else if (LogType == LOG_TYPE_DEBUG)
-			// 	// VideoGetTerminal()->FgColor = LOG_COLOR_DEBUG;
-			// else if (LogType == LOG_TYPE_FATAL)
-			// 	// VideoGetTerminal()->FgColor = LOG_COLOR_ERROR;
+			if (LogType == LOG_TYPE_INFORMATION)
+				VideoGetTerminal()->fgColor = LOG_COLOR_INFORMATION;
+			else if (LogType == LOG_TYPE_DEBUG)
+				VideoGetTerminal()->fgColor = LOG_COLOR_DEBUG;
+			else if (LogType == LOG_TYPE_FATAL)
+				VideoGetTerminal()->fgColor = LOG_COLOR_ERROR;
 
 			/* Print */
 			printf("[%s] ", Header);

@@ -4,10 +4,16 @@
 #include <video/vbe.h>
 #include <video/vga.h>
 
+#include <video/interface/video_interface.h>
+
 extern VideoDriver VBE_DRIVER;
 extern VideoDriver VGA_DRIVER;
 
 Terminal BootTerminal;
+
+Terminal* VideoGetTerminal(void) {
+    return &BootTerminal;
+}
 
 void InitializeVideo(Multiboot_t* BootInfo) {
     
