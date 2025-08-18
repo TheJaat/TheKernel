@@ -99,3 +99,41 @@ OsStatus_t VesaDrawCharacter(VbeContext* ctx, unsigned CursorX, unsigned CursorY
 	// Done - no errors
 	return Success;
 }
+
+void VesaScroll(VbeContext* ctx, int pixelLines, uint32_t background) {
+    VbeContext* vbe = (VbeContext*)ctx;
+
+    if (pixelLines <= 0 || pixelLines >= vbe->mode.YResolution) {
+        // Clear screen if too many lines requested
+        uint32_t* fb = (uint32_t*)(uintptr_t)vbe->mode.PhysBasePtr;
+        size_t totalPixels = (size_t)vbe->mode.XResolution * vbe->mode.YResolution;
+        for (size_t i = 0; i < totalPixels; i++) {
+            fb[i] = background;
+        }
+        return;
+    }
+
+    size_t bytesPerPixel = vbe->mode.BitsPerPixel / 8;
+    size_t bytesPerScanline = vbe->mode.BytesPerScanLine;
+    size_t copyBytesPerRow = vbe->mode.XResolution * bytesPerPixel;
+
+    uint8_t* fbBase = (uint8_t*)(uintptr_t)vbe->mode.PhysBasePtr;
+
+    // Copy scanlines upward
+    for (int row = 0; row < (int)vbe->mode.YResolution - pixelLines; row++) {
+        uint8_t* dst = fbBase + (row * bytesPerScanline);
+        uint8_t* src = fbBase + ((row + pixelLines) * bytesPerScanline);
+        for (size_t i = 0; i < copyBytesPerRow; i++) {
+            dst[i] = src[i];
+        }
+    }
+
+    // Clear bottom pixelLines rows
+    uint8_t* clearStart = fbBase + ((vbe->mode.YResolution - pixelLines) * bytesPerScanline);
+    for (int row = 0; row < pixelLines; row++) {
+        uint32_t* px = (uint32_t*)(clearStart + (row * bytesPerScanline));
+        for (uint32_t col = 0; col < vbe->mode.XResolution; col++) {
+            px[col] = background;
+        }
+    }
+}

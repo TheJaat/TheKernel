@@ -12,7 +12,7 @@ include $(ROOT_DIR)/config.mk
 BUILD_DIR = $(ROOT_DIR)/build
 
 # Define directories
-SUBDIRS = driver terminal
+SUBDIRS = driver terminal system libc
 
 # Define source files in the root directory
 ROOT_ASM_SOURCES = kernel_entry.asm

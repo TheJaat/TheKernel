@@ -9,8 +9,8 @@ static void vbe_drawChar(void* context, int x, int y, int ch, uint32_t fg, uint3
     VesaDrawCharacter((VbeContext*)context, x, y, ch, fg, bg);
 }
 
-static void vbe_scroll(int lines) {
-    // VideoScroll(lines);
+static void vbe_scroll(void* context, int lines, uint32_t bg) {
+    VesaScroll((VbeContext*)context, lines, bg);
 }
 
 static void vbe_clear(void* context, uint32_t color) {

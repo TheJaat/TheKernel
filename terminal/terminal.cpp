@@ -8,6 +8,8 @@ void TerminalInit(Terminal* term, VideoDriver* driver, int width, int height) {
     term->width = width;
     term->height = height;
     term->cursorX = term->cursorY = 0;
+    term->limitX = width;
+    term->limitY = height;
     term->fgColor = 0x000000;
     term->bgColor = 0xFFFFFFFF;
 }
@@ -30,8 +32,9 @@ void TerminalPutChar(Terminal* term, int ch) {
     }
 
     if (term->cursorY + FontHeight >= term->height) {
-        term->driver->scroll(1);
-        term->cursorY -= FontHeight;
+        // term->driver->scroll(1);
+        TerminalScroll(term, 1);
+        // term->cursorY -= FontHeight;
     }
 }
 
@@ -53,6 +56,6 @@ void TerminalDrawPixel(Terminal* term, uint32_t X, uint32_t Y, uint32_t color) {
 }
 
 void TerminalScroll(Terminal* term, int lines) {
-    // term->driver->scroll(lines);
-    // term->cursorY -= lines * FontHeight;
+    term->driver->scroll(term->driver->context, lines * FontHeight, term->bgColor);
+    term->cursorY -= lines * FontHeight;
 }

@@ -7,6 +7,7 @@
 typedef struct {
     int width, height;
     int cursorX, cursorY;
+    int limitX, limitY;
     uint32_t fgColor, bgColor;
     uint32_t videoModeType;
     VideoDriver* driver; // renderer

@@ -10,7 +10,8 @@ static void vga_drawChar(void* context, int x, int y, int ch, uint32_t fg, uint3
     VgaDrawCharacter((VgaContext*)context, ch, x, y, vga_color(BLACK, LIGHT_MAGENTA)); // VGA cursor handles pos
 }
 
-static void vga_scroll(int lines) {
+static void vga_scroll(void* context, int lines, uint32_t bg) {
+    // TODO
     // TextScroll(lines);
 }
 

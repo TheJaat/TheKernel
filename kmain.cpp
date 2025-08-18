@@ -3,6 +3,9 @@
 #include <terminal/terminal.h>
 #include <video/video.h>
 
+#include <stdio.h>
+#include <system/log.h>
+
 BootInfo_t x86BootInfo;
 
 const char* kernelInfo = "TheTaaJKernel Version 0.0.1, Author: TheJat";
@@ -27,6 +30,19 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     TerminalDrawString(&BootTerminal, x86BootInfo.BootLoaderName);
     TerminalDrawString(&BootTerminal, "\n");
     TerminalDrawString(&BootTerminal, kernelInfo);
+    printf("Testing printf\n");
+
+    LogInit();
+    int abc = 7;
+    int def = 9;
+    int ghi = 8;
+    Log("This is from logger %p, - %p - %p\n", &abc, &def, &ghi);
+    Log("Kmain address = %p", &kmain);
+    LogDebug("kmain", "Log debug");
+
+    for(int i = 1; i < 60; i++) {
+        LogDebug("kmain", "i = %d", i);
+    }
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 
     

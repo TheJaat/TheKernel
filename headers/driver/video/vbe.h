@@ -77,5 +77,5 @@ void VesaClearScreen(VbeContext* ctx, uint32_t color);
 
 OsStatus_t VesaDrawPixel(VbeContext* ctx, unsigned X, unsigned Y, uint32_t Color);
 OsStatus_t VesaDrawCharacter(VbeContext* ctx, unsigned CursorX, unsigned CursorY, int Character, uint32_t FgColor, uint32_t BgColor);
-
+void VesaScroll(VbeContext* ctx, int ByLines, uint32_t bg);
 #endif /* __VBE_H__ */
