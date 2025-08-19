@@ -67,7 +67,11 @@ $(BUILD_DIR)/%.o: %.asm
 # Build kernel
 kernel: $(SUBDIRS) $(ROOT_OBJECTS) $(STATIC_LIBS)
 	@echo "Linking kernel..."
-	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o $(STATIC_LIBS)
+# 	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o $(STATIC_LIBS)
+	$(LD) $(LDFLAGS) -T kernel.ld -o $(BUILD_DIR)/kernel.elf \
+    $(BUILD_DIR)/kernel_entry.o $(BUILD_DIR)/kmain.o \
+    --start-group $(STATIC_LIBS) --end-group
+
 
 #kernel.bin: $(OBJECTS)
 #	ld -m elf_i386 -Ttext 0xB000 --oformat binary -o build/$@ build/kernel_entry.o build/kernel_main.o build/idt.o build/idt_asm.o build/isr.o build/isr_asm.o build/vga.o build/kernel_utilities.o

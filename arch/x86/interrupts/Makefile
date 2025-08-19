@@ -12,7 +12,7 @@ SUBDIRS =
 
 # Define source files
 ASM_SOURCES =
-C_SOURCES = interrupts.c
+C_SOURCES = interrupts.c pic.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))

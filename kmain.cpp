@@ -10,6 +10,8 @@
 #include <arch/x86/x32/gdt.h>
 // IDT
 #include <arch/x86/x32/idt.h>
+// PIC
+#include <arch/x86/pic.h>
 
 BootInfo_t x86BootInfo;
 
@@ -68,6 +70,9 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 	// :
 	// :
 	// );
+
+    // Initialize and Remap the PIC
+	PicInit();
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 
