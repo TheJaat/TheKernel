@@ -12,7 +12,7 @@ SUBDIRS =
 
 # Define source files
 ASM_SOURCES = gdt_asm.asm tss_asm.asm idt_asm.asm irq.asm paging.asm
-C_SOURCES = gdt.c idt.c virtual_memory.c
+C_SOURCES = gdt.c idt.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
