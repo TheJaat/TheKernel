@@ -11,8 +11,8 @@ BUILD_DIR ?= $(ROOT_DIR)/arch/x86/x32
 SUBDIRS =
 
 # Define source files
-ASM_SOURCES = gdt_asm.asm tss_asm.asm idt_asm.asm irq.asm
-C_SOURCES = gdt.c idt.c
+ASM_SOURCES = gdt_asm.asm tss_asm.asm idt_asm.asm irq.asm paging.asm
+C_SOURCES = gdt.c idt.c virtual_memory.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))

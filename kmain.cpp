@@ -12,6 +12,8 @@
 #include <arch/x86/x32/idt.h>
 // PIC
 #include <arch/x86/pic.h>
+// Physical Memory
+#include <arch/x86/memory.h>
 
 BootInfo_t x86BootInfo;
 
@@ -73,6 +75,9 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     // Initialize and Remap the PIC
 	PicInit();
+
+    // Initialize Physical Memory
+	MmPhyiscalInit(BootInfo, bootDescriptor);
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

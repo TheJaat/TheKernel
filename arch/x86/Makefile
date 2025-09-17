@@ -12,7 +12,7 @@ SUBDIRS = x32 interrupts
 
 # Define source files
 ASM_SOURCES = port_io.asm
-C_SOURCES =
+C_SOURCES = physical_memory.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
