@@ -5,16 +5,20 @@
 #include <arch/x86/x32/arch_x32.h>
 #include <defs.h>
 #include <system/address_space.h>
+#include <system/log.h>
 #include <video/video.h>
 
 // For physical base pointer
 #include <video/vbe.h>
+#include <video/interface/video_interface.h>
 
 /* Includes
  * - Library
  */
 #include <stddef.h>
 #include <string.h>
+
+#include <heap.h>
 
 /* Globals 
  * Needed for the virtual memory manager to keep
@@ -514,9 +518,20 @@ MmVirtualInit(void)
 
 	// Pre-map video region
 	LogInformation("Virtual_Memory", "Mapping video memory to 0x%x", MEMORY_LOCATION_VIDEO);
-	MmVirtualIdentityMapMemoryRange(g_KernelPageDirectory, VideoGetTerminal()->Info.FrameBufferAddress,
-		MEMORY_LOCATION_VIDEO, (VideoGetTerminal()->Info.BytesPerScanline * VideoGetTerminal()->Info.Height),
-		1, PAGE_USER);
+	// MmVirtualIdentityMapMemoryRange(g_KernelPageDirectory, VideoGetTerminal()->Info.FrameBufferAddress,
+	// 	MEMORY_LOCATION_VIDEO, (VideoGetTerminal()->Info.BytesPerScanline * VideoGetTerminal()->Info.Height),
+	// 	1, PAGE_USER);
+	VbeContext* ctx = (VbeContext*)VideoGetTerminal()->driver->context;
+
+	MmVirtualIdentityMapMemoryRange(
+    	g_KernelPageDirectory,
+    	ctx->mode.PhysBasePtr,             // Physical address
+    	MEMORY_LOCATION_VIDEO,             // Virtual address to map to
+    	ctx->mode.BytesPerScanLine * ctx->mode.YResolution,  // Size
+    	1,                                 // Writable
+    	PAGE_USER                          // User-accessible
+	);
+
 
 	// Install the page table at the reserved system
 	// memory, important! 
@@ -542,7 +557,8 @@ MmVirtualInit(void)
 	}
 
 	// Update video address to the new
-	VideoGetTerminal()->Info.FrameBufferAddress = MEMORY_LOCATION_VIDEO;
+	((VbeContext*)(VideoGetTerminal()->driver->context))->mode.PhysBasePtr = MEMORY_LOCATION_VIDEO;
+
 	// Update video address to the new for the printing string.
 	updatePhysBasePtr(MEMORY_LOCATION_VIDEO);
 

@@ -14,6 +14,8 @@
 #include <arch/x86/pic.h>
 // Physical Memory
 #include <arch/x86/memory.h>
+// Heap
+#include <heap.h>
 
 BootInfo_t x86BootInfo;
 
@@ -78,6 +80,12 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     // Initialize Physical Memory
 	MmPhyiscalInit(BootInfo, bootDescriptor);
+
+    // Initialize Virtual Memory
+	// MmVirtualInit();
+
+	// Initializing the Heap Memory
+	// HeapInit();
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

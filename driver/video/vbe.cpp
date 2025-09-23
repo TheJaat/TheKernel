@@ -27,6 +27,8 @@ void set_vbe_mode(const VbeMode_t* mode) {
 // Updates the frame buffer address (used when virtual memory is implemented)
 void updatePhysBasePtr(uint32_t virtualPhysBasePtr) {
 	// s_vbeMode.PhysBasePtr = virtualPhysBasePtr;
+	s_vbeContext.mode.PhysBasePtr = virtualPhysBasePtr;
+	// ((VbeContext*)(VideoGetTerminal()->driver->context))->mode.PhysBasePtr
 }
 
 void VesaClearScreen(VbeContext* ctx, uint32_t color) {

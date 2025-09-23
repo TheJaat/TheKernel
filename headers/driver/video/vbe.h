@@ -23,7 +23,6 @@
  */
 #define STD_VIDEO_MEMORY	0xB8000
 
-
 /* This is the VBE Graphic Information
  * Descriptor which we have setup in
  * the bootloader */
@@ -68,6 +67,14 @@ typedef struct {
     VbeMode_t mode;
 } VbeContext;
 
+extern VbeContext s_vbeContext;
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 void set_vbe_mode(const VbeMode_t* mode);
 
 // Update the frame buffer address.
@@ -78,4 +85,9 @@ void VesaClearScreen(VbeContext* ctx, uint32_t color);
 OsStatus_t VesaDrawPixel(VbeContext* ctx, unsigned X, unsigned Y, uint32_t Color);
 OsStatus_t VesaDrawCharacter(VbeContext* ctx, unsigned CursorX, unsigned CursorY, int Character, uint32_t FgColor, uint32_t BgColor);
 void VesaScroll(VbeContext* ctx, int ByLines, uint32_t bg);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* __VBE_H__ */

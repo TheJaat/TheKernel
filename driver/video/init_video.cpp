@@ -10,6 +10,7 @@ extern VideoDriver VBE_DRIVER;
 extern VideoDriver VGA_DRIVER;
 
 Terminal BootTerminal;
+VbeContext s_vbeContext;
 
 Terminal* VideoGetTerminal(void) {
     return &BootTerminal;
@@ -43,7 +44,7 @@ void InitializeVideo(Multiboot_t* BootInfo) {
     } else {
         VbeMode_t* vbe = (VbeMode_t*)BootInfo->VbeModeInfo;
 
-        static VbeContext s_vbeContext;
+        // static VbeContext s_vbeContext;
         s_vbeContext.mode = *vbe;
 
         VBE_DRIVER.context = &s_vbeContext;

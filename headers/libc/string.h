@@ -17,6 +17,7 @@ char *strcat(char *destination, const char *source);
 char *strchr(const char *str, int ch);
 
 size_t strlen(const char *str);
+size_t strnlen(const char *str, size_t maxlen);
 
 void *memset(void *dest, int c, size_t count);
 

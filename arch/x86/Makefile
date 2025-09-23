@@ -8,7 +8,7 @@ include $(ROOT_DIR)/config.mk
 
 # Define directories
 BUILD_DIR ?= $(ROOT_DIR)/arch/x86
-SUBDIRS = x32 interrupts
+SUBDIRS = x32 interrupts components
 
 # Define source files
 ASM_SOURCES = port_io.asm
