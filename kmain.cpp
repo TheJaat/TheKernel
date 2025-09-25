@@ -36,13 +36,14 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 	x86BootInfo.Descriptor.SymbolsAddress = bootDescriptor->SymbolsAddress;
 	x86BootInfo.Descriptor.SymbolsSize = bootDescriptor->SymbolsSize;
 
-    InitializeVideo(BootInfo);
-    // TerminalScroll(&BootTerminal, 5);
-    TerminalDrawString(&BootTerminal, x86BootInfo.BootLoaderName);
-    TerminalDrawString(&BootTerminal, "\n");
-    TerminalDrawString(&BootTerminal, kernelInfo);
-    printf("Testing printf\n");
+    // InitializeVideo(BootInfo);
+    // // TerminalScroll(&BootTerminal, 5);
+    // TerminalDrawString(&BootTerminal, x86BootInfo.BootLoaderName);
+    // TerminalDrawString(&BootTerminal, "\n");
+    // TerminalDrawString(&BootTerminal, kernelInfo);
+    // printf("Testing printf\n");
 
+    // Step 1: Set up the Logger (with target as the memory)
     LogInit();
     int abc = 7;
     int def = 9;
@@ -55,6 +56,10 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     for(int i = 1; i < 60; i++) {
         LogDebug("kmain", "i = %d", i);
+    }
+
+    while(true) {
+        // stop right here
     }
 
     // Initialize the GDT

@@ -21,7 +21,7 @@ int GlbLogIndex = 0;
  * with default params */
 void LogInit(void)
 {
-	GlbLogTarget = LogConsole;//LogMemory;
+	GlbLogTarget = LogMemory;
 	GlbLogLevel = LogLevel1;
 
 	// Set log ptr to initial
