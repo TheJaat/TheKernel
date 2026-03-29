@@ -1,4 +1,4 @@
-# arch/x86/x32/Makefile
+# arch/x86/x32/components/Makefile
 
 # Ensure ROOT_DIR is set, defaulting to one level up if not provided
 ROOT_DIR ?= $(abspath .)
@@ -7,11 +7,11 @@ ROOT_DIR ?= $(abspath .)
 include $(ROOT_DIR)/config.mk
 
 # Define directories
-BUILD_DIR ?= $(ROOT_DIR)/arch/x86
-SUBDIRS = x32 interrupts components
+BUILD_DIR ?= $(ROOT_DIR)/arch/x86/components
+SUBDIRS =
 
 # Define source files
-ASM_SOURCES = port_io.asm
+ASM_SOURCES =
 C_SOURCES = physical_memory.c
 CPP_SOURCES =
 
@@ -58,7 +58,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(info KERNEL_DRIVER=$(KERNEL_DRIVER))
 
 # 	$(CXX) -I$(KERNEL_INCLUDE) -I $(KERNEL_LIBC) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
-	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
 
 
 # Assemble ASM sources
