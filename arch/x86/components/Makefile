@@ -12,7 +12,7 @@ SUBDIRS =
 
 # Define source files
 ASM_SOURCES =
-C_SOURCES = physical_memory.c
+C_SOURCES = physical_memory.c virtual_memory.c address_space.c
 CPP_SOURCES =
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))

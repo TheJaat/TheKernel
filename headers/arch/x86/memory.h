@@ -96,6 +96,12 @@ extern "C" {
  * the bitmap and makes sure reserved regions are allocated */
 OsStatus_t MmPhyiscalInit(void *BootInfo, BootDescriptor_t *Descriptor);
 
+/* MmPhysicalFreeBlock
+ * This is the primary function for
+ * freeing physical pages, but NEVER free physical
+ * pages if they exist in someones mapping */
+OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address);
+
 /* MmPhysicalAllocateBlock
  * This is the primary function for allocating
  * physical memory pages, this takes an argument
@@ -123,6 +129,13 @@ OsStatus_t MmVirtualInit(void);
 PhysicalAddress_t MmVirtualGetMapping(
 	void *PageDirectory, 
 	VirtualAddress_t Address);
+
+
+/* MmVirtualSwitchPageDirectory
+ * Switches page-directory for the current cpu
+ * but the current cpu should be given as parameter
+ * as well */
+OsStatus_t MmVirtualSwitchPageDirectory(UUId_t Cpu, PageDirectory_t* PageDirectory, PhysicalAddress_t Pdb);
 
 #ifdef __cplusplus
 }

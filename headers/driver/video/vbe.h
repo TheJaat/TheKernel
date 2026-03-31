@@ -14,9 +14,9 @@
 
 /* Video Type Definitions
  *  */
-#define VIDEO_NONE		    0x00000000
-#define VIDEO_TEXT		    0x00000001
-#define VIDEO_GRAPHICS		0x00000002
+// #define VIDEO_NONE		    0x00000000
+// #define VIDEO_TEXT		    0x00000001
+// #define VIDEO_GRAPHICS		0x00000002
 
 /* Definitions 
  * VGA Memory Address
@@ -68,6 +68,10 @@ typedef struct {
     VbeMode_t mode;
 } VbeContext;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void set_vbe_mode(const VbeMode_t* mode);
 
 // Update the frame buffer address.
@@ -78,4 +82,9 @@ void VesaClearScreen(VbeContext* ctx, uint32_t color);
 OsStatus_t VesaDrawPixel(VbeContext* ctx, unsigned X, unsigned Y, uint32_t Color);
 OsStatus_t VesaDrawCharacter(VbeContext* ctx, unsigned CursorX, unsigned CursorY, int Character, uint32_t FgColor, uint32_t BgColor);
 void VesaScroll(VbeContext* ctx, int ByLines, uint32_t bg);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* __VBE_H__ */
