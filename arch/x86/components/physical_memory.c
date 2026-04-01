@@ -348,36 +348,36 @@ OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor)
  * This is the primary function for
  * freeing physical pages, but NEVER free physical
  * pages if they exist in someones mapping */
-OsStatus_t
-MmPhysicalFreeBlock(PhysicalAddress_t Address)
-{
-	/* Calculate the bitmap bit */
-	int Frame = (int)(Address / PAGE_SIZE);
+// OsStatus_t
+// MmPhysicalFreeBlock(PhysicalAddress_t Address)
+// {
+// 	/* Calculate the bitmap bit */
+// 	int Frame = (int)(Address / PAGE_SIZE);
 
-	/* Sanitize the address
-	 * parameter for ranges */
-//	assert(Address < MemorySize);
+// 	/* Sanitize the address
+// 	 * parameter for ranges */
+// //	assert(Address < MemorySize);
 
-	/* Get Spinlock */
-//	SpinlockAcquire(&MemoryLock);
+// 	/* Get Spinlock */
+// //	SpinlockAcquire(&MemoryLock);
 
-	/* Sanitize that the page is 
-	 * actually allocated */
-//	assert(MmMemoryMapTestBit(Frame) != 0);
+// 	/* Sanitize that the page is 
+// 	 * actually allocated */
+// //	assert(MmMemoryMapTestBit(Frame) != 0);
 
-	/* Free it */
-	MmMemoryMapUnsetBit(Frame);
+// 	/* Free it */
+// 	MmMemoryMapUnsetBit(Frame);
 
-	/* Release Spinlock */
-//	SpinlockRelease(&MemoryLock);
+// 	/* Release Spinlock */
+// //	SpinlockRelease(&MemoryLock);
 
-	/* Statistics */
-	if (MemoryBlocksUsed != 0)
-		MemoryBlocksUsed--;
+// 	/* Statistics */
+// 	if (MemoryBlocksUsed != 0)
+// 		MemoryBlocksUsed--;
 
-	// Done - no errors
-	return Success;
-}
+// 	// Done - no errors
+// 	return Success;
+// }
 
 /* MmPhysicalAllocateBlock
  * This is the primary function for allocating

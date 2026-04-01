@@ -154,28 +154,28 @@ MmVirtualSwitchPageDirectory(
 
 /* MmVirtualGetCurrentDirectory
  * Retrieves the current page-directory for the given cpu */
-PageDirectory_t*
-MmVirtualGetCurrentDirectory(
-	 UUId_t Cpu)
-{
-	// Sanitize
-//	assert(Cpu < MAX_SUPPORTED_CPUS);
+// PageDirectory_t*
+// MmVirtualGetCurrentDirectory(
+// 	 UUId_t Cpu)
+// {
+// 	// Sanitize
+// //	assert(Cpu < MAX_SUPPORTED_CPUS);
 
-	// Return the current - even if null
-	return g_PageDirectories[Cpu];
-}
+// 	// Return the current - even if null
+// 	return g_PageDirectories[Cpu];
+// }
 
 /* MmVirtualInstallPaging
  * Initializes paging for the given cpu id */
-OsStatus_t
-MmVirtualInstallPaging(
-	 UUId_t Cpu)
-{
-	MmVirtualSwitchPageDirectory(Cpu, g_KernelPageDirectory, 
-		(uintptr_t)g_KernelPageDirectory);
-	memory_set_paging(1);
-	return Success;
-}
+// OsStatus_t
+// MmVirtualInstallPaging(
+// 	 UUId_t Cpu)
+// {
+// 	MmVirtualSwitchPageDirectory(Cpu, g_KernelPageDirectory, 
+// 		(uintptr_t)g_KernelPageDirectory);
+// 	memory_set_paging(1);
+// 	return Success;
+// }
 
 /* MmVirtualMap
  * Installs a new page-mapping in the given
@@ -363,60 +363,60 @@ MmVirtualInstallPaging(
  * Retrieves the physical address mapping of the
  * virtual memory address given - from the page directory 
  * that is given */
-PhysicalAddress_t
-MmVirtualGetMapping(
-	 void *PageDirectory, 
-	 VirtualAddress_t Address)
-{
-	// Initiate our variables
-	PageDirectory_t *Directory = (PageDirectory_t*)PageDirectory;
-	PageTable_t *Table = NULL;
-	PhysicalAddress_t Mapping = 0;
+// PhysicalAddress_t
+// MmVirtualGetMapping(
+// 	 void *PageDirectory, 
+// 	 VirtualAddress_t Address)
+// {
+// 	// Initiate our variables
+// 	PageDirectory_t *Directory = (PageDirectory_t*)PageDirectory;
+// 	PageTable_t *Table = NULL;
+// 	PhysicalAddress_t Mapping = 0;
 
-	// If none was given - use the current
-	if (Directory == NULL) {
-		Directory = g_PageDirectories[CpuGetCurrentId()];
-	}
+// 	// If none was given - use the current
+// 	if (Directory == NULL) {
+// 		Directory = g_PageDirectories[CpuGetCurrentId()];
+// 	}
 
-	// Sanitize the page-directory
-	// If it's still NULL somethings wrong
-//	assert(Directory != NULL);
+// 	// Sanitize the page-directory
+// 	// If it's still NULL somethings wrong
+// //	assert(Directory != NULL);
 
-	// Acquire lock for this directory
-	// MutexLock(&Directory->Lock);
+// 	// Acquire lock for this directory
+// 	// MutexLock(&Directory->Lock);
 
-	// Is the table even present in the directory? 
-	// If not, then no mapping 
-	if (!(Directory->pTables[PAGE_DIRECTORY_INDEX(Address)] & PAGE_PRESENT)) {
-		goto NotMapped;
-	}
+// 	// Is the table even present in the directory? 
+// 	// If not, then no mapping 
+// 	if (!(Directory->pTables[PAGE_DIRECTORY_INDEX(Address)] & PAGE_PRESENT)) {
+// 		goto NotMapped;
+// 	}
 
-	// Fetch the page table from the page-directory
-	Table = (PageTable_t*)Directory->vTables[PAGE_DIRECTORY_INDEX(Address)];
+// 	// Fetch the page table from the page-directory
+// 	Table = (PageTable_t*)Directory->vTables[PAGE_DIRECTORY_INDEX(Address)];
 
-	/* Sanitize the page-table just in case */
-//	assert(Table != NULL);
+// 	/* Sanitize the page-table just in case */
+// //	assert(Table != NULL);
 
-	// Sanitize the mapping before anything
-	if (!(Table->Pages[PAGE_TABLE_INDEX(Address)] & PAGE_PRESENT)) {
-		goto NotMapped;
-	}
+// 	// Sanitize the mapping before anything
+// 	if (!(Table->Pages[PAGE_TABLE_INDEX(Address)] & PAGE_PRESENT)) {
+// 		goto NotMapped;
+// 	}
 
-	// Retrieve mapping
-	Mapping = Table->Pages[PAGE_TABLE_INDEX(Address)] & PAGE_MASK;
+// 	// Retrieve mapping
+// 	Mapping = Table->Pages[PAGE_TABLE_INDEX(Address)] & PAGE_MASK;
 
-	// Release mutex on page-directory
-	// we should not keep it longer than neccessary
-//	MutexUnlock(&Directory->Lock);
+// 	// Release mutex on page-directory
+// 	// we should not keep it longer than neccessary
+// //	MutexUnlock(&Directory->Lock);
 
-	// Done - Return with offset
-	return (Mapping + (Address & ATTRIBUTE_MASK));
+// 	// Done - Return with offset
+// 	return (Mapping + (Address & ATTRIBUTE_MASK));
 
-NotMapped:
-	// On fail - release and return 0
-//	MutexUnlock(&Directory->Lock);
-	return 0;
-}
+// NotMapped:
+// 	// On fail - release and return 0
+// //	MutexUnlock(&Directory->Lock);
+// 	return 0;
+// }
 
 /* MmVirtualInitialMap
  * Maps a virtual memory address to a physical
@@ -457,23 +457,23 @@ MmVirtualInitialMap(
  * Reserves memory for system use - should be allocated
  * from a fixed memory region that won't interfere with
  * general usage */
-VirtualAddress_t*
-MmReserveMemory(
-	 int Pages)
-{
-	// Variables
-	VirtualAddress_t ReturnAddress = 0;
+// VirtualAddress_t*
+// MmReserveMemory(
+// 	 int Pages)
+// {
+// 	// Variables
+// 	VirtualAddress_t ReturnAddress = 0;
 
-	// Calculate new address 
-	// this is a locked operation
-//	SpinlockAcquire(&GlbVmLock);
-	ReturnAddress = g_ReservedPtr;
-	g_ReservedPtr += (PAGE_SIZE * Pages);
-//	SpinlockRelease(&GlbVmLock);
+// 	// Calculate new address 
+// 	// this is a locked operation
+// //	SpinlockAcquire(&GlbVmLock);
+// 	ReturnAddress = g_ReservedPtr;
+// 	g_ReservedPtr += (PAGE_SIZE * Pages);
+// //	SpinlockRelease(&GlbVmLock);
 
-	// Done - return address
-	return (VirtualAddress_t*)ReturnAddress;
-}
+// 	// Done - return address
+// 	return (VirtualAddress_t*)ReturnAddress;
+// }
 
 /* MmVirtualInit
  * Initializes the virtual memory system and

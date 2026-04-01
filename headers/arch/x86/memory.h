@@ -100,7 +100,7 @@ OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor);
  * This is the primary function for
  * freeing physical pages, but NEVER free physical
  * pages if they exist in someones mapping */
-OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address);
+// OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address);
 
 /* MmPhysicalAllocateBlock
  * This is the primary function for allocating
@@ -126,9 +126,9 @@ OsStatus_t MmVirtualInit(void);
  * Retrieves the physical address mapping of the
  * virtual memory address given - from the page directory 
  * that is given */
-PhysicalAddress_t MmVirtualGetMapping(
-	void *PageDirectory, 
-	VirtualAddress_t Address);
+// PhysicalAddress_t MmVirtualGetMapping(
+// 	void *PageDirectory, 
+// 	VirtualAddress_t Address);
 
 
 /* MmVirtualSwitchPageDirectory

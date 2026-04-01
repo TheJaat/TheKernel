@@ -228,36 +228,36 @@ OsStatus_t AddressSpaceInitKernel(
 /* AddressSpaceSwitch
  * Switches the current address space out with the
  * the address space provided for the current cpu */
-OsStatus_t
-AddressSpaceSwitch(
-	AddressSpace_t *AddressSpace)
-{
-	// Redirect to our virtual memory manager
-    //// TODO: APIC is not implemented yet so CpuGetCurrentId() return 0.
-	// return MmVirtualSwitchPageDirectory(CpuGetCurrentId(),
-	// 	AddressSpace->PageDirectory, AddressSpace->Cr3);
-    return MmVirtualSwitchPageDirectory(0,
-		AddressSpace->PageDirectory, AddressSpace->Cr3);
-}
+// OsStatus_t
+// AddressSpaceSwitch(
+// 	AddressSpace_t *AddressSpace)
+// {
+// 	// Redirect to our virtual memory manager
+//     //// TODO: APIC is not implemented yet so CpuGetCurrentId() return 0.
+// 	// return MmVirtualSwitchPageDirectory(CpuGetCurrentId(),
+// 	// 	AddressSpace->PageDirectory, AddressSpace->Cr3);
+//     return MmVirtualSwitchPageDirectory(0,
+// 		AddressSpace->PageDirectory, AddressSpace->Cr3);
+// }
 
 /* AddressSpaceTranslate
  * Translates the given address to the correct virtual
  * address, this can be used to correct any special cases on
  * virtual addresses in the sub-layer */
-VirtualAddress_t
-AddressSpaceTranslate(
-	AddressSpace_t *AddressSpace,
-	VirtualAddress_t Address)
-{
-	// Sanitize on the address, and the
-	// the type of addressing space 
-	if (AddressSpace->Flags & AS_TYPE_KERNEL) {
-		return Address;
-	}
-	else {
-		return Address;
-	}
-}
+// VirtualAddress_t
+// AddressSpaceTranslate(
+// 	AddressSpace_t *AddressSpace,
+// 	VirtualAddress_t Address)
+// {
+// 	// Sanitize on the address, and the
+// 	// the type of addressing space 
+// 	if (AddressSpace->Flags & AS_TYPE_KERNEL) {
+// 		return Address;
+// 	}
+// 	else {
+// 		return Address;
+// 	}
+// }
 
 /* AddressSpaceMap
  * Maps the given virtual address into the given address space
@@ -386,9 +386,9 @@ AddressSpaceTranslate(
 /* AddressSpaceGetMap
  * Retrieves a physical mapping from an address space determined
  * by the virtual address given */
-PhysicalAddress_t
-AddressSpaceGetMap(
-	AddressSpace_t *AddressSpace, 
-	VirtualAddress_t Address) {
-	return MmVirtualGetMapping(AddressSpace->PageDirectory, Address);
-}
+// PhysicalAddress_t
+// AddressSpaceGetMap(
+// 	AddressSpace_t *AddressSpace, 
+// 	VirtualAddress_t Address) {
+// 	return MmVirtualGetMapping(AddressSpace->PageDirectory, Address);
+// }

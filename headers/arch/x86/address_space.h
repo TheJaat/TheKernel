@@ -82,8 +82,8 @@ OsStatus_t AddressSpaceInitKernel(
 /* AddressSpaceSwitch
  * Switches the current address space out with the
  * the address space provided for the current cpu */
-OsStatus_t AddressSpaceSwitch(
-	AddressSpace_t *AddressSpace);
+// OsStatus_t AddressSpaceSwitch(
+// 	AddressSpace_t *AddressSpace);
 
 /* AddressSpaceGetCurrent
  * Returns the current address space
@@ -95,9 +95,9 @@ AddressSpace_t* AddressSpaceGetCurrent(void);
  * Translates the given address to the correct virtual
  * address, this can be used to correct any special cases on
  * virtual addresses in the sub-layer */
-VirtualAddress_t AddressSpaceTranslate(
-	AddressSpace_t *AddressSpace,
-	VirtualAddress_t Address);
+// VirtualAddress_t AddressSpaceTranslate(
+// 	AddressSpace_t *AddressSpace,
+// 	VirtualAddress_t Address);
 
 /* AddressSpaceMap
  * Maps the given virtual address into the given address space
@@ -132,9 +132,9 @@ OsStatus_t AddressSpaceUnmap(
 /* AddressSpaceGetMap
  * Retrieves a physical mapping from an address space determined
  * by the virtual address given */
-PhysicalAddress_t AddressSpaceGetMap(
-	AddressSpace_t *AddressSpace, 
-	VirtualAddress_t Address);
+// PhysicalAddress_t AddressSpaceGetMap(
+// 	AddressSpace_t *AddressSpace, 
+// 	VirtualAddress_t Address);
 
 
 #ifdef __cplusplus
