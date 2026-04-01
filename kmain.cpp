@@ -77,7 +77,7 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 	PicInit();
 
     // Initialize Physical Memory
-	MmPhyiscalInit(BootInfo, bootDescriptor);
+	MmPhysicalInit(BootInfo, bootDescriptor);
     
     // Initialize the Virtual Memory
     MmVirtualInit();

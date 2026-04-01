@@ -94,7 +94,7 @@ extern "C" {
  * This is the physical memory manager initializor
  * It reads the multiboot memory descriptor(s), initialies
  * the bitmap and makes sure reserved regions are allocated */
-OsStatus_t MmPhyiscalInit(void *BootInfo, BootDescriptor_t *Descriptor);
+OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor);
 
 /* MmPhysicalFreeBlock
  * This is the primary function for

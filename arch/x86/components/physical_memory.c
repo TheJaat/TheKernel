@@ -198,14 +198,14 @@ void MmFreeRegion(uintptr_t Base, size_t Size)
  * or allocate a region of memory */
 void MmAllocateRegion(uintptr_t Base, size_t Size)
 {
-	// Calculate the frame of this Base, the whole memory is divided into PAGE SIZE which is 4096 bytes.
-	int Frame = (int)(Base / PAGE_SIZE);
-	size_t Count = (size_t)(Size / PAGE_SIZE);
+		// Calculate the frame of this Base, the whole memory is divided into PAGE SIZE which is 4096 bytes.
+    int Frame = (int)(Base / PAGE_SIZE);
+    size_t Count = (size_t)(Size / PAGE_SIZE);
 
 	for (size_t i = Base; (Count + 1) > 0; Count--, i += PAGE_SIZE){
 		MmMemoryMapSetBit(Frame++);
-		MemoryBlocksUsed++;
-	}
+        MemoryBlocksUsed++;
+    }
 }
 
 /* This validates if a system mapping already
@@ -230,11 +230,11 @@ int MmSysMappingsContain(uintptr_t Base, int Type)
 	return 0;
 }
 
-/* MmPhyiscalInit
+/* MmPhysicalInit
  * This is the physical memory manager initializor
  * It reads the multiboot memory descriptor(s), initialies
  * the bitmap and makes sure reserved regions are allocated */
-OsStatus_t MmPhyiscalInit(void *BootInfo, BootDescriptor_t *Descriptor)
+OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor)
 {
 	/* Variables, cast neccessary data */
 	Multiboot_t *BootDesc = (Multiboot_t*)BootInfo;
@@ -256,18 +256,18 @@ OsStatus_t MmPhyiscalInit(void *BootInfo, BootDescriptor_t *Descriptor)
 
 	/* Sanity, we need AT LEAST 32 mb to run! */
 	//assert((MemorySize / 1024 / 1024) >= 32);
-	LogInformation("Physical_Memory", "MmPhyiscalInit, Low Memory Size = %d bytes", BootDesc->MemoryLow );
-	LogInformation("Physical_Memory", "MmPhyiscalInit, High Memory Size = %d bytes", BootDesc->MemoryHigh * 64 * 1024);
-	LogInformation("Physical_Memory", "MmPhyiscalInit, Total Memory Size = %d bytes", MemorySize);
+	LogInformation("Physical_Memory", "MmPhysicalInit, Low Memory Size = %d bytes", BootDesc->MemoryLow );
+	LogInformation("Physical_Memory", "MmPhysicalInit, High Memory Size = %d bytes", BootDesc->MemoryHigh * 64 * 1024);
+	LogInformation("Physical_Memory", "MmPhysicalInit, Total Memory Size = %d bytes", MemorySize);
 
 	/* Set storage variables 
 	 * We have the bitmap normally at 2mb mark */
 	 MemoryBitmap = (uintptr_t*)MEMORY_LOCATION_BITMAP;
 	 MemoryBlocks = MemorySize / PAGE_SIZE;
-	 LogInformation("Physical_Memory", "MmPhyiscalInit, MemoryBlocks = %d", MemoryBlocks);
+	 LogInformation("Physical_Memory", "MmPhysicalInit, MemoryBlocks = %d", MemoryBlocks);
 	 MemoryBlocksUsed = MemoryBlocks;
 	 MemoryBitmapSize = DIVUP(MemoryBlocks, 8); /* 8 blocks per byte, 32/64 per int */
-	 LogInformation("Physical_Memory", "MmPhyiscalInit, MemoryBitmapSize = %d", MemoryBitmapSize);
+	 LogInformation("Physical_Memory", "MmPhysicalInit, MemoryBitmapSize = %d", MemoryBitmapSize);
 
 
 	// /* Set all memory in use */
@@ -293,7 +293,7 @@ OsStatus_t MmPhyiscalInit(void *BootInfo, BootDescriptor_t *Descriptor)
 			if (RegionItr->Type == 1)
 				MmFreeRegion((uintptr_t)RegionItr->Address, (size_t)RegionItr->Size);
 
-			LogInformation("Physical_Memory","MmPhyiscalInit --> Memory Region %u: Address: %x, Size %x",
+			LogInformation("Physical_Memory","MmPhysicalInit --> Memory Region %u: Address: %x, Size %x",
 				RegionItr->Type, (PhysicalAddress_t)RegionItr->Address, (size_t)RegionItr->Size);
 
 			/* Setup a new system mapping, 
