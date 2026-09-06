@@ -11,7 +11,7 @@ BUILD_DIR = $(ROOT_DIR)/build/system
 SUBDIRS = # Add your subdirectories here if any
 
 # Define source files
-C_SOURCES =
+C_SOURCES = heap.c
 CPP_SOURCES = log.cpp
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))

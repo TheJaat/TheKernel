@@ -15,6 +15,8 @@
 // Physical Memory && Virtual Memory
 #include <arch/x86/memory.h>
 
+#include <system/heap.h>
+
 BootInfo_t x86BootInfo;
 
 const char* kernelInfo = "TheTaaJKernel Version 0.0.1, Author: TheJat";
@@ -83,6 +85,10 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     MmVirtualInit();
 
     LogDebug("kmain", "After virtual memory initialization");
+
+    if (HeapInit() == Success) {
+        HeapTest(); // For testing
+    }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

@@ -125,10 +125,18 @@ OsStatus_t MmVirtualInit(void);
 /* MmVirtualGetMapping
  * Retrieves the physical address mapping of the
  * virtual memory address given - from the page directory 
- * that is given */
-// PhysicalAddress_t MmVirtualGetMapping(
-// 	void *PageDirectory, 
-// 	VirtualAddress_t Address);
+ * that is given. Returns 0 if not mapped. */
+PhysicalAddress_t MmVirtualGetMapping(
+	void *PageDirectory, 
+	VirtualAddress_t Address);
+
+/* MmVirtualGetCurrentDirectory
+ * Retrieves the page-directory currently loaded on the given cpu */
+PageDirectory_t* MmVirtualGetCurrentDirectory(UUId_t Cpu);
+
+/* MmPhysicalFreeBlock
+ * Releases a physical page back to the bitmap */
+OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address);
 
 
 /* MmVirtualSwitchPageDirectory
