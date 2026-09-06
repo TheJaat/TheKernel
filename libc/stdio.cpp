@@ -171,8 +171,12 @@ int vsprintf(char* buffer, const char* format, va_list args) {
                 break;
             }
             case 'x': { // handle hex integer
-                int value = va_arg(args, int);
-                itoa(value, tmp, 16);
+                // Must be unsigned. itoa() takes a signed int, so any
+                // address with the top bit set (0xfffc0000, say) produced
+                // negative remainders and printed as punctuation - e.g.
+                // 0xfffc0000 came out as ",0000".
+                unsigned int value = va_arg(args, unsigned int);
+                utoa(value, tmp, 16);
                 for (char* tmp_ptr = tmp; *tmp_ptr != '\0'; tmp_ptr++) {
                     *buf_ptr++ = *tmp_ptr;
                 }

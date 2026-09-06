@@ -1,4 +1,4 @@
-/* Includes 
+/* Includes
  * - System
  */
 #include <arch/x86/x32/arch_x32.h>
@@ -7,35 +7,35 @@
 #include <arch/x86/memory.h>
 #include <defs.h>
 
-/* Includes 
+/* Includes
  * - C-Library
  */
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 
-/* Globals 
- * This is primarily stats and 
- * information about the memory
- * bitmap
- */
+/* Globals */
 uintptr_t *MemoryBitmap = NULL;
 size_t MemoryBitmapSize = 0;
 size_t MemoryBlocks = 0;
 size_t MemoryBlocksUsed = 0;
 size_t MemorySize = 0;
 
-/* The spinlock that protects
- * the physical memory manager */
-//Spinlock_t MemoryLock;
-
-/* Reserved Regions 
- * This primarily comes from the region-descriptor */
+/* Reserved Regions, from the region-descriptor */
 SystemMemoryMapping_t SysMappings[32];
 
-/* MmMemoryDebugPrint
- * This is a debug function for inspecting
- * the memory status, it spits out how many blocks are in use */
+/* The lowest frame the allocator is allowed to return.
+ * Frames below this hold the stage2 image, its VBE/e820 buffers and the
+ * real-mode IVT/BDA. Nothing re-marks them as used, so the allocator has
+ * to stay out of the way by construction.
+ *
+ * stage2 is linked at 0xCC00 and its .bss currently ends around 0x23580,
+ * so 0x20000 was NOT enough - the first page-table allocation landed on
+ * top of it. Re-check this if stage2 grows:
+ *     nm bootloader/build/stage2/stage2.elf | sort | tail -1          */
+#define MEMORY_ALLOC_FLOOR      0x30000
+
+/* MmMemoryDebugPrint */
 void MmMemoryDebugPrint(void)
 {
 	LogInformation("Physical_Memory", "Bitmap size: %u Bytes", MemoryBitmapSize);
@@ -43,419 +43,280 @@ void MmMemoryDebugPrint(void)
 	LogInformation("Physical_Memory", "Block status %u/%u", MemoryBlocksUsed, MemoryBlocks);
 }
 
-/* MmPhysicalQuery
- * Queries information about current block status */
-// OsStatus_t
-// MmPhysicalQuery(
-// 	_Out_Opt_ size_t *BlocksTotal, 
-// 	_Out_Opt_ size_t *BlocksAllocated)
-// {
-// 	// Update total
-// 	if (BlocksTotal != NULL) {
-// 		*BlocksTotal = MemoryBlocks;
-// 	}
+/* Bit helpers. All of them are bounds-checked now: MmFreeRegion used to
+ * be able to walk off the end of the bitmap when the e820 map described
+ * more memory than MemorySize claimed. */
+static int MmMemoryMapValidBit(size_t Bit) {
+	return (Bit < MemoryBlocks) ? 1 : 0;
+}
 
-// 	// Update allocated
-// 	if (BlocksAllocated != NULL) {
-// 		*BlocksAllocated = MemoryBlocksUsed;
-// 	}
-
-// 	// Never fails
-// 	return OsSuccess;
-// }
-
-/* This is an inline helper for 
- * allocating a bit in a bitmap 
- * make sure this is tested before and give
- * an error if its already allocated */
 void MmMemoryMapSetBit(int Bit) {
-	MemoryBitmap[Bit / __BITS] |= (1 << (Bit % __BITS));
+	if (!MmMemoryMapValidBit((size_t)Bit)) return;
+	MemoryBitmap[Bit / __BITS] |= (1u << (Bit % __BITS));
 }
 
-/* This is an inline helper for 
- * freeing a bit in a bitmap 
- * make sure this is tested before and give
- * an error if it's not allocated */
 void MmMemoryMapUnsetBit(int Bit) {
-	MemoryBitmap[Bit / __BITS] &= ~(1 << (Bit % __BITS));
+	if (!MmMemoryMapValidBit((size_t)Bit)) return;
+	MemoryBitmap[Bit / __BITS] &= ~(1u << (Bit % __BITS));
 }
 
-/* This is an inline helper for 
- * testing whether or not a bit is set, it returns
- * 1 if allocated, or 0 if free */
-// int MmMemoryMapTestBit(int Bit) {
-// 	return (MemoryBitmap[Bit / __BITS] & (1 << (Bit % __BITS))) > 0 ? 1 : 0;
-// }
+int MmMemoryMapTestBit(int Bit) {
+	if (!MmMemoryMapValidBit((size_t)Bit)) return 1;
+	return (MemoryBitmap[Bit / __BITS] & (1u << (Bit % __BITS))) ? 1 : 0;
+}
 
-/* This function can be used to retrieve
- * a page of memory below the MEMORY_LOW_THRESHOLD 
- * this is useful for devices that use DMA */
-int MmGetFreeMapBitLow(int Count)
+/* MmGetFreeBlocks
+ * Finds <Count> consecutive free frames in [FirstBlock, LastBlock).
+ * Unlike the old MmGetFreeMapBitLow/High this correctly handles runs
+ * that straddle a 32-bit word boundary. Returns -1 on failure. */
+static int MmGetFreeBlocks(int Count, size_t FirstBlock, size_t LastBlock)
 {
-	/* Variables needed for iteration */
-	int i, j, Result = -1;
+	size_t i, j;
 
-	/* Start out by iterating the 
-	 * different memory blocks, but always skip
-	 * the first mem-block */
-	for (i = 1; i < (8 * 16); i++)
-	{
-		/* Quick-check, if it's maxxed we can skip it 
-		 * due to all being allocated */
-		if (MemoryBitmap[i] != __MASK) {
-			for (j = 0; j < __BITS; j++) {
-				if (!(MemoryBitmap[i] & 1 << j)) {
-					int Found = 1;
-					for (int k = 0, c = j; k < Count && c < __BITS; k++, c++) {
-						if (MemoryBitmap[i] & 1 << c) {
-							Found = 0;
-							break;
-						}
-					}
-					if (Found == 1) {
-						Result = (int)((i * __BITS) + j);
-						break;
-					}
-				}
-			}
-		}
-
-		/* Check for break 
-		 * If result is found then we are done! */
-		if (Result != -1)
-			break;
+	if (Count <= 0) {
+		return -1;
+	}
+	if (LastBlock > MemoryBlocks) {
+		LastBlock = MemoryBlocks;
+	}
+	if (FirstBlock + (size_t)Count > LastBlock) {
+		return -1;
 	}
 
-	/* Return frame */
-	return Result;
-}
-
-/* This function can be used to retrieve
- * a page of memory above the MEMORY_LOW_THRESHOLD 
- * this should probably be the standard alloc used */
-int MmGetFreeMapBitHigh(int Count)
-{
-	/* Variables needed for iteration */
-	int i, j, Result = -1;
-
-	/* Start out by iterating the
-	 * different memory blocks, but always skip
-	 * the first mem-block */
-	for (i = (8 * 16); i < (int)MemoryBlocks; i++)
-	{
-		/* Quick-check, if it's maxxed we can skip it
-		 * due to all being allocated */
-		if (MemoryBitmap[i] != __MASK) {
-			for (j = 0; j < __BITS; j++) {
-				if (!(MemoryBitmap[i] & 1 << j)) {
-					int Found = 1;
-					for (int k = 0, c = j; k < Count && c < __BITS; k++, c++) {
-						if (MemoryBitmap[i] & 1 << c) {
-							Found = 0;
-							break;
-						}
-					}
-					if (Found == 1) {
-						Result = (int)((i * __BITS) + j);
-						break;
-					}
-				}
-			}
+	for (i = FirstBlock; i + (size_t)Count <= LastBlock; i++) {
+		/* Fast skip: a fully allocated word can be jumped over */
+		if ((i % __BITS) == 0 && MemoryBitmap[i / __BITS] == __MASK) {
+			i += __BITS - 1;
+			continue;
+		}
+		if (MmMemoryMapTestBit((int)i)) {
+			continue;
 		}
 
-		/* Check for break
-		 * If result is found then we are done! */
-		if (Result != -1)
-			break;
+		for (j = 1; j < (size_t)Count; j++) {
+			if (MmMemoryMapTestBit((int)(i + j))) {
+				break;
+			}
+		}
+		if (j == (size_t)Count) {
+			return (int)i;
+		}
+		i += j; /* skip the block that broke the run */
 	}
 
-	/* Return frame */
-	return Result;
+	return -1;
 }
 
-/* One of the two region functions
- * they are helpers in order to either free
- * or allocate a region of memory */
+/* MmFreeRegion
+ * Marks a region free. The bounds are rounded *inward* so a partial
+ * page at either end stays reserved rather than being handed out. */
 void MmFreeRegion(uintptr_t Base, size_t Size)
 {
-	/* Calculate the frame */
-	int Frame = (int)(Base / PAGE_SIZE);
-	size_t Count = (size_t)(Size / PAGE_SIZE);
+	uintptr_t Start = (Base + PAGE_SIZE - 1) & PAGE_MASK;
+	uintptr_t End   = (Base + Size) & PAGE_MASK;
+	uintptr_t Address;
 
-	/* Iterate and free the frames in the 
-	 * bitmap using our helper function */
-	for (size_t i = Base; Count > 0; Count--, i += PAGE_SIZE) {
-		MmMemoryMapUnsetBit(Frame++);
-
-		/* Decrease allocated blocks */
-		if (MemoryBlocksUsed != 0)
+	for (Address = Start; Address < End; Address += PAGE_SIZE) {
+		int Frame = (int)(Address / PAGE_SIZE);
+		if (MmMemoryMapTestBit(Frame) && MemoryBlocksUsed != 0) {
 			MemoryBlocksUsed--;
+		}
+		MmMemoryMapUnsetBit(Frame);
 	}
 }
 
-/* One of the two region functions
- * they are helpers in order to either free
- * or allocate a region of memory */
+/* MmAllocateRegion
+ * Marks a region used. Bounds are rounded *outward* so a partially
+ * covered page is fully reserved. */
 void MmAllocateRegion(uintptr_t Base, size_t Size)
 {
-		// Calculate the frame of this Base, the whole memory is divided into PAGE SIZE which is 4096 bytes.
-    int Frame = (int)(Base / PAGE_SIZE);
-    size_t Count = (size_t)(Size / PAGE_SIZE);
+	uintptr_t Start = Base & PAGE_MASK;
+	uintptr_t End   = (Base + Size + PAGE_SIZE - 1) & PAGE_MASK;
+	uintptr_t Address;
 
-	for (size_t i = Base; (Count + 1) > 0; Count--, i += PAGE_SIZE){
-		MmMemoryMapSetBit(Frame++);
-        MemoryBlocksUsed++;
-    }
+	for (Address = Start; Address < End; Address += PAGE_SIZE) {
+		int Frame = (int)(Address / PAGE_SIZE);
+		if (!MmMemoryMapTestBit(Frame)) {
+			MemoryBlocksUsed++;
+		}
+		MmMemoryMapSetBit(Frame);
+	}
 }
 
-/* This validates if a system mapping already
- * exists at the given <Physical> address and of
- * the given type */
+/* MmSysMappingsContain */
 int MmSysMappingsContain(uintptr_t Base, int Type)
 {
-	/* Find address, if it exists! */
-	for (int i = 0; i < 32; i++)
-	{
-		/* Sanity, it has to be a valid mapping */
+	for (int i = 0; i < 32; i++) {
 		if (SysMappings[i].Length == 0)
 			continue;
-
-		/* Does type/address match ? */
-		if (SysMappings[i].Type == Type
-			&& SysMappings[i].pAddressStart == Base) {
+		if (SysMappings[i].Type == Type && SysMappings[i].pAddressStart == Base) {
 			return 1;
 		}
 	}
-
 	return 0;
 }
 
-/* MmPhysicalInit
- * This is the physical memory manager initializor
- * It reads the multiboot memory descriptor(s), initialies
- * the bitmap and makes sure reserved regions are allocated */
+/* MmPhysicalInit */
 OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor)
 {
-	/* Variables, cast neccessary data */
+	LogInformation("Physical_Memory", "KernelAddress=0x%x KernelSize=0x%x",
+    	Descriptor->KernelAddress, Descriptor->KernelSize);
+
 	Multiboot_t *BootDesc = (Multiboot_t*)BootInfo;
 	BIOSMemoryRegion_t *RegionItr = NULL;
 	int i, j;
-	
-	/* Sanitize the bootdescriptor */
-	//assert(BootDesc != NULL);
 
-	/* Good, good ! 
-	 * Get a pointer to the region descriptors */
 	RegionItr = (BIOSMemoryRegion_t*)BootDesc->MemoryMapAddr;
 
-	/* Get information from multiboot struct 
-	 * The memory-high part is 64kb blocks 
-	 * whereas the memory-low part is bytes of memory */
-	MemorySize = (BootDesc->MemoryHigh * 64 * 1024);
-	MemorySize += BootDesc->MemoryLow; /* This is in kilobytes ... */
+	/* MemoryHigh is in 64kB blocks above 16mB.
+	 * MemoryLow is in *kilobytes* - the bootloader stores
+	 * (int15/E801 AX + 0x400) there. It was being added as bytes. */
+	MemorySize  = (size_t)BootDesc->MemoryHigh * 64 * 1024;
+	MemorySize += (size_t)BootDesc->MemoryLow * 1024;
 
-	/* Sanity, we need AT LEAST 32 mb to run! */
-	//assert((MemorySize / 1024 / 1024) >= 32);
-	LogInformation("Physical_Memory", "MmPhysicalInit, Low Memory Size = %d bytes", BootDesc->MemoryLow );
-	LogInformation("Physical_Memory", "MmPhysicalInit, High Memory Size = %d bytes", BootDesc->MemoryHigh * 64 * 1024);
-	LogInformation("Physical_Memory", "MmPhysicalInit, Total Memory Size = %d bytes", MemorySize);
+	LogInformation("Physical_Memory", "Low Memory  = %u KB", BootDesc->MemoryLow);
+	LogInformation("Physical_Memory", "High Memory = %u bytes", BootDesc->MemoryHigh * 64 * 1024);
+	LogInformation("Physical_Memory", "Total Memory = %u bytes", MemorySize);
 
-	/* Set storage variables 
-	 * We have the bitmap normally at 2mb mark */
-	 MemoryBitmap = (uintptr_t*)MEMORY_LOCATION_BITMAP;
-	 MemoryBlocks = MemorySize / PAGE_SIZE;
-	 LogInformation("Physical_Memory", "MmPhysicalInit, MemoryBlocks = %d", MemoryBlocks);
-	 MemoryBlocksUsed = MemoryBlocks;
-	 MemoryBitmapSize = DIVUP(MemoryBlocks, 8); /* 8 blocks per byte, 32/64 per int */
-	 LogInformation("Physical_Memory", "MmPhysicalInit, MemoryBitmapSize = %d", MemoryBitmapSize);
+	MemoryBitmap     = (uintptr_t*)MEMORY_LOCATION_BITMAP;
+	MemoryBlocks     = MemorySize / PAGE_SIZE;
+	MemoryBlocksUsed = MemoryBlocks;
+	MemoryBitmapSize = DIVUP(MemoryBlocks, 8);
 
+	LogInformation("Physical_Memory", "MemoryBlocks = %u", MemoryBlocks);
+	LogInformation("Physical_Memory", "MemoryBitmapSize = %u", MemoryBitmapSize);
 
-	// /* Set all memory in use */
-	 memset((void*)MemoryBitmap, 0xFFFFFFFF, MemoryBitmapSize);
-	 memset((void*)SysMappings, 0, sizeof(SysMappings));
+	/* The bitmap must fit inside the region we identity map at boot */
+	if ((MEMORY_LOCATION_BITMAP + MemoryBitmapSize) >= MEMORY_LOCATION_HEAP) {
+		LogFatal("Physical_Memory", "bitmap does not fit its reserved window");
+		return Error;
+	}
 
-	/* Reset Spinlock */
-	// SpinlockReset(&MemoryLock);
+	memset((void*)MemoryBitmap, 0xFF, MemoryBitmapSize);
+	memset((void*)SysMappings, 0, sizeof(SysMappings));
 
-	// /* Let us make it possible to access 
-	//  * the first page of memory, but not through normal means */
-	 SysMappings[0].Type = 2;
-	 SysMappings[0].pAddressStart = 0;
-	 SysMappings[0].vAddressStart = 0;
-	 SysMappings[0].Length = PAGE_SIZE;
+	SysMappings[0].Type = 2;
+	SysMappings[0].pAddressStart = 0;
+	SysMappings[0].vAddressStart = 0;
+	SysMappings[0].Length = PAGE_SIZE;
 
-	// /* Loop through memory regions from bootloader */
-	 for (i = 0, j = 1; i < (int)BootDesc->MemoryMapLength; i++) {
-	 	if (!MmSysMappingsContain((PhysicalAddress_t)RegionItr->Address, (int)RegionItr->Type))
-	 	{
-	 		/* Available Region? 
-			 * It has to be of type 1 */
+	for (i = 0, j = 1; i < (int)BootDesc->MemoryMapLength && j < 32; i++) {
+		if (!MmSysMappingsContain((PhysicalAddress_t)RegionItr->Address, (int)RegionItr->Type))
+		{
 			if (RegionItr->Type == 1)
 				MmFreeRegion((uintptr_t)RegionItr->Address, (size_t)RegionItr->Size);
 
-			LogInformation("Physical_Memory","MmPhysicalInit --> Memory Region %u: Address: %x, Size %x",
-				RegionItr->Type, (PhysicalAddress_t)RegionItr->Address, (size_t)RegionItr->Size);
+			LogInformation("Physical_Memory", "Region %u: Address: %x, Size %x",
+				RegionItr->Type, (PhysicalAddress_t)RegionItr->Address,
+				(size_t)RegionItr->Size);
 
-			/* Setup a new system mapping, 
-			 * we cache this map for conveniance */
 			SysMappings[j].Type = RegionItr->Type;
 			SysMappings[j].pAddressStart = (PhysicalAddress_t)RegionItr->Address;
 			SysMappings[j].vAddressStart = 0;
 			SysMappings[j].Length = (size_t)RegionItr->Size;
-
-			/* Advance */
 			j++;
 		}
-		
-		/* Advance to next */
 		RegionItr++;
 	}
 
-	// /* Mark special regions as reserved */
-	MmMemoryMapSetBit(0);
+	/* Null page */
+	MmAllocateRegion(0, PAGE_SIZE);
 
-	// /* 0x4000 - 0x6000 || Used for memory region & Trampoline-code */
-	MmMemoryMapSetBit(0x4000 / PAGE_SIZE);
-	MmMemoryMapSetBit(0x5000 / PAGE_SIZE);
-	MmMemoryMapSetBit(0x9000 / PAGE_SIZE);
-	MmMemoryMapSetBit(0xA000 / PAGE_SIZE);
-	MemoryBlocksUsed += 4;
+	/* 0x4000 - 0x6000 and 0x9000 - 0xB000: memory map & trampoline */
+	MmAllocateRegion(0x4000, 0x2000);
+	MmAllocateRegion(0x9000, 0x2000);
 
-	// /* 0x90000 - 0x9F000 || Kernel Stack */
+	/* 0x90000 - 0x9F000: kernel stack */
 	MmAllocateRegion(0x90000, 0xF000);
 
-	/* 0x100000 - 0x200000 = 1MB
-	 * This is the region where kernel is relocated
-	 */
+	/* Kernel image.
+	 * NOTE: Descriptor->KernelSize is the size of kernel.elf *on disk*
+	 * (g_kernelSize in vfs.c), not the size of the loaded image. It
+	 * happens to be larger for this kernel because of the section
+	 * headers, but that is luck, not a guarantee - if you ever strip
+	 * the ELF this reservation can end up smaller than .bss. */
 	MmAllocateRegion(MEMORY_LOCATION_KERNEL, Descriptor->KernelSize + PAGE_SIZE);
 
-	/* 0x200000 - RamDiskSize */
-	// We dont have Ramdisk currently
-	// MmAllocateRegion(MEMORY_LOCATION_RAMDISK, Descriptor->RamDiskSize + PAGE_SIZE);
+	/* Bitmap space + a guard page */
+	MmAllocateRegion(MEMORY_LOCATION_BITMAP, MemoryBitmapSize + PAGE_SIZE);
 
-	/* 0x300000 - ?? || Bitmap Space 
-	 * We allocate an extra guard-page */
-	MmAllocateRegion(MEMORY_LOCATION_BITMAP, (MemoryBitmapSize + PAGE_SIZE));
-
-	/* Debug */
 	MmMemoryDebugPrint();
-
-	// No problems
 	return Success;
 }
 
-/* MmPhysicalFreeBlock
- * This is the primary function for
- * freeing physical pages, but NEVER free physical
- * pages if they exist in someones mapping */
-// OsStatus_t
-// MmPhysicalFreeBlock(PhysicalAddress_t Address)
-// {
-// 	/* Calculate the bitmap bit */
-// 	int Frame = (int)(Address / PAGE_SIZE);
-
-// 	/* Sanitize the address
-// 	 * parameter for ranges */
-// //	assert(Address < MemorySize);
-
-// 	/* Get Spinlock */
-// //	SpinlockAcquire(&MemoryLock);
-
-// 	/* Sanitize that the page is 
-// 	 * actually allocated */
-// //	assert(MmMemoryMapTestBit(Frame) != 0);
-
-// 	/* Free it */
-// 	MmMemoryMapUnsetBit(Frame);
-
-// 	/* Release Spinlock */
-// //	SpinlockRelease(&MemoryLock);
-
-// 	/* Statistics */
-// 	if (MemoryBlocksUsed != 0)
-// 		MemoryBlocksUsed--;
-
-// 	// Done - no errors
-// 	return Success;
-// }
-
-/* MmPhysicalAllocateBlock
- * This is the primary function for allocating
- * physical memory pages, this takes an argument
- * <Mask> which determines where in memory the allocation is OK */
-PhysicalAddress_t MmPhysicalAllocateBlock(uintptr_t Mask, int Count)
+/* MmPhysicalFreeBlock */
+OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address)
 {
-	/* Variables, keep track of 
-	 * the frame allocated */
-	int Frame = -1;
+	int Frame = (int)(Address / PAGE_SIZE);
 
-	/* Sanitize params */
-//	assert(Count > 0);
-
-	/* Get Spinlock */
-//	SpinlockAcquire(&MemoryLock);
-
-	/* Calculate which allocation function
-	 * to use with the given mask */
-	if (Mask <= 0xFFFFFF) {
-		Frame = MmGetFreeMapBitLow(Count);
-	}
-	else {
-		Frame = MmGetFreeMapBitHigh(Count);
+	if (!MmMemoryMapValidBit((size_t)Frame)) {
+		return Error;
 	}
 
-	/* Set bit allocated before we 
-	 * release the lock, but ONLY if 
-	 * the frame is valid */
-	if (Frame != -1) {
-		for (int i = 0; i < Count; i++) {
-			MmMemoryMapSetBit(Frame + i);
-		}
+	MmMemoryMapUnsetBit(Frame);
+	if (MemoryBlocksUsed != 0) {
+		MemoryBlocksUsed--;
 	}
-
-	/* Release lock */
-//	SpinlockRelease(&MemoryLock);
-
-	/* Sanity */
-//	assert(Frame != -1);
-
-	/* Statistics */
-	MemoryBlocksUsed++;
-
-	/* Calculate the return 
-	 * address by multiplying by block size */
-	return (PhysicalAddress_t)(Frame * PAGE_SIZE);
+	return Success;
 }
 
-/* MmPhyiscalGetSysMappingVirtual
- * This function retrieves the virtual address 
- * of an mapped system mapping, this is to avoid
- * re-mapping and continous unmap of device memory 
- * Returns 0 if none exists */
-// VirtualAddress_t
-// MmPhyiscalGetSysMappingVirtual(
-// 	_In_ PhysicalAddress_t PhysicalAddress)
-// {
-// 	/* Iterate the sys-mappings, we only
-// 	 * have up to 32 at the moment, should always be enough */
-// 	for (int i = 0; i < 32; i++) {
-// 		/* It has to be valid, and NOT of type available */
-// 		if (SysMappings[i].Length != 0 && SysMappings[i].Type != 1) 
-// 		{
-// 			/* Calculate start and end 
-// 			 * of this system memory region */
-// 			PhysicalAddress_t Start = SysMappings[i].pAddressStart;
-// 			PhysicalAddress_t End = SysMappings[i].pAddressStart + SysMappings[i].Length;
+/* MmPhysicalAllocateBlock
+ * Allocates <Count> consecutive frames. <Mask> is now actually honoured:
+ * it is the highest physical address the caller can accept.
+ * Returns 0 on failure (frame 0 is permanently reserved, so 0 is safe
+ * to use as the error value). */
+PhysicalAddress_t MmPhysicalAllocateBlock(uintptr_t Mask, int Count)
+{
+	size_t FirstBlock = MEMORY_ALLOC_FLOOR / PAGE_SIZE;
+	size_t LastBlock;
+	int Frame;
 
-// 			/* Is it in range? :) */
-// 			if (PhysicalAddress >= Start && PhysicalAddress < End) {
-// 				return SysMappings[i].vAddressStart 
-// 					+ (PhysicalAddress - SysMappings[i].pAddressStart);
-// 			}
-// 		}
-// 	}
+	if (Count <= 0) {
+		return 0;
+	}
 
-// 	/* Not found */
-// 	return 0;
-// }
+	/* Mask is inclusive, so +1 gives the exclusive limit */
+	LastBlock = ((size_t)Mask / PAGE_SIZE) + 1;
+	if (LastBlock > MemoryBlocks) {
+		LastBlock = MemoryBlocks;
+	}
 
+	Frame = MmGetFreeBlocks(Count, FirstBlock, LastBlock);
+
+	/* Fall back to the whole of memory when the caller's window is full,
+	 * but only for masks that were not deliberately restrictive. */
+	if (Frame == -1 && Mask >= __MASK) {
+		Frame = MmGetFreeBlocks(Count, FirstBlock, MemoryBlocks);
+	}
+
+	if (Frame == -1) {
+		LogFatal("Physical_Memory", "out of memory: %d blocks under 0x%x",
+			Count, Mask);
+		return 0;
+	}
+
+	for (int i = 0; i < Count; i++) {
+		MmMemoryMapSetBit(Frame + i);
+	}
+	MemoryBlocksUsed += (size_t)Count;
+
+	return (PhysicalAddress_t)((uintptr_t)Frame * PAGE_SIZE);
+}
+
+/* MmPhyiscalGetSysMappingVirtual */
+VirtualAddress_t MmPhyiscalGetSysMappingVirtual(PhysicalAddress_t PhysicalAddress)
+{
+	for (int i = 0; i < 32; i++) {
+		if (SysMappings[i].Length != 0 && SysMappings[i].Type != 1)
+		{
+			PhysicalAddress_t Start = SysMappings[i].pAddressStart;
+			PhysicalAddress_t End = SysMappings[i].pAddressStart + SysMappings[i].Length;
+
+			if (PhysicalAddress >= Start && PhysicalAddress < End) {
+				return SysMappings[i].vAddressStart
+					+ (PhysicalAddress - SysMappings[i].pAddressStart);
+			}
+		}
+	}
+	return 0;
+}
