@@ -18,6 +18,9 @@
 #include <system/heap.h>
 // Interrupt manager
 #include <interrupts/interrupts.h>
+// Timers
+#include <system/timers.h>
+#include <arch/x86/pit8253.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -72,6 +75,44 @@ static void InterruptSelfTest(void)
     else {
         LogInformation("kmain", "interrupt self-test: unregistered cleanly");
     }
+}
+
+/* TimerSelfTest
+ * Fires the PIT for a second and checks that the tick counter, the ms
+ * counter and a periodic software timer all advance. Delete once you
+ * trust it. */
+static volatile int GlbTimerCallbackHits = 0;
+
+static void TimerSelfTestCallback(void *Args)
+{
+    (void)Args;
+    GlbTimerCallbackHits++;
+}
+
+static void TimerSelfTest(void)
+{
+    UUId_t Id;
+    size_t StartTicks, StartMs;
+
+    Id = TimersCreateTimer(TimerSelfTestCallback, NULL, TimerPeriodic, 100);
+    if (Id == UUID_INVALID) {
+        LogFatal("kmain", "could not create a periodic timer");
+        return;
+    }
+
+    StartTicks = TimersGetSystemTicks();
+    StartMs    = TimersGetSystemMs();
+
+    DelayMs(1000);
+
+    LogInformation("kmain", "timer self-test: %u ticks, %u ms elapsed",
+        TimersGetSystemTicks() - StartTicks, TimersGetSystemMs() - StartMs);
+    LogInformation("kmain", "timer self-test: 100ms callback ran %d times (expect ~10)",
+        GlbTimerCallbackHits);
+
+    TimersDestroyTimer(Id);
+    LogInformation("kmain", "timer self-test: destroyed, raw pit ticks = %u",
+        PitGetTicks());
 }
 
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
@@ -151,6 +192,18 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     // allocates a descriptor.
     InterruptInitialize();
     InterruptSelfTest();
+
+    // The timer registry has to exist before any tick source registers
+    // itself, so this comes before PitInitialize.
+    TimersInitialize();
+    if (PitInitialize(1000) == Success) {
+        // Nothing is delivered until now - every PIC line was masked and
+        // EFLAGS.IF was clear. Registering the PIT unmasked IRQ 0; this
+        // is what actually lets it through.
+        InterruptEnable();
+        LogInformation("kmain", "interrupts enabled");
+        TimerSelfTest();
+    }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

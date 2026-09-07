@@ -10,6 +10,7 @@
 #include <arch/x86/x32/idt.h>
 #include <arch/x86/x32/arch_x32.h>
 #include <arch/x86/pic.h>
+#include <system/timers.h>
 
 /* Assembly helpers from irq.asm */
 __EXTERN void ___cli(void);
@@ -304,6 +305,10 @@ void InterruptEntry(Context_t *Registers)
 		}
 
 		if (Result == InterruptHandled) {
+			/* Let the timer registry see it. It only acts if this is
+			 * the active tick source, so the cost on every other
+			 * interrupt is one comparison. */
+			TimersInterrupt(Entry->Id);
 			break;
 		}
 		Entry = Entry->Link;

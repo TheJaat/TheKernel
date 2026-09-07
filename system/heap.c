@@ -4,6 +4,7 @@
 #include <system/log.h>
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
+#include <interrupts/interrupts.h>
 
 /* Includes
  * - Library */
@@ -38,13 +39,26 @@ static Heap_t GlbKernelHeap;
 static int GlbHeapInitialized = 0;
 
 /* HeapLock / HeapUnlock
- * Placeholders. There is no threading and interrupts are masked, so
- * there is nothing to race against yet. When you add scheduling, this is
- * the only place that needs to change - either a spinlock or a
- * cli/sti pair saving EFLAGS (___getflags / ___cli / ___sti are already
- * exported from irq.asm). */
-static void HeapLock(Heap_t *Heap)   { (void)Heap; }
-static void HeapUnlock(Heap_t *Heap) { (void)Heap; }
+ * Now that the PIT is running, interrupt handlers can reach the heap and
+ * a tick landing in the middle of HeapAllocate would corrupt the node
+ * lists. Disabling interrupts is the right primitive here, not a
+ * spinlock: on one cpu it is cheaper, and it makes the
+ * interrupt-preempts-allocation case impossible rather than merely
+ * detectable. Swap to a spinlock plus this when you go SMP.
+ *
+ * Heap->Lock carries the previous interrupt state so it can be restored
+ * rather than blindly re-enabled - HeapAllocate is reachable from
+ * contexts that already had interrupts off. */
+static void HeapLock(Heap_t *Heap)
+{
+    int State = InterruptDisable();
+    Heap->Lock = State;
+}
+
+static void HeapUnlock(Heap_t *Heap)
+{
+    InterruptRestoreState(Heap->Lock);
+}
 
 /* HeapSetIdentifier
  * There is no strnlen in this libc, so copy at most HEAP_IDENT_SIZE-1

@@ -76,7 +76,9 @@ typedef enum {
 /* Time definitions that can help with 
  * conversion of the different time-units */
 #define FSEC_PER_NSEC                           1000000L
-#define NSEC_PER_MSEC                           1000L
+/* This was 1000L, which is microseconds per millisecond, not
+ * nanoseconds. Nothing used it yet, but the timer code does now. */
+#define NSEC_PER_MSEC                           1000000L
 #define MSEC_PER_SEC                            1000L
 #define NSEC_PER_SEC                            1000000000L
 #define FSEC_PER_SEC                            1000000000000000LL

@@ -7,6 +7,7 @@
 
 #include <video/interface/video_interface.h>
 #include <system/heap.h>
+#include <interrupts/interrupts.h>
 
 // Globals
 // UUId_t GlbLogFileHandle = UUID_INVALID;
@@ -216,6 +217,15 @@ void LogFlush(LogTarget_t Output)
 // Internal Log Print
 void LogInternalPrint(int LogType, const char *Header, const char *Message)
 {
+	/* A timer callback logging while the main path is mid-record would
+	 * interleave two records into GlbLog and garble both. Cheap to
+	 * prevent, impossible to debug afterwards.
+	 *
+	 * This does mean a full-screen scroll runs with interrupts off, which
+	 * will drop ticks. Acceptable while the log is the only output; worth
+	 * revisiting when the terminal gets a back buffer. */
+	int LogState = InterruptDisable();
+
 	/* Temporary format buffer 
 	 * used by fileprint */
 	int HeaderLen = (Header != NULL) ? (int)strlen(Header) : 0;
@@ -304,6 +314,7 @@ void LogInternalPrint(int LogType, const char *Header, const char *Message)
 		// TODO
 	}
 
+	InterruptRestoreState(LogState);
 }
 
 // Raw Log
