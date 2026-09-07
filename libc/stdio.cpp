@@ -11,11 +11,22 @@ void itoa(int value, char* str_buffer, int base) {
     char tmp_char;
     int tmp_value;
 
+    int negative = 0;
+
     // Handle the 0 value, explicitly
     if (value == 0) {
         *str_buffer++ = '0';
         *str_buffer = '\0';
         return;
+    }
+
+    // Negative values were not handled at all. value % base then yields
+    // non-positive remainders and tmp_value + '0' walks *below* '0' into
+    // punctuation - which is why -1 printed as '/' (ASCII 47, one below
+    // '0'). Work on the magnitude and prepend the sign.
+    if (value < 0 && base == 10) {
+        negative = 1;
+        value = -value;
     }
 
     // Process each digit
@@ -25,6 +36,10 @@ void itoa(int value, char* str_buffer, int base) {
         *ptr++ = (tmp_value < 10) ? (tmp_value + '0') : (tmp_value - 10 + 'a');
         // remove the last digit from the value.
         value /= base;
+    }
+
+    if (negative) {
+        *ptr++ = '-';
     }
 
     // Append the null terminator to the buffer

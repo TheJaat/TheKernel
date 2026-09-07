@@ -14,12 +14,65 @@
 #include <arch/x86/pic.h>
 // Physical Memory && Virtual Memory
 #include <arch/x86/memory.h>
-
+// Kernel Heap
 #include <system/heap.h>
+// Interrupt manager
+#include <interrupts/interrupts.h>
+#include <string.h>
 
 BootInfo_t x86BootInfo;
 
 const char* kernelInfo = "TheTaaJKernel Version 0.0.1, Author: TheJat";
+
+/* InterruptSelfTest
+ * Registers a handler on a free software vector and triggers it with an
+ * int instruction. This exercises the whole dispatch path - IDT gate,
+ * irq_common stub, InterruptEntry, table lookup, handler call - without
+ * needing a device or interrupts to be enabled, since a software int is
+ * not gated by EFLAGS.IF. Delete once the timer is up. */
+static volatile int GlbSelfTestHits = 0;
+
+extern "C" InterruptStatus_t InterruptSelfTestHandler(void *Data)
+{
+    (void)Data;
+    GlbSelfTestHits++;
+    return InterruptHandled;
+}
+
+static void InterruptSelfTest(void)
+{
+    Interrupt_t Irq;
+    UUId_t Id;
+
+    memset(&Irq, 0, sizeof(Interrupt_t));
+    for (int i = 0; i < INTERRUPT_MAXVECTORS; i++) {
+        Irq.Vectors[i] = INTERRUPT_NONE;
+    }
+    Irq.Vectors[0]   = 0xF0;
+    Irq.Line         = INTERRUPT_NONE;
+    Irq.Pin          = INTERRUPT_NONE;
+    Irq.FastHandler  = InterruptSelfTestHandler;
+    Irq.Data         = (void*)&GlbSelfTestHits;   // non-NULL: handler gets this
+
+    Id = InterruptRegister(&Irq, INTERRUPT_KERNEL | INTERRUPT_SOFTWARE);
+    if (Id == UUID_INVALID) {
+        LogFatal("kmain", "self-test could not register vector 0xF0");
+        return;
+    }
+
+    __asm__ volatile ("int $0xF0");
+    __asm__ volatile ("int $0xF0");
+
+    LogInformation("kmain", "interrupt self-test: handler ran %d times (expected 2)",
+        GlbSelfTestHits);
+
+    if (InterruptUnregister(Id) != Success) {
+        LogFatal("kmain", "self-test could not unregister");
+    }
+    else {
+        LogInformation("kmain", "interrupt self-test: unregistered cleanly");
+    }
+}
 
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
@@ -86,10 +139,18 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     LogDebug("kmain", "After virtual memory initialization");
 
+    // Initialize the kernel heap. Must come after MmVirtualInit, since it
+    // maps its pages on demand through MmVirtualMap.
     if (HeapInit() == Success) {
-        // HeapTest(); // For testing
+        // The first memory operation: move the log off the small static
+        // boot buffer and onto the heap.
         LogUpgrade(LOG_PREFFERED_SIZE);
     }
+
+    // The interrupt manager needs the heap, since every registration
+    // allocates a descriptor.
+    InterruptInitialize();
+    InterruptSelfTest();
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
 

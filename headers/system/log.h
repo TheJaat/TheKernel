@@ -47,12 +47,25 @@ OsStatus_t LogUpgrade(size_t Size);
 void LogRedirect(LogTarget_t Output);
 void LogFlush(LogTarget_t Output);
 
-// The log functions
-void Log(const char *Message, ...);
-void LogRaw(const char *Message, ...);
-void LogInformation(const char *System, const char *Message, ...);
-void LogDebug(const char *System, const char *Message, ...);
-void LogFatal(const char *System, const char *Message, ...);
+/* The log functions.
+ *
+ * noinline is load-bearing, not a style choice. These are variadic, and
+ * log.cpp calls them from LogUpgrade - i.e. from inside the same
+ * translation unit. At -O2 GCC inlines the callee into LogUpgrade, and
+ * the inlined va_start then resolves against LogUpgrade's own parameter
+ * list instead of the arguments actually passed. Every %u/%x then reads
+ * from the wrong stack slot and prints bytes of the format string.
+ * At -O1 the call is left alone and everything is fine, which makes this
+ * an unusually nasty thing to chase. */
+#ifndef __LOG_NOINLINE
+#define __LOG_NOINLINE __attribute__((noinline))
+#endif
+
+__LOG_NOINLINE void Log(const char *Message, ...);
+__LOG_NOINLINE void LogRaw(const char *Message, ...);
+__LOG_NOINLINE void LogInformation(const char *System, const char *Message, ...);
+__LOG_NOINLINE void LogDebug(const char *System, const char *Message, ...);
+__LOG_NOINLINE void LogFatal(const char *System, const char *Message, ...);
 
 #ifdef __cplusplus
 }

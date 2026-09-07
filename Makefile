@@ -57,7 +57,8 @@ $(SUBDIRS):
 # Compile root C++ sources
 $(BUILD_DIR)/%.o: %.cpp
 	@echo "Compiling $<..."
-	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER)
+	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER)
+# 	$(CXX) -c $< -o $@ $(CXX_FLAGS) $(INCLUDES) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER)
 
 # Assemble root ASM sources
 $(BUILD_DIR)/%.o: %.asm

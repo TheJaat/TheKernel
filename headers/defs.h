@@ -24,6 +24,11 @@ typedef reg32_t                     reg_t;
 #endif
 
 typedef unsigned int	UUId_t;
+
+/* Reserved id, returned by anything that hands out UUId_t on failure. */
+#ifndef UUID_INVALID
+	#define UUID_INVALID			((UUId_t)-1)
+#endif
 typedef unsigned int	Flags_t;
 
 #ifndef __EXTERN
