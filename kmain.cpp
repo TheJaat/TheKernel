@@ -87,7 +87,8 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     LogDebug("kmain", "After virtual memory initialization");
 
     if (HeapInit() == Success) {
-        HeapTest(); // For testing
+        // HeapTest(); // For testing
+        LogUpgrade(LOG_PREFFERED_SIZE);
     }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);

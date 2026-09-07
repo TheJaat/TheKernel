@@ -3,6 +3,7 @@
 
 /* Includes */
 #include <defs.h>
+#include <stddef.h>
 
 // Definitions
 typedef enum LogTarget
@@ -42,7 +43,7 @@ extern "C" {
 
 // Functions
 void LogInit(void);
-// void LogUpgrade(size_t Size);
+OsStatus_t LogUpgrade(size_t Size);
 void LogRedirect(LogTarget_t Output);
 void LogFlush(LogTarget_t Output);
 
