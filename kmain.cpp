@@ -21,6 +21,7 @@
 // Timers
 #include <system/timers.h>
 #include <arch/x86/pit8253.h>
+#include <system/iospace.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -115,6 +116,56 @@ static void TimerSelfTest(void)
         PitGetTicks());
 }
 
+/* IoSpaceSelfTest
+ * Checks registration, overlap rejection, the acquire/release lock and
+ * bounds checking. Uses a harmless unused port range. Delete once you
+ * trust it. */
+static void IoSpaceSelfTest(void)
+{
+    DeviceIoSpace_t A, B, C;
+
+    memset(&A, 0, sizeof(A));
+    A.Type = IO_SPACE_IO; A.PhysicalBase = 0x0278; A.Size = 8;  // LPT2, unused
+    if (IoSpaceRegister(&A) != Success) {
+        LogFatal("kmain", "io-space self-test: register failed");
+        return;
+    }
+
+    // Overlapping range must be rejected.
+    memset(&B, 0, sizeof(B));
+    B.Type = IO_SPACE_IO; B.PhysicalBase = 0x027C; B.Size = 8;
+    if (IoSpaceRegister(&B) == Success) {
+        LogFatal("kmain", "io-space self-test: overlap was NOT rejected");
+    }
+
+    // Adjacent but non-overlapping must be accepted.
+    memset(&C, 0, sizeof(C));
+    C.Type = IO_SPACE_IO; C.PhysicalBase = 0x0280; C.Size = 8;
+    if (IoSpaceRegister(&C) != Success) {
+        LogFatal("kmain", "io-space self-test: adjacent range was rejected");
+    }
+
+    if (IoSpaceAcquire(&A) != Success) {
+        LogFatal("kmain", "io-space self-test: acquire failed");
+    }
+    // Double acquire must fail.
+    if (IoSpaceAcquire(&A) == Success) {
+        LogFatal("kmain", "io-space self-test: double acquire succeeded");
+    }
+    // Destroy while acquired must fail.
+    if (IoSpaceDestroy(A.Id) == Success) {
+        LogFatal("kmain", "io-space self-test: destroyed while acquired");
+    }
+
+    IoSpaceRelease(&A);
+    if (IoSpaceDestroy(A.Id) != Success
+        || IoSpaceDestroy(C.Id) != Success) {
+        LogFatal("kmain", "io-space self-test: cleanup failed");
+    }
+
+    LogInformation("kmain", "io-space self-test: passed");
+}
+
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     // Store the passed arguments value in global data structure
@@ -196,6 +247,12 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
     // The timer registry has to exist before any tick source registers
     // itself, so this comes before PitInitialize.
     TimersInitialize();
+
+    // Drivers claim their register ranges through this, so it has to be
+    // up before the first one initializes.
+    IoSpaceInitialize();
+    IoSpaceSelfTest();
+
     if (PitInitialize(1000) == Success) {
         // Nothing is delivered until now - every PIC line was masked and
         // EFLAGS.IF was clear. Registering the PIT unmasked IRQ 0; this

@@ -4,6 +4,7 @@
 #include <arch/x86/pit8253.h>
 #include <interrupts/interrupts.h>
 #include <system/timers.h>
+#include <system/iospace.h>
 #include <system/log.h>
 
 /* Includes
@@ -15,6 +16,7 @@
  * allocated. It is written from interrupt context, hence volatile. */
 typedef struct _Pit {
     Interrupt_t     Interrupt;
+    DeviceIoSpace_t Io;
     UUId_t          Irq;
     size_t          Divisor;
     size_t          NsTick;
@@ -68,28 +70,53 @@ OsStatus_t PitInitialize(size_t Frequency)
         Divisor = 1;
     }
 
-    /* Derive the tick length from the divisor we can actually program,
-     * not from the frequency that was asked for. At 1000 Hz the divisor
-     * is 1193, which is really 1000.15 Hz - close, but the drift adds up
-     * if you pretend otherwise. */
-    ActualHz = PIT_BASE_FREQUENCY / Divisor;
-    if (ActualHz == 0) {
-        ActualHz = 1;
-    }
-
+    /* Tick length in nanoseconds is Divisor * 1e9 / PIT_BASE_FREQUENCY.
+     *
+     * Doing that as 1000000000 / (BASE / Divisor) does not work: the
+     * inner division truncates 1000.15 Hz to 1000, and the answer comes
+     * out a flat 1000000 ns instead of 999847 - 152 ns of error per
+     * tick, which is 13 seconds of drift per day.
+     *
+     * The direct form needs Divisor * 1e9, which overflows 32 bits, and
+     * a 64-bit divide would pull in __udivdi3 from libgcc which this
+     * kernel does not link. So split the constant:
+     *
+     *     1e9 = PIT_BASE_FREQUENCY * 838 + 113484
+     *     113484 / 1193182  reduces to  56742 / 596591
+     *
+     * The largest intermediate is 65535 * 56742 = 3718586970, which
+     * still fits in a uint32. Accurate to under 1 ns per tick across the
+     * whole 19 Hz - 1193182 Hz range. */
     memset(&GlbPit, 0, sizeof(Pit_t));
     GlbPit.Divisor = Divisor;
-    GlbPit.NsTick  = 1000000000u / ActualHz;
+    GlbPit.NsTick  = (Divisor * PIT_NS_WHOLE)
+                   + ((Divisor * PIT_NS_REM_NUM) / PIT_NS_REM_DEN);
     GlbPit.Ticks   = 0;
+
+    /* Only used for the log line - the real number is NsTick. */
+    ActualHz = PIT_BASE_FREQUENCY / Divisor;
+
+    /* Claim the port range before touching it. If some other driver has
+     * already taken 0x40-0x44 this fails here rather than silently
+     * fighting over the chip. */
+    GlbPit.Io.Type         = IO_SPACE_IO;
+    GlbPit.Io.PhysicalBase = PIT_IO_BASE;
+    GlbPit.Io.Size         = PIT_IO_LENGTH;
+    if (IoSpaceRegister(&GlbPit.Io) != Success
+        || IoSpaceAcquire(&GlbPit.Io) != Success) {
+        LogFatal("PIT", "could not claim ports 0x%x + 0x%x",
+            PIT_IO_BASE, PIT_IO_LENGTH);
+        return Error;
+    }
 
     /* Mode 2 (rate generator) rather than mode 3 (square wave). Mode 3
      * halves the counter each half-cycle and misbehaves with odd
      * divisors; mode 2 gives one pulse every N inputs, which is what a
      * tick source wants. */
-    outb(PIT_REGISTER_COMMAND,
-        PIT_COMMAND_COUNTER_0 | PIT_COMMAND_FULL | PIT_COMMAND_MODE2);
-    outb(PIT_REGISTER_COUNTER0, (uint8_t)(Divisor & 0xFF));
-    outb(PIT_REGISTER_COUNTER0, (uint8_t)((Divisor >> 8) & 0xFF));
+    IoSpaceWrite(&GlbPit.Io, PIT_OFFSET_COMMAND,
+        PIT_COMMAND_COUNTER_0 | PIT_COMMAND_FULL | PIT_COMMAND_MODE2, 1);
+    IoSpaceWrite(&GlbPit.Io, PIT_OFFSET_COUNTER0, (Divisor & 0xFF), 1);
+    IoSpaceWrite(&GlbPit.Io, PIT_OFFSET_COUNTER0, ((Divisor >> 8) & 0xFF), 1);
 
     /* Register the handler. This unmasks IRQ 0, so from here the chip
      * will interrupt as soon as EFLAGS.IF is set. */

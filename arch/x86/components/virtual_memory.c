@@ -175,6 +175,35 @@ MmVirtualGetCurrentDirectory(
 	return g_PageDirectories[Cpu];
 }
 
+/* MmReserveMemory
+ * Hands out virtual address space from the kernel's reserved window.
+ * The SysMappings loop in MmVirtualInit fills the bottom of this region
+ * at boot; anything reserved afterwards continues from where it stopped.
+ *
+ * This only ever bumps the pointer - there is no free. Fine for device
+ * registers, which are mapped once and kept, and it is what the
+ * reference does too. */
+VirtualAddress_t
+MmReserveMemory(
+	 int Pages)
+{
+	uintptr_t ReturnAddress;
+
+	if (Pages <= 0) {
+		return 0;
+	}
+	if ((g_ReservedPtr + (uintptr_t)(Pages * PAGE_SIZE))
+		>= MEMORY_LOCATION_KERNEL_END) {
+		LogFatal("Virtual_Memory", "reserved space exhausted at 0x%x",
+			g_ReservedPtr);
+		return 0;
+	}
+
+	ReturnAddress = g_ReservedPtr;
+	g_ReservedPtr += (uintptr_t)(Pages * PAGE_SIZE);
+	return (VirtualAddress_t)ReturnAddress;
+}
+
 /* MmVirtualInitialMap
  * Maps a single page into the kernel directory. Only safe to call
  * while the frame the page-table lives in is still reachable 1:1. */

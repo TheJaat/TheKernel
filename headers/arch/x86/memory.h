@@ -121,6 +121,11 @@ OsStatus_t MmVirtualMap(void *PageDirectory, PhysicalAddress_t pAddress, Virtual
  */
 OsStatus_t MmVirtualInit(void);
 
+/* MmReserveMemory
+ * Allocates <Pages> pages of kernel reserved virtual address space.
+ * Returns 0 when the region is exhausted. Bump-allocated, never freed. */
+VirtualAddress_t MmReserveMemory(int Pages);
+
 
 /* MmVirtualGetMapping
  * Retrieves the physical address mapping of the

@@ -6,6 +6,13 @@
 
 /* Io-space for accessing the PIT. Spans 0x40-0x44. */
 #define PIT_IO_BASE                 0x40
+#define PIT_IO_LENGTH               0x04
+
+/* Offsets within the io-space, as opposed to absolute ports. */
+#define PIT_OFFSET_COUNTER0         0x00
+#define PIT_OFFSET_COUNTER1         0x01
+#define PIT_OFFSET_COUNTER2         0x02
+#define PIT_OFFSET_COMMAND          0x03
 #define PIT_REGISTER_COUNTER0       0x40
 #define PIT_REGISTER_COUNTER1       0x41
 #define PIT_REGISTER_COUNTER2       0x42
@@ -36,6 +43,14 @@
 
 /* The crystal feeding the chip. Every divisor is derived from this. */
 #define PIT_BASE_FREQUENCY          1193182
+
+/* Constants for converting a divisor to nanoseconds in 32-bit integer
+ * arithmetic. See the comment in PitInitialize.
+ *   1e9 = PIT_BASE_FREQUENCY * 838 + 113484, and 113484/1193182
+ *   reduces to 56742/596591. */
+#define PIT_NS_WHOLE                838
+#define PIT_NS_REM_NUM              56742
+#define PIT_NS_REM_DEN              596591
 
 /* IRQ 0 is hardwired to channel 0 on every PC. */
 #define PIT_IRQ                     0
