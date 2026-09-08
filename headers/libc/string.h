@@ -18,6 +18,10 @@ char *strchr(const char *str, int ch);
 
 size_t strlen(const char *str);
 
+int strcmp(const char *a, const char *b);
+
+int strncmp(const char *a, const char *b, size_t count);
+
 void *memset(void *dest, int c, size_t count);
 
 void *memcpy(void *dest, const void *src, size_t count);

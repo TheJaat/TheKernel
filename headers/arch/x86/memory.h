@@ -90,6 +90,8 @@ typedef struct SystemMemoryMapping {
 extern "C" {
 #endif
 
+void MmMemoryDebugPrint(void);
+
 /* MmPhyiscalInit
  * This is the physical memory manager initializor
  * It reads the multiboot memory descriptor(s), initialies

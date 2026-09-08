@@ -114,3 +114,42 @@ size_t strlen(const char *str) {
         s++;
     return s - str;
 }
+
+/* strcmp
+ * Compares two strings. Returns <0, 0 or >0.
+ *
+ * The comparison is done on unsigned chars deliberately: with signed
+ * chars any byte above 0x7F sorts before 'a', which makes the ordering
+ * wrong for anything non-ASCII. */
+int strcmp(const char *a, const char *b)
+{
+    const unsigned char *p = (const unsigned char*)a;
+    const unsigned char *q = (const unsigned char*)b;
+
+    while (*p != '\0' && *p == *q) {
+        p++;
+        q++;
+    }
+    return (int)*p - (int)*q;
+}
+
+/* strncmp
+ * As strcmp, but stops after <count> bytes. */
+int strncmp(const char *a, const char *b, size_t count)
+{
+    const unsigned char *p = (const unsigned char*)a;
+    const unsigned char *q = (const unsigned char*)b;
+
+    while (count > 0) {
+        if (*p != *q) {
+            return (int)*p - (int)*q;
+        }
+        if (*p == '\0') {
+            return 0;
+        }
+        p++;
+        q++;
+        count--;
+    }
+    return 0;
+}
