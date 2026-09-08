@@ -22,6 +22,9 @@
 #include <system/timers.h>
 #include <arch/x86/pit8253.h>
 #include <system/iospace.h>
+// Threading
+#include <system/threading.h>
+#include <system/scheduler.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -166,6 +169,48 @@ static void IoSpaceSelfTest(void)
     LogInformation("kmain", "io-space self-test: passed");
 }
 
+/* ThreadSelfTest
+ * Spawns three threads. Two sleep at different intervals and log, the
+ * third exits immediately so the zombie reaping path gets exercised.
+ * Delete once you trust it. */
+static volatile int GlbWorkerTicks[2] = { 0, 0 };
+
+static void ThreadWorker(void *Args)
+{
+    int Index = (int)(uintptr_t)Args;
+    int i;
+
+    for (i = 0; i < 5; i++) {
+        SleepMs(200 + (Index * 100));
+        GlbWorkerTicks[Index]++;
+        LogInformation("worker", "thread %d woke, count %d at %u ms",
+            Index, GlbWorkerTicks[Index], TimersGetSystemMs());
+    }
+}
+
+static void ThreadShortLived(void *Args)
+{
+    (void)Args;
+    LogInformation("worker", "short-lived thread ran and is exiting");
+}
+
+static void ThreadSelfTest(void)
+{
+    ThreadingCreateThread("worker0", ThreadWorker, (void*)0, 0);
+    ThreadingCreateThread("worker1", ThreadWorker, (void*)1, 0);
+    ThreadingCreateThread("brief", ThreadShortLived, NULL, 0);
+
+    ThreadingPrint();
+
+    // The boot thread sleeps too, so everything has to be scheduled -
+    // if the switch is broken this never returns.
+    SleepMs(1500);
+
+    LogInformation("kmain", "thread self-test: worker0 %d, worker1 %d (expect 5, 5)",
+        GlbWorkerTicks[0], GlbWorkerTicks[1]);
+    ThreadingPrint();
+}
+
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     // Store the passed arguments value in global data structure
@@ -257,9 +302,17 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
         // Nothing is delivered until now - every PIC line was masked and
         // EFLAGS.IF was clear. Registering the PIT unmasked IRQ 0; this
         // is what actually lets it through.
+        // Threading has to be up before interrupts are enabled: the
+        // first tick can preempt, and it needs somewhere to go.
+        SchedulerInit(0);
+        if (ThreadingInitialize(0) != Success) {
+            LogFatal("kmain", "threading failed to initialize");
+        }
+
         InterruptEnable();
         LogInformation("kmain", "interrupts enabled");
         TimerSelfTest();
+        ThreadSelfTest();
     }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);

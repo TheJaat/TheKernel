@@ -85,6 +85,11 @@ size_t TimersGetSystemMs(void);
 void DelayMs(size_t MilliSeconds);
 void StallMs(size_t MilliSeconds);
 
+/* SleepMs
+ * Blocks the calling thread for <MilliSeconds> and lets another run.
+ * Falls back to DelayMs before threading is up. */
+void SleepMs(size_t MilliSeconds);
+
 #ifdef __cplusplus
 }
 #endif

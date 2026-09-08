@@ -11,6 +11,7 @@
 #include <arch/x86/x32/arch_x32.h>
 #include <arch/x86/pic.h>
 #include <system/timers.h>
+#include <system/threading.h>
 
 /* Assembly helpers from irq.asm */
 __EXTERN void ___cli(void);
@@ -270,6 +271,8 @@ void InterruptEntry(Context_t *Registers)
 	InterruptStatus_t Result = InterruptNotHandled;
 	int TableIndex = (int)Registers->Irq + PIC_VECTOR_BASE;
 	int Line = INTERRUPT_NONE;
+	int Reschedule = 0;
+	int PreEmptive = 0;
 
 	if (TableIndex < 0 || TableIndex >= IDT_DESCRIPTORS) {
 		LogFatal("Interrupts", "vector %d out of range", TableIndex);
@@ -308,7 +311,11 @@ void InterruptEntry(Context_t *Registers)
 			/* Let the timer registry see it. It only acts if this is
 			 * the active tick source, so the cost on every other
 			 * interrupt is one comparison. */
-			TimersInterrupt(Entry->Id);
+			if (TimersInterrupt(Entry->Id) == Success) {
+				/* The system tick. This is what preempts. */
+				Reschedule = 1;
+				PreEmptive = 1;
+			}
 			break;
 		}
 		Entry = Entry->Link;
@@ -323,6 +330,23 @@ void InterruptEntry(Context_t *Registers)
 	if (Result != InterruptHandled) {
 		LogFatal("Interrupts", "unhandled interrupt, vector %d (line %d)",
 			TableIndex, Line);
+	}
+
+	/* A thread asking to be rescheduled. Not preemptive - it gets a
+	 * fresh slice rather than being charged for the one it gave up. */
+	if (TableIndex == THREADING_YIELD_VECTOR) {
+		Reschedule = 1;
+		PreEmptive = 0;
+	}
+
+	/* The switch has to be the very last thing: enter_thread never
+	 * returns, so anything after it - including the EOI above - would
+	 * simply not happen. */
+	if (Reschedule && ThreadingIsEnabled()) {
+		Context_t *Next = _ThreadingSwitch(Registers, PreEmptive);
+		if (Next != Registers) {
+			enter_thread(Next);
+		}
 	}
 }
 

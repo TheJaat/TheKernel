@@ -4,6 +4,7 @@ segment .text
 ;Functions in this asm
 global exception_common
 global irq_common
+global enter_thread
 global syscall_entry
 global ___cli
 global ___sti
@@ -145,6 +146,31 @@ irq_common:
 	add esp, 0x8
 
 	; Return
+	iret
+
+;void enter_thread(Context_t *Context)
+;Loads a saved register frame and iret's into it. Does not return.
+;
+;This is the exit half of irq_common with esp pointed at a different
+;frame - the pop order below must stay identical to the one there, or a
+;switch will restore garbage segments.
+enter_thread:
+	; The argument, before we throw the current stack away
+	mov eax, [esp + 4]
+	mov esp, eax
+
+	; Restore state - same order as irq_common
+	popad
+
+	pop gs
+	pop fs
+	pop es
+	pop ds
+
+	; Cleanup IrqNum & IrqErrorCode
+	add esp, 0x8
+
+	; Into the thread
 	iret
 
 ; Macros

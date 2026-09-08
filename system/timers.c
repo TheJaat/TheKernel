@@ -3,6 +3,8 @@
 #include <system/timers.h>
 #include <system/log.h>
 #include <interrupts/interrupts.h>
+#include <system/scheduler.h>
+#include <system/threading.h>
 
 /* Includes
  * - Library */
@@ -136,6 +138,10 @@ static void TimersTick(size_t NsTick)
     GlbNsRemainder -= MilliTicks * 1000000u;
     GlbSystemMs += MilliTicks;
 
+    /* Advance sleeping threads before the software timers, so a thread
+     * woken this tick is runnable by the time the scheduler looks. */
+    SchedulerApplyMs(MilliTicks);
+
     for (i = 0; i < TIMERS_MAX_SOFTWARE; i++) {
         Timer_t *Timer = &GlbTimers[i];
 
@@ -267,8 +273,22 @@ void DelayMs(size_t MilliSeconds)
     }
 }
 
-/* StallMs */
+/* StallMs
+ * Busy-waits without giving up the cpu. Use SleepMs unless you are in a
+ * context that cannot yield. */
 void StallMs(size_t MilliSeconds)
 {
     DelayMs(MilliSeconds);
+}
+
+/* SleepMs
+ * Blocks the calling thread and lets something else run. Falls back to
+ * busy-waiting when threading is not up yet. */
+void SleepMs(size_t MilliSeconds)
+{
+    if (ThreadingIsEnabled() == 0) {
+        DelayMs(MilliSeconds);
+        return;
+    }
+    SchedulerSleepThread(MilliSeconds);
 }
