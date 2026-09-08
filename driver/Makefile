@@ -8,7 +8,7 @@ include $(ROOT_DIR)/config.mk
 
 # Define directories
 BUILD_DIR = $(ROOT_DIR)/build/driver
-SUBDIRS = video # Add your subdirectories here if any
+SUBDIRS = video input # Add your subdirectories here if any
 
 # Define source files
 C_SOURCES =

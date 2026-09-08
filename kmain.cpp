@@ -27,6 +27,8 @@
 #include <system/scheduler.h>
 #include <system/mutex.h>
 #include <system/semaphore.h>
+#include <system/pipe.h>
+#include <driver/ps2_keyboard.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -288,6 +290,55 @@ static void SyncSelfTest(void)
     LogInformation("kmain", "sync self-test: recursive lock/unlock survived");
 }
 
+/* KeyboardEcho
+ * Reads decoded keystrokes off the driver's pipe and prints them. This
+ * blocks in PipeRead, so it costs nothing while nobody is typing.
+ *
+ * It is also the first end-to-end use of everything built so far: an
+ * io-space claim, a hardware interrupt, a pipe, a semaphore and a
+ * thread, all in one path. */
+static void KeyboardEcho(void *Args)
+{
+    Pipe_t *Pipe = (Pipe_t*)Args;
+    uint8_t Buffer[16];
+    size_t Read, i;
+
+    for (;;) {
+        Read = PipeRead(Pipe, Buffer, sizeof(Buffer), 0);
+        for (i = 0; i < Read; i++) {
+            char c = (char)Buffer[i];
+            if (c == '\n') {
+                LogInformation("kbd", "[enter]  scancodes=%u dropped=%u",
+                    Ps2KeyboardGetScancodes(), Ps2KeyboardGetDropped());
+            }
+            else if (c == '\b') {
+                LogInformation("kbd", "[backspace]");
+            }
+            else {
+                printf("%c", c);
+            }
+        }
+    }
+}
+
+static void KeyboardSelfTest(void)
+{
+    Pipe_t *Pipe;
+
+    if (Ps2KeyboardInitialize() != Success) {
+        LogFatal("kmain", "keyboard failed to initialize");
+        return;
+    }
+
+    Pipe = Ps2KeyboardGetPipe();
+    if (Pipe == NULL) {
+        return;
+    }
+
+    ThreadingCreateThread("kbd-echo", KeyboardEcho, Pipe, 0);
+    LogInformation("kmain", "keyboard ready - type something");
+}
+
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
     // Store the passed arguments value in global data structure
@@ -394,6 +445,7 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
         TimerSelfTest();
         ThreadSelfTest();
         SyncSelfTest();
+        KeyboardSelfTest();
     }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);
