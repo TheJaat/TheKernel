@@ -52,6 +52,14 @@ typedef struct _Thread {
 
     long            SleepMsLeft;
     int             TimeSliceLeft;
+
+    /* What this thread is blocked on, when it is blocked on a mutex or
+     * semaphore rather than on time. NULL for a plain sleep. Signalling
+     * scans the thread table for this rather than every lock keeping its
+     * own wait queue - 32 threads makes the scan cheaper than the
+     * bookkeeping would be. */
+    void           *WaitObject;
+    int             WaitTimedOut;
 } Thread_t;
 
 #ifdef __cplusplus

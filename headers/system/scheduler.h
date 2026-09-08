@@ -26,6 +26,21 @@ void SchedulerSleepThread(size_t MilliSeconds);
  * Moves a blocked thread back to ready. */
 void SchedulerWakeThread(UUId_t ThreadId);
 
+/* SchedulerBlockOn
+ * Blocks the current thread on <Object> until it is signalled, or until
+ * <TimeoutMs> elapses. A timeout of 0 waits forever. Returns Success if
+ * signalled, Error if it timed out.
+ *
+ * Must not be called from interrupt context - it yields. */
+OsStatus_t SchedulerBlockOn(void *Object, size_t TimeoutMs);
+
+/* SchedulerWakeOne / SchedulerWakeAll
+ * Releases threads blocked on <Object>. Safe from interrupt context:
+ * neither allocates nor yields. SchedulerWakeOne returns the number
+ * woken, so a caller can tell whether anyone was waiting. */
+int SchedulerWakeOne(void *Object);
+int SchedulerWakeAll(void *Object);
+
 /* SchedulerApplyMs
  * Advances sleep timers. Called from TimersTick, so it runs in
  * interrupt context and must not allocate. */

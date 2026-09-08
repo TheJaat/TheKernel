@@ -25,6 +25,8 @@
 // Threading
 #include <system/threading.h>
 #include <system/scheduler.h>
+#include <system/mutex.h>
+#include <system/semaphore.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -204,11 +206,86 @@ static void ThreadSelfTest(void)
 
     // The boot thread sleeps too, so everything has to be scheduled -
     // if the switch is broken this never returns.
-    SleepMs(1500);
+    //
+    // 1500 was too tight: worker1 does 5 x 300ms and does not finish
+    // until ~1520ms after it starts, so the check below ran while its
+    // last iteration was still asleep and reported 4. Leave margin for
+    // sleep granularity and scheduling latency.
+    SleepMs(2200);
 
     LogInformation("kmain", "thread self-test: worker0 %d, worker1 %d (expect 5, 5)",
         GlbWorkerTicks[0], GlbWorkerTicks[1]);
     ThreadingPrint();
+}
+
+/* SyncSelfTest
+ * Producer/consumer over a semaphore, plus a mutex guarding a shared
+ * counter that two threads hammer. If the mutex is broken the counter
+ * ends up short; if the semaphore is broken the consumer stalls.
+ * Delete once you trust it. */
+static Semaphore_t GlbTestSem;
+static Mutex_t GlbTestMutex;
+static volatile int GlbShared = 0;
+static volatile int GlbConsumed = 0;
+static volatile int GlbProducersDone = 0;
+
+static void SyncProducer(void *Args)
+{
+    int i;
+    (void)Args;
+
+    for (i = 0; i < 20; i++) {
+        // Contended increments. Without the mutex, two read-modify-writes
+        // across a preemption lose one.
+        MutexLock(&GlbTestMutex);
+        GlbShared++;
+        MutexUnlock(&GlbTestMutex);
+
+        SemaphoreV(&GlbTestSem, 1);
+        SleepMs(10);
+    }
+
+    MutexLock(&GlbTestMutex);
+    GlbProducersDone++;
+    MutexUnlock(&GlbTestMutex);
+}
+
+static void SyncConsumer(void *Args)
+{
+    (void)Args;
+
+    for (;;) {
+        if (SemaphoreP(&GlbTestSem, 500) != Success) {
+            break;      // timed out, producers must be finished
+        }
+        GlbConsumed++;
+    }
+    LogInformation("sync", "consumer stopped after %d items", GlbConsumed);
+}
+
+static void SyncSelfTest(void)
+{
+    SemaphoreConstruct(&GlbTestSem, 0);
+    MutexConstruct(&GlbTestMutex);
+    GlbShared = 0; GlbConsumed = 0; GlbProducersDone = 0;
+
+    ThreadingCreateThread("prod0", SyncProducer, NULL, 0);
+    ThreadingCreateThread("prod1", SyncProducer, NULL, 0);
+    ThreadingCreateThread("cons",  SyncConsumer, NULL, 0);
+
+    SleepMs(1200);
+
+    LogInformation("kmain", "sync self-test: shared=%d (expect 40), consumed=%d (expect 40)",
+        GlbShared, GlbConsumed);
+    LogInformation("kmain", "sync self-test: producers done=%d (expect 2)",
+        GlbProducersDone);
+
+    // Recursion must not deadlock.
+    MutexLock(&GlbTestMutex);
+    MutexLock(&GlbTestMutex);
+    MutexUnlock(&GlbTestMutex);
+    MutexUnlock(&GlbTestMutex);
+    LogInformation("kmain", "sync self-test: recursive lock/unlock survived");
 }
 
 extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
@@ -311,8 +388,12 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
         InterruptEnable();
         LogInformation("kmain", "interrupts enabled");
+        // Callbacks can leave interrupt context now that threads exist.
+        TimersStartWorker();
+
         TimerSelfTest();
         ThreadSelfTest();
+        SyncSelfTest();
     }
 
     // TerminalDrawPixel(&BootTerminal, 100, 100, 0x00ff0000);

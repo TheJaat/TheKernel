@@ -5,6 +5,7 @@
 #include <interrupts/interrupts.h>
 #include <system/scheduler.h>
 #include <system/threading.h>
+#include <system/semaphore.h>
 
 /* Includes
  * - Library */
@@ -27,6 +28,13 @@ static size_t GlbNsRemainder = 0;
 
 static UUId_t GlbTimerIds = 0;
 static int GlbTimersInitialized = 0;
+
+/* Callbacks used to run inside the tick, with interrupts off. Now the
+ * tick only marks a timer pending and signals this semaphore; the worker
+ * thread runs the callback in normal thread context, where it may block,
+ * allocate and log freely. */
+static Semaphore_t GlbTimerSignal;
+static int GlbTimerWorkerRunning = 0;
 
 /* TimersInitialize */
 void TimersInitialize(void)
@@ -124,6 +132,7 @@ OsStatus_t TimersRegister(UUId_t Source, size_t NsTick)
 static void TimersTick(size_t NsTick)
 {
     size_t MilliTicks;
+    int Fired = 0;
     int i;
 
     GlbSystemTicks++;
@@ -163,10 +172,80 @@ static void TimersTick(size_t NsTick)
             Timer->Used = 0;
         }
 
+        /* Mark and signal rather than call. Setting a flag is
+         * idempotent, so a timer that expires again before the worker
+         * has drained it simply stays pending instead of needing a
+         * queue that could overflow in interrupt context. */
         if (Timer->Callback != NULL) {
-            Timer->Callback(Timer->Args);
+            if (GlbTimerWorkerRunning) {
+                Timer->Pending = 1;
+                Fired++;
+            }
+            else {
+                /* No worker yet - early boot. Call inline, as before. */
+                Timer->Callback(Timer->Args);
+            }
         }
     }
+
+    if (Fired > 0) {
+        SemaphoreV(&GlbTimerSignal, Fired);
+    }
+}
+
+/* TimersWorker
+ * Drains pending timer callbacks. Runs as an ordinary thread, so a
+ * callback here may do anything a thread may do. */
+static void TimersWorker(void *Args)
+{
+    (void)Args;
+
+    for (;;) {
+        SemaphoreP(&GlbTimerSignal, 0);
+
+        for (int i = 0; i < TIMERS_MAX_SOFTWARE; i++) {
+            TimerHandler_t Callback = NULL;
+            void *CallbackArgs = NULL;
+            int State = InterruptDisable();
+
+            if (GlbTimers[i].Pending != 0) {
+                GlbTimers[i].Pending = 0;
+                Callback     = GlbTimers[i].Callback;
+                CallbackArgs = GlbTimers[i].Args;
+            }
+
+            InterruptRestoreState(State);
+
+            /* Outside the critical section, so the callback runs with
+             * interrupts on and can be preempted like anything else. */
+            if (Callback != NULL) {
+                Callback(CallbackArgs);
+            }
+        }
+    }
+}
+
+/* TimersStartWorker */
+OsStatus_t TimersStartWorker(void)
+{
+    if (GlbTimersInitialized != 1) {
+        return Error;
+    }
+    if (GlbTimerWorkerRunning != 0) {
+        return Success;
+    }
+
+    SemaphoreConstruct(&GlbTimerSignal, 0);
+
+    if (ThreadingCreateThread("timers", TimersWorker, NULL, 0)
+        == UUID_INVALID) {
+        LogFatal("Timers", "could not start the worker thread");
+        return Error;
+    }
+
+    GlbTimerWorkerRunning = 1;
+    LogInformation("Timers", "worker started, callbacks now run in thread context");
+    return Success;
 }
 
 /* TimersInterrupt */

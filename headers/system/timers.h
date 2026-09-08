@@ -34,6 +34,7 @@ typedef struct _Timer {
     size_t          PeriodicMs;
     long            MsLeft;
     int             Used;
+    volatile int    Pending;    /* expired, waiting for the worker */
 } Timer_t;
 
 #ifdef __cplusplus
@@ -43,6 +44,11 @@ extern "C" {
 /* TimersInitialize
  * Prepares the timer tables. Call before any tick source registers. */
 void TimersInitialize(void);
+
+/* TimersStartWorker
+ * Spawns the thread that runs expired callbacks. Call once threading is
+ * up; until then callbacks run inline in the tick. */
+OsStatus_t TimersStartWorker(void);
 
 /* TimersRegister
  * Registers an interrupt as a system tick source. <Source> is the id
@@ -61,10 +67,10 @@ OsStatus_t TimersInterrupt(UUId_t Source);
  * Registers a callback to fire after <TimeoutMs>, once or repeatedly.
  * Returns UUID_INVALID if the table is full.
  *
- * The callback runs in INTERRUPT CONTEXT with interrupts disabled. It
- * must not allocate, must not log at length, and must be quick. The
- * reference spawns a thread per expiry instead; do that once threading
- * exists. */
+ * Once TimersStartWorker has run, the callback executes in ordinary
+ * thread context and may block, allocate and log freely. Before that -
+ * during early boot - it runs inline in the tick with interrupts off and
+ * must be short. */
 UUId_t TimersCreateTimer(TimerHandler_t Callback, void *Args,
     TimerType_t Type, size_t TimeoutMs);
 

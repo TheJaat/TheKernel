@@ -80,14 +80,101 @@ void SchedulerSleepThread(size_t MilliSeconds)
         return;
     }
 
-    Current->SleepMsLeft = (long)MilliSeconds;
-    Current->State = ThreadStateBlocked;
+    Current->SleepMsLeft  = (long)MilliSeconds;
+    Current->WaitObject   = NULL;   /* a plain sleep, not an object wait */
+    Current->WaitTimedOut = 0;
+    Current->State        = ThreadStateBlocked;
 
     InterruptRestoreState(State);
 
     /* Yield outside the critical section, so the switch happens with
      * interrupts in whatever state the caller had. */
     ThreadingYield();
+}
+
+/* SchedulerBlockOn */
+OsStatus_t SchedulerBlockOn(void *Object, size_t TimeoutMs)
+{
+    Thread_t *Current;
+    int State;
+
+    if (ThreadingIsEnabled() == 0 || Object == NULL) {
+        return Error;
+    }
+
+    State = InterruptDisable();
+    Current = ThreadingGetCurrentThread(0);
+
+    if (Current == NULL) {
+        InterruptRestoreState(State);
+        return Error;
+    }
+    if (Current->Flags & THREADING_IDLE) {
+        InterruptRestoreState(State);
+        LogFatal("Scheduler", "the idle thread tried to block on an object");
+        return Error;
+    }
+
+    Current->WaitObject   = Object;
+    Current->WaitTimedOut = 0;
+    Current->SleepMsLeft  = (long)TimeoutMs;   /* 0 means forever */
+    Current->State        = ThreadStateBlocked;
+
+    InterruptRestoreState(State);
+
+    ThreadingYield();
+
+    /* Back here once woken - either by a signal or by the timeout in
+     * SchedulerApplyMs. */
+    return (Current->WaitTimedOut != 0) ? Error : Success;
+}
+
+/* SchedulerWakeInternal
+ * Caller holds interrupts off. Returns how many it woke. */
+static int SchedulerWakeInternal(void *Object, int Limit)
+{
+    Thread_t *Table = ThreadingGetTable();
+    int Woken = 0;
+    int i;
+
+    for (i = 0; i < THREADING_MAX_THREADS; i++) {
+        Thread_t *Thread = &Table[i];
+
+        if (Thread->State != ThreadStateBlocked
+            || Thread->WaitObject != Object) {
+            continue;
+        }
+
+        Thread->WaitObject   = NULL;
+        Thread->WaitTimedOut = 0;
+        Thread->SleepMsLeft  = 0;
+        Thread->State        = ThreadStateReady;
+        Woken++;
+
+        if (Limit > 0 && Woken >= Limit) {
+            break;
+        }
+    }
+
+    return Woken;
+}
+
+/* SchedulerWakeOne */
+int SchedulerWakeOne(void *Object)
+{
+    int State = InterruptDisable();
+    int Woken = SchedulerWakeInternal(Object, 1);
+    InterruptRestoreState(State);
+    return Woken;
+}
+
+/* SchedulerWakeAll */
+int SchedulerWakeAll(void *Object)
+{
+    int State = InterruptDisable();
+    int Woken = SchedulerWakeInternal(Object, 0);
+    InterruptRestoreState(State);
+    return Woken;
 }
 
 /* SchedulerApplyMs
@@ -119,6 +206,13 @@ void SchedulerApplyMs(size_t MilliSeconds)
         Thread->SleepMsLeft -= (long)MilliSeconds;
         if (Thread->SleepMsLeft <= 0) {
             Thread->SleepMsLeft = 0;
+            /* A thread waiting on an object that ran out of time has to
+             * be told, or it cannot distinguish "signalled" from "gave
+             * up" when it wakes. */
+            if (Thread->WaitObject != NULL) {
+                Thread->WaitTimedOut = 1;
+                Thread->WaitObject = NULL;
+            }
             Thread->State = ThreadStateReady;
         }
     }
