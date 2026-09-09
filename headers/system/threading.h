@@ -99,6 +99,11 @@ Thread_t *ThreadingGetThread(UUId_t ThreadId);
  * so an early tick cannot reschedule into nothing. */
 int ThreadingIsEnabled(void);
 
+/* ThreadingEnableGc
+ * Moves zombie collection from the idle thread onto the garbage
+ * collector. Call after GcInitialize. */
+OsStatus_t ThreadingEnableGc(void);
+
 /* ThreadingReapZombies
  * Frees the stacks of exited threads. Called from the idle thread,
  * because a thread cannot free the stack it is standing on. */

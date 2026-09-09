@@ -291,6 +291,65 @@ MmVirtualMap(
 	return Success;
 }
 
+/* MmVirtualUnmap
+ * Removes a mapping and optionally releases the physical frame behind
+ * it. Returns Error if nothing was mapped there.
+ *
+ * The page-table itself is left installed. Reclaiming it would mean
+ * proving every one of its 1024 entries is clear, and a directory entry
+ * costs 4 KB of physical memory against the several MB a re-map would
+ * otherwise churn - not a trade worth making yet. */
+OsStatus_t
+MmVirtualUnmap(
+	 void *PageDirectory,
+	 VirtualAddress_t vAddress,
+	 int ReleaseFrame)
+{
+	PageDirectory_t *Directory = (PageDirectory_t*)PageDirectory;
+	PageTable_t *Table = NULL;
+	uint32_t Entry;
+	int IsCurrent = 0;
+
+	if (Directory == NULL) {
+		Directory = g_PageDirectories[CpuGetCurrentId()];
+	}
+	if (Directory == NULL) {
+		return Error;
+	}
+	if (g_PageDirectories[CpuGetCurrentId()] == Directory) {
+		IsCurrent = 1;
+	}
+
+	if (!(Directory->pTables[PAGE_DIRECTORY_INDEX(vAddress)] & PAGE_PRESENT)) {
+		return Error;
+	}
+
+	Table = (PageTable_t*)Directory->vTables[PAGE_DIRECTORY_INDEX(vAddress)];
+	if (Table == NULL) {
+		return Error;
+	}
+
+	Entry = Table->Pages[PAGE_TABLE_INDEX(vAddress)];
+	if (!(Entry & PAGE_PRESENT)) {
+		return Error;
+	}
+
+	Table->Pages[PAGE_TABLE_INDEX(vAddress)] = 0;
+
+	/* Flush before freeing the frame. If the TLB still held the
+	 * translation and the frame were handed straight back out, a stale
+	 * entry would let this address write into somebody else's page. */
+	if (IsCurrent) {
+		memory_invalidate_addr(vAddress);
+	}
+
+	if (ReleaseFrame) {
+		MmPhysicalFreeBlock(Entry & PAGE_MASK);
+	}
+
+	return Success;
+}
+
 /* MmVirtualGetMapping
  * Retrieves the physical address behind a virtual address, or 0. */
 PhysicalAddress_t

@@ -253,11 +253,31 @@ OsStatus_t IoSpaceRelease(DeviceIoSpace_t *IoSpace)
 
     Entry->Acquired = 0;
 
-    /* The MMIO mapping stays. There is no MmVirtualUnmap yet, and
-     * MmReserveMemory only ever bumps a pointer, so reserved virtual
-     * space is never reclaimed either. Re-acquiring reuses the existing
-     * mapping rather than leaking a second one. Worth revisiting once
-     * unmapping exists. */
+    /* Tear the MMIO mapping down now that MmVirtualUnmap exists.
+     *
+     * ReleaseFrame is 0 on purpose: these frames are device registers,
+     * not RAM from the physical allocator. Handing 0xFED00000 to
+     * MmPhysicalFreeBlock would mark a bit for memory that was never
+     * ours and eventually hand a device aperture out as a page.
+     *
+     * The reserved *virtual* range is still not reclaimed -
+     * MmReserveMemory only bumps a pointer - so a re-acquire allocates
+     * fresh virtual space. Bounded, but noted. */
+    if (Entry->Io.Type == IO_SPACE_MMIO && Entry->Mapped != 0) {
+        uintptr_t Virtual = Entry->Io.VirtualBase & PAGE_MASK;
+        uintptr_t Offset  = Entry->Io.PhysicalBase & ATTRIBUTE_MASK;
+        int PageCount = (int)DIVUP((Offset + Entry->Io.Size), PAGE_SIZE);
+        int i;
+
+        if (PageCount == 0) {
+            PageCount = 1;
+        }
+        for (i = 0; i < PageCount; i++) {
+            MmVirtualUnmap(NULL, Virtual + (i * PAGE_SIZE), 0);
+        }
+        Entry->Mapped = 0;
+        Entry->Io.VirtualBase = 0;
+    }
 
     InterruptRestoreState(State);
     return Success;

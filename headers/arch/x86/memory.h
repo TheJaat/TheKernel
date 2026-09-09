@@ -90,13 +90,21 @@ typedef struct SystemMemoryMapping {
 extern "C" {
 #endif
 
-void MmMemoryDebugPrint(void);
-
 /* MmPhyiscalInit
  * This is the physical memory manager initializor
  * It reads the multiboot memory descriptor(s), initialies
  * the bitmap and makes sure reserved regions are allocated */
 OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor);
+
+/* Physical memory statistics, for anything that wants to report them. */
+void MmMemoryDebugPrint(void);
+
+/* MmPhysicalGetBlocksUsed / Total */
+size_t MmPhysicalGetBlocksUsed(void);
+size_t MmPhysicalGetBlocksTotal(void);
+__EXTERN size_t MemorySize;
+__EXTERN size_t MemoryBlocks;
+__EXTERN size_t MemoryBlocksUsed;
 
 /* MmPhysicalFreeBlock
  * This is the primary function for
@@ -128,6 +136,13 @@ OsStatus_t MmVirtualInit(void);
  * Returns 0 when the region is exhausted. Bump-allocated, never freed. */
 VirtualAddress_t MmReserveMemory(int Pages);
 
+
+/* MmVirtualUnmap
+ * Removes the mapping at <vAddress>. When <ReleaseFrame> is non-zero the
+ * physical page behind it is returned to the allocator. Returns Error
+ * if nothing was mapped. */
+OsStatus_t MmVirtualUnmap(void *PageDirectory, VirtualAddress_t vAddress,
+	int ReleaseFrame);
 
 /* MmVirtualGetMapping
  * Retrieves the physical address mapping of the

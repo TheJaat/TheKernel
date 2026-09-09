@@ -5,8 +5,11 @@
 #include <system/heap.h>
 #include <system/timers.h>
 #include <system/iospace.h>
+#include <system/garbagecollector.h>
+#include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
+#include <arch/x86/x32/arch_x32.h>
 #include <driver/ps2_keyboard.h>
 #include <video/interface/video_interface.h>
 #include <terminal/terminal.h>
@@ -66,6 +69,9 @@ static void ShellCommandHelp(void)
     printf("  echo <text>   print text back\n");
     printf("  sleep <ms>    block this shell for a while\n");
     printf("  spawn <n>     start n short-lived worker threads\n");
+    printf("  gc            garbage collector counters\n");
+    printf("  vm            map/unmap test, shows frames being reclaimed\n");
+    printf("  list          run the list self-test\n");
     printf("  clear         clear the screen\n");
     printf("  fault         dereference NULL, to see the fault report\n");
 }
@@ -110,6 +116,94 @@ static void ShellExecute(char *Line)
     else if (strcmp(Line, "kb") == 0) {
         printf("scancodes %u, dropped %u\n",
             Ps2KeyboardGetScancodes(), Ps2KeyboardGetDropped());
+    }
+    else if (strcmp(Line, "gc") == 0) {
+        printf("collected %u, dropped %u\n",
+            GcGetCollected(), GcGetDropped());
+    }
+    else if (strcmp(Line, "vm") == 0) {
+        /* Map a scratch page, write to it, unmap it, and check the
+         * frame came back. Before MmVirtualUnmap existed the used count
+         * only ever went up. */
+        VirtualAddress_t Va = MmReserveMemory(1);
+        PhysicalAddress_t Pa;
+        size_t Before, After;
+
+        if (Va == 0) {
+            printf("vm: no reserved virtual space left\n");
+        }
+        else {
+            Before = MmPhysicalGetBlocksUsed();
+            Pa = MmPhysicalAllocateBlock(__MASK, 1);
+            if (Pa == 0) {
+                printf("vm: out of physical memory\n");
+            }
+            else if (MmVirtualMap(NULL, Pa, Va, 0) != Success) {
+                printf("vm: map failed\n");
+            }
+            else {
+                volatile uint32_t *Probe = (volatile uint32_t*)Va;
+                *Probe = 0xC0FFEE;
+                printf("mapped 0x%x -> 0x%x, read back 0x%x\n",
+                    Va, Pa, *Probe);
+                printf("resolved back to 0x%x\n",
+                    MmVirtualGetMapping(NULL, Va));
+
+                MmVirtualUnmap(NULL, Va, 1);
+                After = MmPhysicalGetBlocksUsed();
+                printf("blocks used %u -> %u -> %u\n",
+                    Before, Before + 1, After);
+                printf("mapping after unmap: 0x%x (expect 0)\n",
+                    MmVirtualGetMapping(NULL, Va));
+                printf("vm test: %s\n",
+                    (After == Before) ? "PASS" : "FAIL - frame not reclaimed");
+            }
+        }
+    }
+    else if (strcmp(Line, "list") == 0) {
+        List_t *L = ListCreate(KeyInteger, LIST_SAFE);
+        DataKey_t Key;
+        ListNode_t *Node;
+        int Ok = 1;
+        int i;
+
+        if (L == NULL) {
+            printf("list: out of memory\n");
+        }
+        else {
+            for (i = 0; i < 5; i++) {
+                Key.Value = i;
+                ListAppend(L, ListCreateNode(Key, (void*)(uintptr_t)(i * 10)));
+            }
+            if (ListLength(L) != 5) { Ok = 0; }
+
+            Key.Value = 3;
+            Node = ListGetNodeByKey(L, Key);
+            if (Node == NULL || (uintptr_t)Node->Data != 30) { Ok = 0; }
+
+            if (ListRemoveByKey(L, Key) != Success) { Ok = 0; }
+            if (ListLength(L) != 4) { Ok = 0; }
+            if (ListGetNodeByKey(L, Key) != NULL) { Ok = 0; }
+
+            Node = ListPopFront(L);
+            if (Node == NULL || Node->Key.Value != 0) { Ok = 0; }
+            ListDestroyNode(Node);
+            if (ListLength(L) != 3) { Ok = 0; }
+
+            /* order must survive the middle removal */
+            i = 1;
+            {
+                ListNode_t *It;
+                _foreach(It, L) {
+                    if (It->Key.Value != i) { Ok = 0; }
+                    i++;
+                    if (i == 3) { i = 4; }   /* 3 was removed */
+                }
+            }
+
+            ListDestroy(L);
+            printf("list self-test: %s\n", Ok ? "PASS" : "FAIL");
+        }
     }
     else if (strcmp(Line, "clear") == 0) {
         TerminalClear(VideoGetTerminal());

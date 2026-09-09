@@ -37,7 +37,12 @@ static const char Ps2ScancodeMap[128] = {
     '\t','q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']','\n',   0,
      'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';','\'', '`',   0,'\\',
      'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',   0, '*',   0, ' ',
-       0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /* 0x3A caps, 0x3B-0x44 F1-F10, 0x45 numlock, 0x46 scroll = 13 codes.
+     * This row had 14 zeros, which pushed the entire keypad block down
+     * by one: kp7 returned nothing and every key after it returned its
+     * neighbour's character. */
+       0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /* 0x47 onwards: the keypad */
      '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.',   0,
        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
@@ -49,7 +54,12 @@ static const char Ps2ScancodeMapShift[128] = {
     '\t','Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}','\n',   0,
      'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',   0, '|',
      'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',   0, '*',   0, ' ',
-       0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /* 0x3A caps, 0x3B-0x44 F1-F10, 0x45 numlock, 0x46 scroll = 13 codes.
+     * This row had 14 zeros, which pushed the entire keypad block down
+     * by one: kp7 returned nothing and every key after it returned its
+     * neighbour's character. */
+       0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /* 0x47 onwards: the keypad */
      '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.',   0,
        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,

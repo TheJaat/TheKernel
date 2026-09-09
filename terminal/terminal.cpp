@@ -18,6 +18,33 @@ void TerminalPutChar(Terminal* term, int ch) {
     if (ch == '\n') {
         term->cursorX = 0;
         term->cursorY += FontHeight;
+    } else if (ch == '\b') {
+        // Erase the previous cell rather than just moving the cursor,
+        // otherwise the old glyph stays on screen and the line editor
+        // looks broken even though the buffer is correct.
+        int step = (term->videoModeType == VIDEO_TEXT) ? 1 : FontWidth;
+        if (term->cursorX >= step) {
+            term->cursorX -= step;
+        } else if (term->cursorY >= FontHeight) {
+            // Wrapped back onto the previous line.
+            term->cursorY -= FontHeight;
+            term->cursorX = term->width - (term->width % step) - step;
+            if (term->cursorX < 0) {
+                term->cursorX = 0;
+            }
+        }
+        term->driver->drawChar(term->driver->context, term->cursorX,
+            term->cursorY, ' ', term->fgColor, term->bgColor);
+        return;
+    } else if (ch == '\t') {
+        int i;
+        for (i = 0; i < 4; i++) {
+            TerminalPutChar(term, ' ');
+        }
+        return;
+    } else if (ch == '\r') {
+        term->cursorX = 0;
+        return;
     } else {
         term->driver->drawChar(term->driver->context, term->cursorX, term->cursorY, ch, term->fgColor, term->bgColor);
         if (term->videoModeType == VIDEO_TEXT) {

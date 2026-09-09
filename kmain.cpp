@@ -30,6 +30,7 @@
 #include <system/pipe.h>
 #include <driver/ps2_keyboard.h>
 #include <system/shell.h>
+#include <system/garbagecollector.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -420,6 +421,13 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
         TimerSelfTest();
         ThreadSelfTest();
         SyncSelfTest();
+
+        // Deferred cleanup. Once this is up, exiting threads are reaped
+        // by the collector instead of being polled for by idle.
+        if (GcInitialize() == Success) {
+            ThreadingEnableGc();
+        }
+
         StartShell();
     }
 

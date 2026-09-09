@@ -3,6 +3,7 @@
 #include <system/threading.h>
 #include <system/scheduler.h>
 #include <system/heap.h>
+#include <system/garbagecollector.h>
 #include <system/log.h>
 #include <interrupts/interrupts.h>
 #include <arch/x86/x32/arch_x32.h>
@@ -22,6 +23,10 @@ static Thread_t *GlbCurrentThread = NULL;
 static Thread_t *GlbIdleThread = NULL;
 static UUId_t GlbThreadIds = 0;
 static int GlbThreadingEnabled = 0;
+
+/* Set once the collector is available. Until then the idle thread keeps
+ * doing the reaping, because a thread can exit before the gc exists. */
+static UUId_t GlbThreadGcHandler = UUID_INVALID;
 
 /* ThreadingIsEnabled */
 int ThreadingIsEnabled(void)
@@ -111,7 +116,11 @@ static void ThreadingIdle(void *Args)
     (void)Args;
 
     for (;;) {
-        ThreadingReapZombies();
+        /* Once the gc is running it owns this; polling here as well
+         * would race it for the same stacks. */
+        if (GlbThreadGcHandler == UUID_INVALID) {
+            ThreadingReapZombies();
+        }
         __asm__ volatile ("hlt");
     }
 }
@@ -191,6 +200,12 @@ void ThreadingExit(void)
 
     InterruptRestoreState(State);
 
+    /* Hand the corpse to the collector. If the gc is not up yet this
+     * fails harmlessly and the idle thread picks it up instead. */
+    if (GlbThreadGcHandler != UUID_INVALID) {
+        GcSignal(GlbThreadGcHandler, (void*)GlbCurrentThread);
+    }
+
     /* Give the cpu up. The scheduler will not pick a zombie again, and
      * the idle thread frees the stack later - this thread is still
      * standing on it. */
@@ -200,6 +215,51 @@ void ThreadingExit(void)
     for (;;) {
         __asm__ volatile ("hlt");
     }
+}
+
+/* ThreadingGcReap
+ * Runs on the gc thread. Frees the stack of one exited thread and
+ * releases its slot. */
+static OsStatus_t ThreadingGcReap(void *Data)
+{
+    Thread_t *Thread = (Thread_t*)Data;
+    uintptr_t Stack = 0;
+    int State;
+
+    if (Thread == NULL) {
+        return Error;
+    }
+
+    State = InterruptDisable();
+    if (Thread->State == ThreadStateZombie && Thread != GlbCurrentThread) {
+        Stack = Thread->StackBase;
+        Thread->StackBase = 0;
+        Thread->Context = NULL;
+        Thread->State = ThreadStateFree;
+    }
+    InterruptRestoreState(State);
+
+    /* Free outside the critical section - kfree takes the heap lock. */
+    if (Stack != 0) {
+        kfree((void*)Stack);
+    }
+    return Success;
+}
+
+/* ThreadingEnableGc
+ * Switches zombie collection over to the garbage collector. Called once
+ * GcInitialize has run. */
+OsStatus_t ThreadingEnableGc(void)
+{
+    UUId_t Handler = GcRegister(ThreadingGcReap);
+
+    if (Handler == UUID_INVALID) {
+        return Error;
+    }
+
+    GlbThreadGcHandler = Handler;
+    LogInformation("Threading", "zombie reaping moved to the gc");
+    return Success;
 }
 
 /* ThreadingReapZombies */

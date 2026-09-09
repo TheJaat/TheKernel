@@ -320,3 +320,14 @@ VirtualAddress_t MmPhyiscalGetSysMappingVirtual(PhysicalAddress_t PhysicalAddres
 	}
 	return 0;
 }
+/* MmPhysicalGetBlocksUsed / MmPhysicalGetBlocksTotal
+ * Exposed so callers can verify that frames actually come back. */
+size_t MmPhysicalGetBlocksUsed(void)
+{
+	return MemoryBlocksUsed;
+}
+
+size_t MmPhysicalGetBlocksTotal(void)
+{
+	return MemoryBlocks;
+}
