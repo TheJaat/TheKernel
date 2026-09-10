@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <terminal/terminal.h>
 #include <video/video.h>
@@ -147,9 +148,54 @@ void ptoa(uintptr_t value, char* str, int base) {
 }
 
 
+/* VsprintfPad
+ * Copies <text> into *dst padded to <width>, left aligned when
+ * <leftAlign>, otherwise right aligned with <padChar>.
+ * Returns the new write pointer. */
+static char *VsprintfPad(char *dst, const char *text, int width,
+                         int leftAlign, char padChar)
+{
+    int len = 0;
+    int pad;
+
+    while (text[len] != '\0') {
+        len++;
+    }
+
+    pad = width - len;
+    if (pad < 0) {
+        pad = 0;
+    }
+
+    if (!leftAlign) {
+        while (pad-- > 0) {
+            *dst++ = padChar;
+        }
+    }
+    while (*text != '\0') {
+        *dst++ = *text++;
+    }
+    if (leftAlign) {
+        while (pad-- > 0) {
+            *dst++ = ' ';
+        }
+    }
+    return dst;
+}
+
 // vsprintf:
 // Formats and stores a string in a buffer based on a format string
 // and a va_list of arguments.
+//
+// Understands a subset of the usual conversion syntax:
+//     %[-][0][width]<conversion>
+//
+// The flags and width are not decoration. Before they were parsed, a
+// format like "%-32s" fell straight through the switch below: nothing
+// matched '-', so the string argument was never consumed with va_arg and
+// every later conversion read the wrong argument. That desync is silent
+// until some conversion happens to be %s, at which point it dereferences
+// whatever integer it was handed.
 int vsprintf(char* buffer, const char* format, va_list args) {
 
     // Pointer to the buffer to keep track of the current position
@@ -165,24 +211,47 @@ int vsprintf(char* buffer, const char* format, va_list args) {
             continue;
         }
 
+        /* Flags */
+        int leftAlign = 0;
+        char padChar = ' ';
+        int width = 0;
+        char *fieldStart;
+
+        for (;;) {
+            if (*fmt_ptr == '-') {
+                leftAlign = 1;
+                fmt_ptr++;
+            }
+            else if (*fmt_ptr == '0') {
+                padChar = '0';
+                fmt_ptr++;
+            }
+            else {
+                break;
+            }
+        }
+
+        /* Width */
+        while (*fmt_ptr >= '0' && *fmt_ptr <= '9') {
+            width = (width * 10) + (*fmt_ptr - '0');
+            fmt_ptr++;
+        }
+
+        fieldStart = buf_ptr;
+        (void)fieldStart;
+
         ch = *fmt_ptr++;
         switch (ch) {
             case 'd': { // handle integer
                 int value = va_arg(args, int);
                 itoa(value, tmp, 10);
-                for (char* tmp_ptr = tmp; *tmp_ptr != '\0'; tmp_ptr++) {
-                    *buf_ptr++ = *tmp_ptr;
-                }
+                buf_ptr = VsprintfPad(buf_ptr, tmp, width, leftAlign, padChar);
                 break;
             }
             case 'u': {  // handle Unsigned Integer
                 unsigned int val = va_arg(args, unsigned int);
                 utoa(val, tmp, 10);
-                // strcpy(buf_ptr, tmp);
-                // buf_ptr += strlen(tmp);
-                for (char* tmp_ptr = tmp; *tmp_ptr != '\0'; tmp_ptr++) {
-                    *buf_ptr++ = *tmp_ptr;
-                }
+                buf_ptr = VsprintfPad(buf_ptr, tmp, width, leftAlign, padChar);
                 break;
             }
             case 'x': { // handle hex integer
@@ -192,16 +261,17 @@ int vsprintf(char* buffer, const char* format, va_list args) {
                 // 0xfffc0000 came out as ",0000".
                 unsigned int value = va_arg(args, unsigned int);
                 utoa(value, tmp, 16);
-                for (char* tmp_ptr = tmp; *tmp_ptr != '\0'; tmp_ptr++) {
-                    *buf_ptr++ = *tmp_ptr;
-                }
+                buf_ptr = VsprintfPad(buf_ptr, tmp, width, leftAlign, padChar);
                 break;
             }
             case 's': { // handle string
                 char* str = va_arg(args, char*);
-                while (*str != '\0') {
-                    *buf_ptr++ = *str++;
+                /* A NULL here used to walk off address 0. Printing
+                 * something is far more useful than faulting. */
+                if (str == NULL) {
+                    str = (char*)"(null)";
                 }
+                buf_ptr = VsprintfPad(buf_ptr, str, width, leftAlign, padChar);
                 break;
             }
             case 'c': { // handle character
@@ -227,7 +297,20 @@ int vsprintf(char* buffer, const char* format, va_list args) {
                 }
           	break; 
             }
-            default: {  // handle unknown format specifier
+            case '%': {
+                /* A literal percent. This used to work by accident -
+                 * it fell through to the default, which echoed the one
+                 * character. Now that the default also emits the '%'
+                 * prefix, it needs a case of its own. */
+                *buf_ptr++ = '%';
+                break;
+            }
+            default: {
+                /* An unrecognised conversion. Echo it including the '%'
+                 * so it is visible in the output rather than looking
+                 * like a stray letter - and crucially do NOT consume an
+                 * argument, since there is no way to know its type. */
+                *buf_ptr++ = '%';
                 *buf_ptr++ = ch;
                 break;
             }

@@ -6,6 +6,7 @@
 #include <system/timers.h>
 #include <system/iospace.h>
 #include <system/garbagecollector.h>
+#include <system/modules.h>
 #include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
@@ -71,6 +72,8 @@ static void ShellCommandHelp(void)
     printf("  spawn <n>     start n short-lived worker threads\n");
     printf("  gc            garbage collector counters\n");
     printf("  vm            map/unmap test, shows frames being reclaimed\n");
+    printf("  ls            list files on the ramdisk\n");
+    printf("  cat <file>    print a file from the ramdisk\n");
     printf("  list          run the list self-test\n");
     printf("  clear         clear the screen\n");
     printf("  fault         dereference NULL, to see the fault report\n");
@@ -116,6 +119,48 @@ static void ShellExecute(char *Line)
     else if (strcmp(Line, "kb") == 0) {
         printf("scancodes %u, dropped %u\n",
             Ps2KeyboardGetScancodes(), Ps2KeyboardGetDropped());
+    }
+    else if (strcmp(Line, "ls") == 0) {
+        uint32_t Count = ModulesGetCount();
+        uint32_t i;
+
+        if (Count == 0) {
+            printf("no ramdisk loaded\n");
+        }
+        for (i = 0; i < Count; i++) {
+            RamdiskEntry_t *Entry = ModulesGetEntry(i);
+            printf("%-32s %u bytes%s\n", Entry->Name, Entry->Size,
+                (ModulesVerify(Entry) == Success) ? "" : "  [BAD CHECKSUM]");
+        }
+    }
+    else if (strncmp(Line, "cat", 3) == 0
+             && (Line[3] == ' ' || Line[3] == '\0')) {
+        const char *Name = ShellSkipSpaces(Line + 3);
+        RamdiskEntry_t *Entry;
+
+        if (*Name == '\0') {
+            printf("cat: expected a filename\n");
+        }
+        else if ((Entry = ModulesFind(Name)) == NULL) {
+            printf("cat: %s not found\n", Name);
+        }
+        else if (ModulesVerify(Entry) != Success) {
+            printf("cat: %s failed its checksum, refusing\n", Name);
+        }
+        else {
+            size_t Size = 0;
+            const uint8_t *Data = ModulesGetData(Entry, &Size);
+            size_t i;
+
+            /* Byte at a time: the data is not null-terminated, so %s
+             * would run off the end of the file into the next one. */
+            for (i = 0; i < Size; i++) {
+                printf("%c", (char)Data[i]);
+            }
+            if (Size > 0 && Data[Size - 1] != '\n') {
+                printf("\n");
+            }
+        }
     }
     else if (strcmp(Line, "gc") == 0) {
         printf("collected %u, dropped %u\n",

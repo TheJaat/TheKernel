@@ -1,6 +1,6 @@
 # Makefile for kernel/tools/
 
-.PHONY: all clean revision
+.PHONY: all clean revision ramdisk
 
 # Ensure ROOT_DIR is set, defaulting to one level up if not provided
 ROOT_DIR ?= $(abspath ..)
@@ -12,10 +12,10 @@ include $(ROOT_DIR)/config.mk
 Build_DIR = $(ROOT_DIR)/build
 
 # Subdirectories
-SUBDIRS = revision
+SUBDIRS = revision ramdisk
 
 # Target to build everything
-all: revision
+all: revision ramdisk
 
 # Build the revision tool
 revision:
@@ -28,6 +28,11 @@ revision:
 	#done
 	@echo "$(GREEN)Building kernel revision tool...$(RESET)"
 	$(MAKE) -C revision ROOT_DIR=$(ROOT_DIR)
+
+# Build the ramdisk packing tool
+ramdisk:
+	@echo "$(GREEN)Building kernel ramdisk tool...$(RESET)"
+	$(MAKE) -C ramdisk ROOT_DIR=$(ROOT_DIR)
 
 # Target to clean everything
 clean:

@@ -240,6 +240,17 @@ OsStatus_t MmPhysicalInit(void *BootInfo, BootDescriptor_t *Descriptor)
 	/* Bitmap space + a guard page */
 	MmAllocateRegion(MEMORY_LOCATION_BITMAP, MemoryBitmapSize + PAGE_SIZE);
 
+	/* The ramdisk, if the bootloader loaded one. Without this the
+	 * allocator would happily hand out the frames the image is sitting
+	 * in - and the corruption would only show up whenever something
+	 * next read a file, long after the allocation that caused it. */
+	if (Descriptor->RamDiskAddress != 0 && Descriptor->RamDiskSize != 0) {
+		LogInformation("Physical_Memory", "Reserving ramdisk 0x%x + 0x%x",
+			Descriptor->RamDiskAddress, Descriptor->RamDiskSize);
+		MmAllocateRegion(Descriptor->RamDiskAddress,
+			Descriptor->RamDiskSize + PAGE_SIZE);
+	}
+
 	MmMemoryDebugPrint();
 	return Success;
 }

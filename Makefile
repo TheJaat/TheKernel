@@ -12,7 +12,7 @@ include $(ROOT_DIR)/config.mk
 BUILD_DIR = $(ROOT_DIR)/build
 
 # Define directories
-SUBDIRS = driver ds terminal system libc arch
+SUBDIRS = ds driver terminal system libc arch
 
 # Define source files in the root directory
 ROOT_ASM_SOURCES = kernel_entry.asm
@@ -119,4 +119,3 @@ clean:
 
 # Phony targets
 .PHONY: all clean $(SUBDIRS) kernel grub tools
-
