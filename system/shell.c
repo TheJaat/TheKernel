@@ -7,6 +7,7 @@
 #include <system/iospace.h>
 #include <system/garbagecollector.h>
 #include <system/modules.h>
+#include <system/moduleloader.h>
 #include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
@@ -74,6 +75,8 @@ static void ShellCommandHelp(void)
     printf("  vm            map/unmap test, shows frames being reclaimed\n");
     printf("  ls            list files on the ramdisk\n");
     printf("  cat <file>    print a file from the ramdisk\n");
+    printf("  run <file>    load and run a module from the ramdisk\n");
+    printf("  exports       kernel symbols modules may call\n");
     printf("  list          run the list self-test\n");
     printf("  clear         clear the screen\n");
     printf("  fault         dereference NULL, to see the fault report\n");
@@ -161,6 +164,19 @@ static void ShellExecute(char *Line)
                 printf("\n");
             }
         }
+    }
+    else if (strncmp(Line, "run", 3) == 0
+             && (Line[3] == ' ' || Line[3] == '\0')) {
+        const char *Name = ShellSkipSpaces(Line + 3);
+        if (*Name == '\0') {
+            printf("run: expected a module name\n");
+        }
+        else if (ModuleLoad(Name) != Success) {
+            printf("run: %s could not be loaded\n", Name);
+        }
+    }
+    else if (strcmp(Line, "exports") == 0) {
+        ModuleLoaderPrintExports();
     }
     else if (strcmp(Line, "gc") == 0) {
         printf("collected %u, dropped %u\n",
