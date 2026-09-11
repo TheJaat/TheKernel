@@ -112,6 +112,12 @@ __EXTERN size_t MemoryBlocksUsed;
  * pages if they exist in someones mapping */
 // OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address);
 
+/* MmPhysicalFreeBlocks
+ * Releases <Count> consecutive frames - the counterpart to the Count
+ * argument of MmPhysicalAllocateBlock. Anything allocated as a run must
+ * be freed with this, or the extra frames are lost. */
+OsStatus_t MmPhysicalFreeBlocks(PhysicalAddress_t Address, int Count);
+
 /* MmPhysicalAllocateBlock
  * This is the primary function for allocating
  * physical memory pages, this takes an argument
@@ -136,6 +142,11 @@ OsStatus_t MmVirtualInit(void);
  * Returns 0 when the region is exhausted. Bump-allocated, never freed. */
 VirtualAddress_t MmReserveMemory(int Pages);
 
+
+/* MmVirtualSetPageFlags
+ * ORs <Flags> into an existing mapping and its directory entry. */
+OsStatus_t MmVirtualSetPageFlags(void *PageDirectory,
+	VirtualAddress_t vAddress, Flags_t Flags);
 
 /* MmVirtualUnmap
  * Removes the mapping at <vAddress>. When <ReleaseFrame> is non-zero the

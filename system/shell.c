@@ -8,10 +8,12 @@
 #include <system/garbagecollector.h>
 #include <system/modules.h>
 #include <system/moduleloader.h>
+#include <system/syscalls.h>
 #include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
+#include <arch/x86/address_space.h>
 #include <driver/ps2_keyboard.h>
 #include <video/interface/video_interface.h>
 #include <terminal/terminal.h>
@@ -76,7 +78,10 @@ static void ShellCommandHelp(void)
     printf("  ls            list files on the ramdisk\n");
     printf("  cat <file>    print a file from the ramdisk\n");
     printf("  run <file>    load and run a module from the ramdisk\n");
+    printf("  urun <file>   load and run a module in ring 3\n");
     printf("  exports       kernel symbols modules may call\n");
+    printf("  sys           syscall counter\n");
+    printf("  reap          return unused heap pages to the allocator\n");
     printf("  list          run the list self-test\n");
     printf("  clear         clear the screen\n");
     printf("  fault         dereference NULL, to see the fault report\n");
@@ -111,6 +116,7 @@ static void ShellExecute(char *Line)
     else if (strcmp(Line, "mem") == 0) {
         MmMemoryDebugPrint();
         HeapPrintStats(NULL);
+        printf("address spaces live: %u\n", AddressSpaceGetCount());
     }
     else if (strcmp(Line, "io") == 0) {
         IoSpacePrint();
@@ -175,8 +181,29 @@ static void ShellExecute(char *Line)
             printf("run: %s could not be loaded\n", Name);
         }
     }
+    else if (strncmp(Line, "urun", 4) == 0
+             && (Line[4] == ' ' || Line[4] == '\0')) {
+        const char *Name = ShellSkipSpaces(Line + 4);
+        if (*Name == '\0') {
+            printf("urun: expected a module name\n");
+        }
+        else if (ModuleLoadUser(Name) != Success) {
+            printf("urun: %s could not be loaded\n", Name);
+        }
+    }
+    else if (strcmp(Line, "sys") == 0) {
+        printf("%u syscalls made\n", SyscallsGetCount());
+    }
     else if (strcmp(Line, "exports") == 0) {
         ModuleLoaderPrintExports();
+    }
+    else if (strcmp(Line, "reap") == 0) {
+        size_t Before = MmPhysicalGetBlocksUsed();
+        size_t Pages = HeapReap(NULL);
+        size_t After = MmPhysicalGetBlocksUsed();
+
+        printf("reclaimed %u pages\n", Pages);
+        printf("blocks used %u -> %u\n", Before, After);
     }
     else if (strcmp(Line, "gc") == 0) {
         printf("collected %u, dropped %u\n",

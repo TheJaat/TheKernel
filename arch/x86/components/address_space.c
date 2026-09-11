@@ -2,6 +2,11 @@
  * - System */
 #include <arch/x86/address_space.h>
 #include <arch/x86/memory.h>
+#include <system/heap.h>
+#include <system/log.h>
+#include <interrupts/interrupts.h>
+#include <string.h>
+#include <arch/x86/memory.h>
 // #include <system/utils.h>
 // #include <threading.h>
 // #include <memory.h>
@@ -23,6 +28,136 @@ static AddressSpace_t GlbKernelAddressSpace;
  * This only copies the data into a static global
  * storage, which means users should just pass something
  * temporary structure */
+/* The first page-directory index that belongs to user space. Everything
+ * below it is kernel and is shared by every address space - not copied,
+ * shared: the directory entries point at the same page tables, so a
+ * kernel mapping made after a process exists is visible to it too. Copy
+ * them instead and a later MmVirtualMap would be invisible to every
+ * process created before it. */
+#define ADDRESSSPACE_KERNEL_TABLES  PAGE_DIRECTORY_INDEX(MEMORY_LOCATION_KERNEL_END)
+
+/* A PageDirectory_t is two pages (pTables and vTables); the third is a
+ * guard. Named so allocate and free cannot drift apart - they already
+ * did once, and the result was two frames lost per process with nothing
+ * to point at. */
+#define ADDRESSSPACE_DIRECTORY_BLOCKS   3
+
+/* Live address spaces, excluding the kernel's. Exposed so the leak this
+ * closes is visible rather than something you have to infer from the
+ * physical block count. */
+static volatile size_t GlbAddressSpaceCount = 0;
+
+/* AddressSpaceGetCount */
+size_t AddressSpaceGetCount(void)
+{
+	return GlbAddressSpaceCount;
+}
+
+/* AddressSpaceCreate
+ * Builds an address space that shares the kernel half and has an empty
+ * user half. */
+AddressSpace_t *AddressSpaceCreate(Flags_t Flags)
+{
+	AddressSpace_t *Space;
+	PageDirectory_t *Directory;
+	PageDirectory_t *Kernel;
+	int i;
+
+	Space = (AddressSpace_t*)kmalloc(sizeof(AddressSpace_t));
+	if (Space == NULL) {
+		LogFatal("AddressSpace", "out of memory");
+		return NULL;
+	}
+
+	/* Three blocks: the structure is two pages, the third is a guard,
+	 * matching how MmVirtualInit allocates the kernel's own. */
+	Directory = (PageDirectory_t*)MmPhysicalAllocateBlock(MEMORY_INIT_MASK,
+		ADDRESSSPACE_DIRECTORY_BLOCKS);
+	if (Directory == NULL) {
+		kfree(Space);
+		LogFatal("AddressSpace", "no physical memory for a page-directory");
+		return NULL;
+	}
+
+	memset((void*)Directory, 0, sizeof(PageDirectory_t));
+
+	Kernel = (PageDirectory_t*)GlbKernelAddressSpace.PageDirectory;
+	for (i = 0; i < ADDRESSSPACE_KERNEL_TABLES; i++) {
+		Directory->pTables[i] = Kernel->pTables[i];
+		Directory->vTables[i] = Kernel->vTables[i];
+	}
+
+	Space->References = 1;
+	Space->Flags = Flags;
+	Space->Cr3 = (uintptr_t)Directory;
+	Space->PageDirectory = (void*)Directory;
+
+	GlbAddressSpaceCount++;
+	return Space;
+}
+
+/* AddressSpaceDestroy
+ * Releases an address space once nothing references it. Only the user
+ * half is freed - the kernel tables are shared, and freeing them would
+ * unmap the kernel from every other address space at once. */
+OsStatus_t AddressSpaceDestroy(AddressSpace_t *Space)
+{
+	PageDirectory_t *Directory;
+	int i;
+
+	if (Space == NULL || Space == &GlbKernelAddressSpace) {
+		return Error;
+	}
+
+	Space->References--;
+	if (Space->References > 0) {
+		return Success;
+	}
+
+	Directory = (PageDirectory_t*)Space->PageDirectory;
+
+	for (i = ADDRESSSPACE_KERNEL_TABLES; i < TABLES_PER_PDIR; i++) {
+		if (Directory->pTables[i] & PAGE_PRESENT) {
+			PageTable_t *Table = (PageTable_t*)Directory->vTables[i];
+			int j;
+
+			/* Release the frames the user half was using. */
+			for (j = 0; j < PAGES_PER_TABLE; j++) {
+				if (Table->Pages[j] & PAGE_PRESENT) {
+					MmPhysicalFreeBlock(Table->Pages[j] & PAGE_MASK);
+				}
+			}
+			MmPhysicalFreeBlock((PhysicalAddress_t)Directory->vTables[i]);
+		}
+	}
+
+	MmPhysicalFreeBlocks((PhysicalAddress_t)Directory,
+		ADDRESSSPACE_DIRECTORY_BLOCKS);
+	kfree(Space);
+
+	if (GlbAddressSpaceCount > 0) {
+		GlbAddressSpaceCount--;
+	}
+	return Success;
+}
+
+/* AddressSpaceGetKernel */
+AddressSpace_t *AddressSpaceGetKernel(void)
+{
+	return &GlbKernelAddressSpace;
+}
+
+/* AddressSpaceSwitch
+ * Loads the given space on the current cpu. */
+OsStatus_t AddressSpaceSwitch(AddressSpace_t *Space)
+{
+	if (Space == NULL) {
+		return Error;
+	}
+	return MmVirtualSwitchPageDirectory(0,
+		(PageDirectory_t*)Space->PageDirectory, Space->Cr3);
+}
+
 OsStatus_t AddressSpaceInitKernel(
 	AddressSpace_t *Kernel)
 {

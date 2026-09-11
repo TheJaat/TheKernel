@@ -291,6 +291,57 @@ MmVirtualMap(
 	return Success;
 }
 
+/* MmVirtualSetPageFlags
+ * ORs <Flags> into an existing mapping, and into the page-directory
+ * entry above it.
+ *
+ * Both are required. The cpu checks the user bit at every level of the
+ * walk, so a page marked PAGE_USER under a supervisor-only directory
+ * entry is still unreachable from ring 3 - and the resulting fault looks
+ * exactly like a missing page, which sends you looking in the wrong
+ * place entirely.
+ *
+ * Marking the directory entry user does NOT expose the other pages in
+ * that 4mB: each one still needs its own user bit. Protection stays per
+ * page. */
+OsStatus_t
+MmVirtualSetPageFlags(
+	 void *PageDirectory,
+	 VirtualAddress_t vAddress,
+	 Flags_t Flags)
+{
+	PageDirectory_t *Directory = (PageDirectory_t*)PageDirectory;
+	PageTable_t *Table = NULL;
+	unsigned Index;
+
+	if (Directory == NULL) {
+		Directory = g_PageDirectories[CpuGetCurrentId()];
+	}
+	if (Directory == NULL) {
+		return Error;
+	}
+
+	Index = PAGE_DIRECTORY_INDEX(vAddress);
+	if (!(Directory->pTables[Index] & PAGE_PRESENT)) {
+		return Error;
+	}
+
+	Table = (PageTable_t*)Directory->vTables[Index];
+	if (Table == NULL
+		|| !(Table->Pages[PAGE_TABLE_INDEX(vAddress)] & PAGE_PRESENT)) {
+		return Error;
+	}
+
+	Directory->pTables[Index] |= Flags;
+	Table->Pages[PAGE_TABLE_INDEX(vAddress)] |= Flags;
+
+	if (g_PageDirectories[CpuGetCurrentId()] == Directory) {
+		memory_invalidate_addr(vAddress);
+	}
+
+	return Success;
+}
+
 /* MmVirtualUnmap
  * Removes a mapping and optionally releases the physical frame behind
  * it. Returns Error if nothing was mapped there.

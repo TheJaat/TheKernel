@@ -24,7 +24,8 @@
  * segments does NOT pop esp/ss: after it, esp points just past Eflags,
  * and the thread's stack grows down from there through the rest of the
  * allocation. */
-Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip, uintptr_t StackTop)
+Context_t *ContextCreateUser(Flags_t ThreadFlags, uintptr_t Eip,
+    uintptr_t StackTop, uintptr_t UserStackTop)
 {
     Context_t *Context = NULL;
     uintptr_t ContextAddress;
@@ -33,11 +34,12 @@ Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip, uintptr_t StackTop)
         return NULL;
     }
 
-    /* Only kernel threads exist so far. Ring 3 needs the user selectors
-     * plus UserEsp/UserSs filled in, and a TSS esp0 that points at this
-     * frame - see the reference's ContextCreate for the shape of it. */
-    if (ThreadFlags & ~(Flags_t)(THREADING_IDLE)) {
+    if (ThreadFlags & ~(Flags_t)(THREADING_IDLE | THREADING_USERMODE)) {
         LogFatal("Context", "unsupported thread flags 0x%x", ThreadFlags);
+        return NULL;
+    }
+    if ((ThreadFlags & THREADING_USERMODE) && UserStackTop == 0) {
+        LogFatal("Context", "a user thread needs a user stack");
         return NULL;
     }
 
@@ -49,11 +51,22 @@ Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip, uintptr_t StackTop)
     memset(Context, 0, sizeof(Context_t));
 
     /* Segments. irq_common reloads ds/es/fs/gs from the frame on the way
-     * out, so these have to be valid kernel selectors. */
-    Context->Ds = GDT_KDATA_SEGMENT;
-    Context->Es = GDT_KDATA_SEGMENT;
-    Context->Fs = GDT_KDATA_SEGMENT;
-    Context->Gs = GDT_KDATA_SEGMENT;
+     * out, so these have to be valid selectors for the target ring.
+     *
+     * The low two bits are the requested privilege level. A ring-3
+     * selector without them is still a ring-0 request and faults. */
+    if (ThreadFlags & THREADING_USERMODE) {
+        Context->Ds = GDT_UDATA_SEGMENT | 0x3;
+        Context->Es = GDT_UDATA_SEGMENT | 0x3;
+        Context->Fs = GDT_UDATA_SEGMENT | 0x3;
+        Context->Gs = GDT_UDATA_SEGMENT | 0x3;
+    }
+    else {
+        Context->Ds = GDT_KDATA_SEGMENT;
+        Context->Es = GDT_KDATA_SEGMENT;
+        Context->Fs = GDT_KDATA_SEGMENT;
+        Context->Gs = GDT_KDATA_SEGMENT;
+    }
 
     /* Ebp points at the top of the frame so a backtrace terminates
      * instead of wandering into whatever was on the page. */
@@ -62,17 +75,34 @@ Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip, uintptr_t StackTop)
 
     /* iret pops these three. */
     Context->Eip    = Eip;
-    Context->Cs     = GDT_KCODE_SEGMENT;
+    Context->Cs     = (ThreadFlags & THREADING_USERMODE)
+                    ? (GDT_UCODE_SEGMENT | 0x3) : GDT_KCODE_SEGMENT;
     Context->Eflags = X86_THREAD_EFLAGS;
 
     /* irq_common does 'add esp, 8' before iret to drop these. */
     Context->Irq       = 0;
     Context->ErrorCode = 0;
 
-    /* Ring-0 iret does not touch these. Left zero. */
-    Context->UserEsp = 0;
-    Context->UserSs  = 0;
+    /* A ring-0 iret does not touch these. A ring-3 one pops both, and
+     * this is the only way the user stack ever gets loaded - there is no
+     * instruction between the iret and the first user instruction. */
+    if (ThreadFlags & THREADING_USERMODE) {
+        Context->UserEsp = UserStackTop;
+        Context->UserSs  = GDT_UDATA_SEGMENT | 0x3;
+        Context->Ebp     = UserStackTop;
+    }
+    else {
+        Context->UserEsp = 0;
+        Context->UserSs  = 0;
+    }
     Context->UserArg = 0;
 
     return Context;
+}
+
+/* ContextCreate
+ * Kernel thread wrapper, kept so existing callers do not change. */
+Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip, uintptr_t StackTop)
+{
+    return ContextCreateUser(ThreadFlags, Eip, StackTop, 0);
 }

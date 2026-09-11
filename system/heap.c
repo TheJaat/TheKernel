@@ -5,6 +5,7 @@
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
 #include <interrupts/interrupts.h>
+#include <arch/x86/memory.h>
 
 /* Includes
  * - Library */
@@ -753,6 +754,83 @@ Heap_t *HeapCreate(uintptr_t HeapAddress, uintptr_t HeapEnd, int UserHeap)
         return NULL;
     }
     return Heap;
+}
+
+/**************************************/
+/*********** Page reclaim *************/
+/**************************************/
+
+/* HeapReapBlockList
+ * Returns whole pages that lie entirely inside a free node.
+ *
+ * Only the interior is reclaimed: a node from 0x1400800 to 0x1403200
+ * gives up 0x1401000..0x1403000 and keeps the partial pages at each end,
+ * because those still hold bytes belonging to the allocations either
+ * side of it.
+ *
+ * This is safe because the heap's own bookkeeping lives in the header
+ * region at the bottom of the heap, never in the data pages - so
+ * unmapping a data page cannot take a node or block header with it. The
+ * range stays owned by the heap; it simply has no memory behind it until
+ * something allocates there again, at which point ALLOCATION_COMMIT maps
+ * fresh pages. */
+static size_t HeapReapBlockList(HeapBlock_t *Block)
+{
+    size_t Reaped = 0;
+
+    while (Block != NULL) {
+        HeapNode_t *Node = Block->Nodes;
+
+        while (Node != NULL) {
+            if (!(Node->Flags & NODE_ALLOCATED) && Node->Length >= PAGE_SIZE) {
+                uintptr_t Start = HEAP_ALIGN_UP(Node->Address, PAGE_SIZE);
+                uintptr_t End   = (Node->Address + Node->Length) & PAGE_MASK;
+                uintptr_t Page;
+
+                /* End is already rounded down to a page boundary, so
+                 * every page in [Start, End) lies wholly inside the
+                 * free node. */
+                for (Page = Start; Page < End; Page += PAGE_SIZE) {
+                    if (MmVirtualGetMapping(NULL, Page) == 0) {
+                        continue;   /* already reclaimed */
+                    }
+                    if (MmVirtualUnmap(NULL, Page, 1) == Success) {
+                        Reaped++;
+                    }
+                }
+            }
+            Node = Node->Link;
+        }
+
+        Block = Block->Link;
+    }
+
+    return Reaped;
+}
+
+/* HeapReap
+ * Returns unused heap pages to the physical allocator. Returns the
+ * number of pages reclaimed. NULL means the kernel heap. */
+size_t HeapReap(Heap_t *Heap)
+{
+    Heap_t *pHeap = (Heap == NULL) ? &GlbKernelHeap : Heap;
+    size_t Reaped = 0;
+
+    if (GlbHeapInitialized == 0) {
+        return 0;
+    }
+
+    HeapLock(pHeap);
+    Reaped += HeapReapBlockList(pHeap->Blocks);
+    Reaped += HeapReapBlockList(pHeap->PageBlocks);
+    Reaped += HeapReapBlockList(pHeap->CustomBlocks);
+    HeapUnlock(pHeap);
+
+    if (Reaped > 0) {
+        pHeap->NumPages -= (pHeap->NumPages >= Reaped) ? Reaped : pHeap->NumPages;
+    }
+
+    return Reaped;
 }
 
 /**************************************/

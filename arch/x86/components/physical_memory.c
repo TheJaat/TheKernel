@@ -271,6 +271,36 @@ OsStatus_t MmPhysicalFreeBlock(PhysicalAddress_t Address)
 	return Success;
 }
 
+/* MmPhysicalFreeBlocks
+ * Releases <Count> consecutive frames.
+ *
+ * The counterpart to MmPhysicalAllocateBlock's Count argument. Without
+ * it, anything allocated as a run had to be freed one frame at a time
+ * by hand - and the page-directory allocation, three blocks, was being
+ * released as one. That leaked two frames per address space, invisibly,
+ * because the address space itself was accounted for correctly. */
+OsStatus_t MmPhysicalFreeBlocks(PhysicalAddress_t Address, int Count)
+{
+	int Frame = (int)(Address / PAGE_SIZE);
+	int i;
+
+	if (Count <= 0) {
+		return Error;
+	}
+
+	for (i = 0; i < Count; i++) {
+		if (!MmMemoryMapValidBit((size_t)(Frame + i))) {
+			return Error;
+		}
+		MmMemoryMapUnsetBit(Frame + i);
+		if (MemoryBlocksUsed != 0) {
+			MemoryBlocksUsed--;
+		}
+	}
+
+	return Success;
+}
+
 /* MmPhysicalAllocateBlock
  * Allocates <Count> consecutive frames. <Mask> is now actually honoured:
  * it is the highest physical address the caller can accept.

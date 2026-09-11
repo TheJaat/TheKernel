@@ -7,6 +7,9 @@
 #include <system/log.h>
 #include <interrupts/interrupts.h>
 #include <arch/x86/x32/arch_x32.h>
+#include <arch/x86/x32/gdt.h>
+#include <arch/x86/memory.h>
+#include <arch/x86/address_space.h>
 
 /* Includes
  * - Library */
@@ -189,6 +192,157 @@ UUId_t ThreadingCreateThread(const char *Name, ThreadEntry_t Function,
     return Id;
 }
 
+/* ThreadingCreateUserThread
+ * A thread that starts in ring 3. The caller has already mapped the code
+ * PAGE_USER; this adds the user stack and marks that too. */
+UUId_t ThreadingCreateUserThread(const char *Name, uintptr_t Entry,
+    Flags_t Flags)
+{
+    Thread_t *Thread = NULL;
+    uintptr_t Stack, UserStack;
+    UUId_t Id;
+    size_t i;
+    int State;
+
+    if (Entry == 0) {
+        return UUID_INVALID;
+    }
+
+    Stack = (uintptr_t)kmalloc_a(THREADING_STACK_SIZE);
+    if (Stack == 0) {
+        LogFatal("Threading", "no memory for a kernel stack");
+        return UUID_INVALID;
+    }
+    UserStack = (uintptr_t)kmalloc_a(THREADING_USER_STACK_SIZE);
+    if (UserStack == 0) {
+        kfree((void*)Stack);
+        LogFatal("Threading", "no memory for a user stack");
+        return UUID_INVALID;
+    }
+    memset((void*)Stack, 0, THREADING_STACK_SIZE);
+    memset((void*)UserStack, 0, THREADING_USER_STACK_SIZE);
+
+    /* The user stack has to be reachable from ring 3, or the very first
+     * push after iret faults. The kernel stack deliberately is not. */
+    for (i = 0; i < THREADING_USER_STACK_SIZE; i += PAGE_SIZE) {
+        MmVirtualSetPageFlags(NULL, UserStack + i, PAGE_USER);
+    }
+
+    State = InterruptDisable();
+
+    Thread = ThreadingAllocateSlot();
+    if (Thread == NULL) {
+        InterruptRestoreState(State);
+        kfree((void*)Stack);
+        kfree((void*)UserStack);
+        LogFatal("Threading", "thread table is full");
+        return UUID_INVALID;
+    }
+
+    memset(Thread, 0, sizeof(Thread_t));
+    Id = GlbThreadIds++;
+
+    Thread->Id            = Id;
+    Thread->Flags         = Flags | THREADING_USERMODE;
+    Thread->Function      = NULL;
+    Thread->Args          = NULL;
+    Thread->StackBase     = Stack;
+    Thread->StackSize     = THREADING_STACK_SIZE;
+    Thread->UserStackBase = UserStack;
+    Thread->UserStackSize = THREADING_USER_STACK_SIZE;
+    Thread->TimeSliceLeft = THREADING_TIMESLICE;
+    ThreadingSetName(Thread, Name);
+
+    /* No trampoline for user threads: the entry point is user code and
+     * cannot be called from here. It exits with the exit syscall, and if
+     * it simply returns it lands on a zeroed user stack and faults -
+     * which is a user bug, reported as a fault, not a kernel one. */
+    Thread->Context = ContextCreateUser(Thread->Flags, Entry,
+        Stack + THREADING_STACK_SIZE,
+        UserStack + THREADING_USER_STACK_SIZE);
+
+    if (Thread->Context == NULL) {
+        Thread->State = ThreadStateFree;
+        InterruptRestoreState(State);
+        kfree((void*)Stack);
+        kfree((void*)UserStack);
+        return UUID_INVALID;
+    }
+
+    Thread->State = ThreadStateReady;
+    InterruptRestoreState(State);
+
+    LogInformation("Threading", "created user thread '%s' id %u, entry 0x%x",
+        Thread->Name, Thread->Id, Entry);
+    return Id;
+}
+
+/* ThreadingCreateUserThreadInSpace
+ * A ring-3 thread in its own address space. The image and stack are
+ * already mapped there by the caller. */
+UUId_t ThreadingCreateUserThreadInSpace(const char *Name, uintptr_t Entry,
+    AddressSpace_t *Space, uintptr_t UserStackTop, Flags_t Flags)
+{
+    Thread_t *Thread = NULL;
+    uintptr_t Stack;
+    UUId_t Id;
+    int State;
+
+    if (Entry == 0 || Space == NULL || UserStackTop == 0) {
+        return UUID_INVALID;
+    }
+
+    /* The kernel stack stays in the kernel heap: it must be reachable
+     * from every address space, because an interrupt taken in this
+     * thread lands on it before CR3 has changed. */
+    Stack = (uintptr_t)kmalloc_a(THREADING_STACK_SIZE);
+    if (Stack == 0) {
+        LogFatal("Threading", "no memory for a kernel stack");
+        return UUID_INVALID;
+    }
+    memset((void*)Stack, 0, THREADING_STACK_SIZE);
+
+    State = InterruptDisable();
+
+    Thread = ThreadingAllocateSlot();
+    if (Thread == NULL) {
+        InterruptRestoreState(State);
+        kfree((void*)Stack);
+        LogFatal("Threading", "thread table is full");
+        return UUID_INVALID;
+    }
+
+    memset(Thread, 0, sizeof(Thread_t));
+    Id = GlbThreadIds++;
+
+    Thread->Id            = Id;
+    Thread->Flags         = Flags | THREADING_USERMODE;
+    Thread->StackBase     = Stack;
+    Thread->StackSize     = THREADING_STACK_SIZE;
+    Thread->UserStackBase = 0;      /* lives in the process space */
+    Thread->UserStackSize = 0;
+    Thread->AddressSpace  = Space;
+    Thread->TimeSliceLeft = THREADING_TIMESLICE;
+    ThreadingSetName(Thread, Name);
+
+    Thread->Context = ContextCreateUser(Thread->Flags, Entry,
+        Stack + THREADING_STACK_SIZE, UserStackTop);
+
+    if (Thread->Context == NULL) {
+        Thread->State = ThreadStateFree;
+        InterruptRestoreState(State);
+        kfree((void*)Stack);
+        return UUID_INVALID;
+    }
+
+    Thread->State = ThreadStateReady;
+    InterruptRestoreState(State);
+
+    LogInformation("Threading", "created '%s' id %u in its own space, entry 0x%x",
+        Thread->Name, Thread->Id, Entry);
+    return Id;
+}
+
 /* ThreadingExit */
 void ThreadingExit(void)
 {
@@ -224,6 +378,8 @@ static OsStatus_t ThreadingGcReap(void *Data)
 {
     Thread_t *Thread = (Thread_t*)Data;
     uintptr_t Stack = 0;
+    uintptr_t UserStack = 0;
+    AddressSpace_t *Space = NULL;
     int State;
 
     if (Thread == NULL) {
@@ -233,15 +389,31 @@ static OsStatus_t ThreadingGcReap(void *Data)
     State = InterruptDisable();
     if (Thread->State == ThreadStateZombie && Thread != GlbCurrentThread) {
         Stack = Thread->StackBase;
+        UserStack = Thread->UserStackBase;
+        Space = Thread->AddressSpace;
         Thread->StackBase = 0;
+        Thread->UserStackBase = 0;
+        Thread->AddressSpace = NULL;
         Thread->Context = NULL;
         Thread->State = ThreadStateFree;
     }
     InterruptRestoreState(State);
 
+    /* Tearing down the address space is safe here because this runs on
+     * the gc thread, which has no address space of its own and therefore
+     * already switched CR3 back to the kernel's when it was scheduled.
+     * Doing it from the dying thread would be pulling the directory out
+     * from under the cpu that is executing. */
+    if (Space != NULL) {
+        AddressSpaceDestroy(Space);
+    }
+
     /* Free outside the critical section - kfree takes the heap lock. */
     if (Stack != 0) {
         kfree((void*)Stack);
+    }
+    if (UserStack != 0) {
+        kfree((void*)UserStack);
     }
     return Success;
 }
@@ -443,6 +615,36 @@ Context_t *_ThreadingSwitch(Context_t *Regs, int PreEmptive)
     Next->State = ThreadStateRunning;
     Next->TimeSliceLeft = THREADING_TIMESLICE;
     GlbCurrentThread = Next;
+
+    /* Point the TSS at this thread's kernel stack. When a ring-3 thread
+     * takes an interrupt the cpu switches stacks using esp0, so a stale
+     * value here means the next interrupt pushes its frame onto whatever
+     * thread ran last - corrupting it, and usually not crashing until
+     * much later. Set unconditionally: a kernel thread that later
+     * spawns a user one must not inherit a stale pointer either. */
+    if (Next->StackBase != 0) {
+        TssUpdateStack(0, Next->StackBase + Next->StackSize);
+    }
+
+    /* Load the incoming thread's address space, if it differs.
+     *
+     * Only on a change: reloading CR3 flushes the whole TLB, and doing
+     * that on every tick between two kernel threads would be pure loss.
+     *
+     * This is safe to do here, mid-switch, precisely because every
+     * address space shares the kernel half - the code executing right
+     * now is mapped identically in both, so the instruction after the
+     * CR3 write is still there. */
+    {
+        AddressSpace_t *NextSpace = (Next->AddressSpace != NULL)
+            ? Next->AddressSpace : AddressSpaceGetKernel();
+        AddressSpace_t *CurrentSpace = (Current->AddressSpace != NULL)
+            ? Current->AddressSpace : AddressSpaceGetKernel();
+
+        if (NextSpace != CurrentSpace) {
+            AddressSpaceSwitch(NextSpace);
+        }
+    }
 
     return Next->Context;
 }

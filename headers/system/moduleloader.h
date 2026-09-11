@@ -25,6 +25,11 @@ extern "C" {
  * once the module has finished. */
 OsStatus_t ModuleLoad(const char *Name);
 
+/* ModuleLoadUser
+ * As ModuleLoad, but the module runs in ring 3. It may not reference any
+ * kernel symbol - only int 0x80. */
+OsStatus_t ModuleLoadUser(const char *Name);
+
 /* ModuleLoaderPrintExports
  * Lists the kernel symbols modules are allowed to call. */
 void ModuleLoaderPrintExports(void);

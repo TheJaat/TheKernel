@@ -11,7 +11,7 @@ BUILD_DIR = $(ROOT_DIR)/build/system
 SUBDIRS = # Add your subdirectories here if any
 
 # Define source files
-C_SOURCES = heap.c timers.c iospace.c scheduler.c threading.c mutex.c semaphore.c spinlock.c pipe.c shell.c garbagecollector.c modules.c moduleloader.c
+C_SOURCES = heap.c timers.c iospace.c scheduler.c threading.c mutex.c semaphore.c spinlock.c pipe.c shell.c garbagecollector.c modules.c moduleloader.c syscalls.c
 CPP_SOURCES = log.cpp
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))

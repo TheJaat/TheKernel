@@ -4,6 +4,7 @@
 #include <defs.h>
 #include <stddef.h>
 #include <arch/x86/x32/context.h>
+#include <arch/x86/address_space.h>
 
 /* Fixed table, same reasoning as the timers and io-spaces: no list
  * implementation, and the scheduler runs in interrupt context where
@@ -31,6 +32,13 @@ typedef enum {
 /* Thread flags */
 #define THREADING_KERNELMODE        0x00000000
 #define THREADING_IDLE              0x00000001
+#define THREADING_USERMODE          0x00000002
+
+/* Where a user thread's stack goes, and how big. Separate from the
+ * kernel stack: ring 3 must never be able to touch the stack the kernel
+ * runs on, or a user program could rewrite its own saved register frame
+ * and return into ring 0. */
+#define THREADING_USER_STACK_SIZE   0x1000
 
 typedef void (*ThreadEntry_t)(void*);
 
@@ -44,8 +52,10 @@ typedef struct _Thread {
     Context_t      *Context;
 
     /* Base of the kmalloc'd stack, kept so it can be freed. */
-    uintptr_t       StackBase;
+    uintptr_t       StackBase;      /* kernel stack                     */
     size_t          StackSize;
+    uintptr_t       UserStackBase;  /* ring 3 stack, 0 for kernel threads */
+    size_t          UserStackSize;
 
     ThreadEntry_t   Function;
     void           *Args;
@@ -60,6 +70,10 @@ typedef struct _Thread {
      * bookkeeping would be. */
     void           *WaitObject;
     int             WaitTimedOut;
+
+    /* NULL means the kernel address space. Only user threads get their
+     * own. */
+    AddressSpace_t *AddressSpace;
 } Thread_t;
 
 #ifdef __cplusplus
@@ -118,6 +132,25 @@ void ThreadingPrint(void);
  * arranged so that iret enters <Eip>. Architecture specific. */
 Context_t *ContextCreate(Flags_t ThreadFlags, uintptr_t Eip,
     uintptr_t StackTop);
+
+/* ContextCreateUser
+ * As ContextCreate, but also arranges the ring-3 stack that iret loads. */
+Context_t *ContextCreateUser(Flags_t ThreadFlags, uintptr_t Eip,
+    uintptr_t StackTop, uintptr_t UserStackTop);
+
+/* ThreadingCreateUserThread
+ * Spawns a thread that begins executing in ring 3 at <Entry>. The code
+ * at <Entry> and the pages of its user stack must already be mapped
+ * PAGE_USER - the loader does that. */
+UUId_t ThreadingCreateUserThread(const char *Name, uintptr_t Entry,
+    Flags_t Flags);
+
+/* ThreadingCreateUserThreadInSpace
+ * As above, but the thread runs in <Space> with <UserStackTop> as its
+ * ring-3 stack. Both must already be set up by the caller - the loader
+ * does that. */
+UUId_t ThreadingCreateUserThreadInSpace(const char *Name, uintptr_t Entry,
+    AddressSpace_t *Space, uintptr_t UserStackTop, Flags_t Flags);
 
 /* _ThreadingSwitch
  * Called from InterruptEntry. Saves <Regs> into the current thread,

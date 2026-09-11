@@ -7,12 +7,17 @@
 #include <system/heap.h>
 #include <system/log.h>
 #include <system/elf.h>
+#include <arch/x86/memory.h>
+#include <arch/x86/x32/arch_x32.h>
+#include <arch/x86/address_space.h>
+#include <interrupts/interrupts.h>
 
 /* Includes
  * - Library */
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 /* A symbol a module is allowed to call. Anything not in here is an
  * undefined reference and the load is refused - which is the whole point
@@ -101,8 +106,65 @@ static void ModuleThread(void *Args)
     kfree(Module);
 }
 
-/* ModuleLoad */
-OsStatus_t ModuleLoad(const char *Name)
+/* ModuleRelocateAgain
+ * Re-applies relocations so the image works at <NewBase> instead of
+ * <OldBase>.
+ *
+ * The first pass resolved everything against the staging copy in the
+ * kernel heap. A user module has no undefined symbols, so every
+ * relocation is internal - which means each one can simply be shifted
+ * by the delta rather than recomputed. R_386_PC32 needs no adjustment
+ * at all: it is relative, and moving the whole image leaves the
+ * distance between two points inside it unchanged. */
+static OsStatus_t ModuleRelocateAgain(const uint8_t *Raw, Elf32_Ehdr *Header,
+    Elf32_Shdr *Sections, uintptr_t *SectionBase,
+    uintptr_t OldBase, uintptr_t NewBase, const char *Name)
+{
+    /* Unsigned on purpose: this libc has no intptr_t, and wrap-around
+     * gives the right answer for a negative delta anyway - adding the
+     * wrapped value is the same as subtracting the difference. */
+    uintptr_t Delta = NewBase - OldBase;
+    uint32_t i, j;
+
+    for (i = 0; i < Header->e_shnum; i++) {
+        Elf32_Rel *Relocs;
+        uint32_t Count;
+        uintptr_t TargetBase;
+
+        if (Sections[i].sh_type != SHT_REL) {
+            continue;
+        }
+        TargetBase = SectionBase[Sections[i].sh_info];
+        if (TargetBase == 0) {
+            continue;
+        }
+
+        Relocs = (Elf32_Rel*)(Raw + Sections[i].sh_offset);
+        Count = Sections[i].sh_size / sizeof(Elf32_Rel);
+
+        for (j = 0; j < Count; j++) {
+            uint32_t Type = ELF32_R_TYPE(Relocs[j].r_info);
+            uint32_t *Target = (uint32_t*)(TargetBase + Relocs[j].r_offset);
+
+            if (Type == R_386_32) {
+                *Target = (uint32_t)(*Target + Delta);
+            }
+            else if (Type == R_386_PC32 || Type == R_386_NONE) {
+                /* relative - unaffected by moving the image */
+            }
+            else {
+                LogFatal("Module", "'%s' relocation type %u cannot be "
+                    "rebased", Name, Type);
+                return Error;
+            }
+        }
+    }
+
+    return Success;
+}
+
+/* ModuleLoadInternal */
+static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
 {
     RamdiskEntry_t *File;
     const uint8_t *Raw;
@@ -256,6 +318,19 @@ OsStatus_t ModuleLoad(const char *Name)
 
             if (Symbol->st_shndx == SHN_UNDEF) {
                 const char *SymName = Strings + Symbol->st_name;
+
+                /* A user module may not link against the kernel at all.
+                 * Ring 3 cannot call a ring-0 address, so resolving one
+                 * would just produce a protection fault at the call
+                 * site - far better to refuse now and say why. User
+                 * modules reach the kernel through int 0x80 only. */
+                if (UserMode) {
+                    LogFatal("Module", "'%s' references '%s'; user modules "
+                        "may only use syscalls", Name, SymName);
+                    kfree(Image); kfree(SectionBase); kfree(Module);
+                    return Error;
+                }
+
                 S = ModuleFindExport(SymName);
                 if (S == 0) {
                     /* Refusing here is the point of the export table.
@@ -343,8 +418,90 @@ OsStatus_t ModuleLoad(const char *Name)
     Module->Image = Image;
     Module->SectionBase = SectionBase;
 
-    LogInformation("Module", "'%s' loaded at 0x%x, %u bytes, entry 0x%x",
-        Name, (uintptr_t)Image, ImageSize, (uintptr_t)Module->Entry);
+    LogInformation("Module", "'%s' loaded at 0x%x, %u bytes, entry 0x%x%s",
+        Name, (uintptr_t)Image, ImageSize, (uintptr_t)Module->Entry,
+        UserMode ? " (ring 3)" : "");
+
+    if (UserMode) {
+        AddressSpace_t *Space;
+        uintptr_t EntryOffset = (uintptr_t)Module->Entry - (uintptr_t)Image;
+        uintptr_t UserImage = MEMORY_LOCATION_RING3_CODE;
+        uintptr_t UserStackTop = MEMORY_LOCATION_RING3_HEAP;
+        size_t StackSize = PAGE_SIZE * 4;
+        size_t Offset;
+        int State;
+
+        Space = AddressSpaceCreate(AS_TYPE_APPLICATION);
+        if (Space == NULL) {
+            kfree(Image); kfree(SectionBase); kfree(Module);
+            return Error;
+        }
+
+        /* Map private frames for the image and the stack into the new
+         * space at the ring-3 addresses. These are the process's own
+         * pages: nothing else can see them, which is the entire point
+         * of giving it a directory of its own. */
+        for (Offset = 0; Offset < ImageSize; Offset += PAGE_SIZE) {
+            PhysicalAddress_t Frame = MmPhysicalAllocateBlock(__MASK, 1);
+            if (Frame == 0 || MmVirtualMap(Space->PageDirectory, Frame,
+                    UserImage + Offset, PAGE_USER) != Success) {
+                LogFatal("Module", "could not map the image for '%s'", Name);
+                AddressSpaceDestroy(Space);
+                kfree(Image); kfree(SectionBase); kfree(Module);
+                return Error;
+            }
+        }
+        for (Offset = 0; Offset < StackSize; Offset += PAGE_SIZE) {
+            PhysicalAddress_t Frame = MmPhysicalAllocateBlock(__MASK, 1);
+            if (Frame == 0 || MmVirtualMap(Space->PageDirectory, Frame,
+                    (UserStackTop - StackSize) + Offset, PAGE_USER) != Success) {
+                LogFatal("Module", "could not map a stack for '%s'", Name);
+                AddressSpaceDestroy(Space);
+                kfree(Image); kfree(SectionBase); kfree(Module);
+                return Error;
+            }
+        }
+
+        /* Relocations were resolved against the kernel-heap copy, so
+         * redo them for where the image will actually live. Simpler
+         * than a second relocation pass: adjust by the delta, which is
+         * only valid because every internal reference is an absolute
+         * address inside the image. */
+        if (ModuleRelocateAgain(Raw, Header, Sections, SectionBase,
+                (uintptr_t)Image, UserImage, Name) != Success) {
+            AddressSpaceDestroy(Space);
+            kfree(Image); kfree(SectionBase); kfree(Module);
+            return Error;
+        }
+
+        /* Copy the prepared image into the process. Switching CR3 is
+         * the simplest way to reach those addresses; interrupts are off
+         * so no thread switch can reload CR3 underneath us. */
+        State = InterruptDisable();
+        AddressSpaceSwitch(Space);
+        memcpy((void*)UserImage, Image, ImageSize);
+        memset((void*)(UserStackTop - StackSize), 0, StackSize);
+        AddressSpaceSwitch(AddressSpaceGetKernel());
+        InterruptRestoreState(State);
+
+        LogInformation("Module", "'%s' mapped at 0x%x in its own space",
+            Name, UserImage);
+
+        if (ThreadingCreateUserThreadInSpace("umodule",
+                UserImage + EntryOffset, Space, UserStackTop, 0)
+            == UUID_INVALID) {
+            LogFatal("Module", "could not create a user thread for '%s'", Name);
+            AddressSpaceDestroy(Space);
+            kfree(Image); kfree(SectionBase); kfree(Module);
+            return Error;
+        }
+
+        /* The kernel-side staging copy has done its job. */
+        kfree(Image);
+        kfree(SectionBase);
+        kfree(Module);
+        return Success;
+    }
 
     if (ThreadingCreateThread("module", ModuleThread, Module, 0)
         == UUID_INVALID) {
@@ -354,4 +511,15 @@ OsStatus_t ModuleLoad(const char *Name)
     }
 
     return Success;
+}
+
+/* ModuleLoad / ModuleLoadUser */
+OsStatus_t ModuleLoad(const char *Name)
+{
+    return ModuleLoadInternal(Name, 0);
+}
+
+OsStatus_t ModuleLoadUser(const char *Name)
+{
+    return ModuleLoadInternal(Name, 1);
 }

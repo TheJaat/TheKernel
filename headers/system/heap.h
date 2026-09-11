@@ -127,6 +127,13 @@ int HeapQueryMemoryInformation(Heap_t *Heap, size_t *BytesInUse,
  * NULL = kernel heap. */
 int HeapValidateAddress(Heap_t *Heap, uintptr_t Address);
 
+/* HeapReap
+ * Returns whole unused pages inside free heap nodes to the physical
+ * allocator. The address range stays owned by the heap; it just has no
+ * memory behind it until something allocates there again. Returns the
+ * number of pages reclaimed. NULL means the kernel heap. */
+size_t HeapReap(Heap_t *Heap);
+
 /* HeapPrintStats
  * Dumps block/node counts through the logger. NULL = kernel heap. */
 void HeapPrintStats(Heap_t *Heap);

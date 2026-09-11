@@ -32,6 +32,7 @@
 #include <system/shell.h>
 #include <system/garbagecollector.h>
 #include <system/modules.h>
+#include <system/syscalls.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -431,6 +432,8 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
 
         // The ramdisk, if the bootloader found one. Not fatal when
         // absent - the shell just has nothing to list.
+        SyscallsInitialize();
+
         ModulesInitialize(bootDescriptor);
         ModulesPrint();
 

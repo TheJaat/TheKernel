@@ -66,18 +66,25 @@ OsStatus_t AddressSpaceInitKernel(
 	AddressSpace_t *Kernel);
 
 /* AddressSpaceCreate
- * Initialize a new address space, depending on 
- * what user is requesting we might recycle a already
- * existing address space */
-// AddressSpace_t* AddressSpaceCreate(
-// 	Flags_t Flags);
+ * Creates an address space that shares the kernel half and has an empty
+ * user half. NULL on failure. */
+AddressSpace_t *AddressSpaceCreate(Flags_t Flags);
 
 /* AddressSpaceDestroy
- * Destroy and release all resources related
- * to an address space, only if there is no more
- * references */
-// OsStatus_t AddressSpaceDestroy(
-// 	AddressSpace_t *AddressSpace);
+ * Drops a reference and, at zero, frees the user half and the
+ * directory. The kernel tables are shared and are never freed. */
+OsStatus_t AddressSpaceDestroy(AddressSpace_t *AddressSpace);
+
+/* AddressSpaceGetCount
+ * Number of live address spaces, kernel excluded. */
+size_t AddressSpaceGetCount(void);
+
+/* AddressSpaceGetKernel */
+AddressSpace_t *AddressSpaceGetKernel(void);
+
+/* AddressSpaceSwitch
+ * Loads an address space on the current cpu. */
+OsStatus_t AddressSpaceSwitch(AddressSpace_t *AddressSpace);
 
 /* AddressSpaceSwitch
  * Switches the current address space out with the
