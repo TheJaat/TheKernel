@@ -10,6 +10,7 @@
 #include <arch/x86/x32/gdt.h>
 #include <arch/x86/memory.h>
 #include <arch/x86/address_space.h>
+#include <system/process.h>
 
 /* Includes
  * - Library */
@@ -343,6 +344,38 @@ UUId_t ThreadingCreateUserThreadInSpace(const char *Name, uintptr_t Entry,
     return Id;
 }
 
+/* ThreadingCreateProcessThread */
+UUId_t ThreadingCreateProcessThread(const char *Name, uintptr_t Entry,
+    void *ProcessPtr, Flags_t Flags)
+{
+    Process_t *Process = (Process_t*)ProcessPtr;
+    uintptr_t UserStackTop;
+    Thread_t *Thread;
+    UUId_t Id;
+
+    if (Process == NULL || Entry == 0) {
+        return UUID_INVALID;
+    }
+
+    UserStackTop = ProcessAllocateUserStack(Process);
+    if (UserStackTop == 0) {
+        return UUID_INVALID;
+    }
+
+    Id = ThreadingCreateUserThreadInSpace(Name, Entry,
+        Process->AddressSpace, UserStackTop, Flags);
+    if (Id == UUID_INVALID) {
+        return UUID_INVALID;
+    }
+
+    Thread = ThreadingGetThread(Id);
+    if (Thread != NULL) {
+        Thread->Process = Process;
+    }
+    ProcessAddThread(Process);
+    return Id;
+}
+
 /* ThreadingExit */
 void ThreadingExit(void)
 {
@@ -380,6 +413,7 @@ static OsStatus_t ThreadingGcReap(void *Data)
     uintptr_t Stack = 0;
     uintptr_t UserStack = 0;
     AddressSpace_t *Space = NULL;
+    void *Process = NULL;
     int State;
 
     if (Thread == NULL) {
@@ -391,9 +425,11 @@ static OsStatus_t ThreadingGcReap(void *Data)
         Stack = Thread->StackBase;
         UserStack = Thread->UserStackBase;
         Space = Thread->AddressSpace;
+        Process = Thread->Process;
         Thread->StackBase = 0;
         Thread->UserStackBase = 0;
         Thread->AddressSpace = NULL;
+        Thread->Process = NULL;
         Thread->Context = NULL;
         Thread->State = ThreadStateFree;
     }
@@ -404,7 +440,12 @@ static OsStatus_t ThreadingGcReap(void *Data)
      * already switched CR3 back to the kernel's when it was scheduled.
      * Doing it from the dying thread would be pulling the directory out
      * from under the cpu that is executing. */
-    if (Space != NULL) {
+    /* A thread in a process does not destroy the space itself: it tells
+     * the process it is gone, and the last one out tears it down. */
+    if (Process != NULL) {
+        ProcessRemoveThread((Process_t*)Process);
+    }
+    else if (Space != NULL) {
         AddressSpaceDestroy(Space);
     }
 

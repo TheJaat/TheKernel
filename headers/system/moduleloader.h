@@ -30,6 +30,11 @@ OsStatus_t ModuleLoad(const char *Name);
  * kernel symbol - only int 0x80. */
 OsStatus_t ModuleLoadUser(const char *Name);
 
+/* ModuleLoadServer
+ * As ModuleLoadUser, but the process is granted hardware privileges.
+ * For drivers started at boot, not for anything loaded on request. */
+OsStatus_t ModuleLoadServer(const char *Name);
+
 /* ModuleLoaderPrintExports
  * Lists the kernel symbols modules are allowed to call. */
 void ModuleLoaderPrintExports(void);

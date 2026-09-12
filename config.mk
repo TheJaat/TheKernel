@@ -32,6 +32,16 @@ KERNEL_LIBC = $(KERNEL_INCLUDE)/libc
 KERNEL_DRIVER = $(KERNEL_INCLUDE)/driver
 KERNEL_LIB = $(KERNEL_INCLUDE)/lib
 
+# Headers shared verbatim between the kernel and user programs - the
+# syscall ABI lives here, so there is exactly one copy and the two
+# cannot drift apart.
+SHARED_INCLUDE = $(ROOT_DIR)/../shared
+
+# One list used by every compile rule. Adding a header directory should
+# only ever mean editing this line.
+KERNEL_INCLUDES = -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) \
+                  -I$(KERNEL_DRIVER) -I$(SHARED_INCLUDE)
+
 # Common Directories
 OUTPUT_DIR = ../../build
 

@@ -8,10 +8,10 @@ include $(ROOT_DIR)/config.mk
 
 # Define directories
 BUILD_DIR = $(ROOT_DIR)/build/system
-SUBDIRS = # Add your subdirectories here if any
+SUBDIRS = process
 
 # Define source files
-C_SOURCES = heap.c timers.c iospace.c scheduler.c threading.c mutex.c semaphore.c spinlock.c pipe.c shell.c garbagecollector.c modules.c moduleloader.c syscalls.c
+C_SOURCES = heap.c timers.c iospace.c scheduler.c threading.c mutex.c semaphore.c spinlock.c pipe.c shell.c garbagecollector.c modules.c moduleloader.c 
 CPP_SOURCES = log.cpp
 
 REL_DIR := $(patsubst $(ROOT_DIR)/%,%,$(CURDIR))
@@ -42,12 +42,12 @@ $(SUBDIRS):
 # Compile C sources
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling $<..."
-	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
-# 	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CFLAGS) -O2 -Wall -Wextra
+	$(CC) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
+# 	$(CC) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CFLAGS) -O2 -Wall -Wextra
 
 $(BUILD_DIR)/%.o: %.cpp
 	@echo "Compiling $<..."
-	$(CXX) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+	$(CXX) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
 
 # Create build directory if not exists
 $(BUILD_DIR):

@@ -74,6 +74,11 @@ typedef struct _Thread {
     /* NULL means the kernel address space. Only user threads get their
      * own. */
     AddressSpace_t *AddressSpace;
+
+    /* The process this thread belongs to, or NULL for a kernel thread.
+     * The address space above belongs to the process - the thread does
+     * not own it, which is why only the last thread out destroys it. */
+    void           *Process;
 } Thread_t;
 
 #ifdef __cplusplus
@@ -151,6 +156,12 @@ UUId_t ThreadingCreateUserThread(const char *Name, uintptr_t Entry,
  * does that. */
 UUId_t ThreadingCreateUserThreadInSpace(const char *Name, uintptr_t Entry,
     AddressSpace_t *Space, uintptr_t UserStackTop, Flags_t Flags);
+
+/* ThreadingCreateProcessThread
+ * A ring-3 thread belonging to <Process>: shares its address space and
+ * gets a fresh stack from it. */
+UUId_t ThreadingCreateProcessThread(const char *Name, uintptr_t Entry,
+    void *Process, Flags_t Flags);
 
 /* _ThreadingSwitch
  * Called from InterruptEntry. Saves <Regs> into the current thread,

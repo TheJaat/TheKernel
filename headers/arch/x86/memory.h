@@ -148,6 +148,11 @@ VirtualAddress_t MmReserveMemory(int Pages);
 OsStatus_t MmVirtualSetPageFlags(void *PageDirectory,
 	VirtualAddress_t vAddress, Flags_t Flags);
 
+/* MmVirtualGetPageFlags
+ * Success if every bit in <Flags> is set at both levels of the walk. */
+OsStatus_t MmVirtualGetPageFlags(void *PageDirectory,
+	VirtualAddress_t vAddress, Flags_t Flags);
+
 /* MmVirtualUnmap
  * Removes the mapping at <vAddress>. When <ReleaseFrame> is non-zero the
  * physical page behind it is returned to the allocator. Returns Error

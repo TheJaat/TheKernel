@@ -42,7 +42,7 @@ $(SUBDIRS):
 
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling $<..."
-	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
+	$(CC) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
 
 # Compile C sources
 $(BUILD_DIR)/%.o: %.cpp
@@ -51,8 +51,8 @@ $(BUILD_DIR)/%.o: %.cpp
 	$(info KERNEL_LIBC=$(KERNEL_LIBC))
 	$(info KERNEL_DRIVER=$(KERNEL_DRIVER))
 
-# 	$(CXX) -I$(KERNEL_INCLUDE) -I $(KERNEL_LIBC) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
-	$(CXX) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+# 	$(CXX) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I $(KERNEL_LIBC) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+	$(CXX) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
 
 # Assemble ASM sources
 $(BUILD_DIR)/%.o: %.asm

@@ -10,6 +10,7 @@
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
 #include <arch/x86/address_space.h>
+#include <system/process.h>
 #include <interrupts/interrupts.h>
 
 /* Includes
@@ -164,7 +165,8 @@ static OsStatus_t ModuleRelocateAgain(const uint8_t *Raw, Elf32_Ehdr *Header,
 }
 
 /* ModuleLoadInternal */
-static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
+static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode,
+    Flags_t Privileges)
 {
     RamdiskEntry_t *File;
     const uint8_t *Raw;
@@ -423,19 +425,21 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
         UserMode ? " (ring 3)" : "");
 
     if (UserMode) {
+        Process_t *Process;
         AddressSpace_t *Space;
         uintptr_t EntryOffset = (uintptr_t)Module->Entry - (uintptr_t)Image;
         uintptr_t UserImage = MEMORY_LOCATION_RING3_CODE;
-        uintptr_t UserStackTop = MEMORY_LOCATION_RING3_HEAP;
-        size_t StackSize = PAGE_SIZE * 4;
+        uintptr_t UserStackTop;
         size_t Offset;
         int State;
 
-        Space = AddressSpaceCreate(AS_TYPE_APPLICATION);
-        if (Space == NULL) {
+        Process = ProcessCreate(Name, Privileges);
+        if (Process == NULL) {
             kfree(Image); kfree(SectionBase); kfree(Module);
             return Error;
         }
+        Space = Process->AddressSpace;
+        ProcessAddThread(Process);      /* held until the thread exists */
 
         /* Map private frames for the image and the stack into the new
          * space at the ring-3 addresses. These are the process's own
@@ -446,20 +450,18 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
             if (Frame == 0 || MmVirtualMap(Space->PageDirectory, Frame,
                     UserImage + Offset, PAGE_USER) != Success) {
                 LogFatal("Module", "could not map the image for '%s'", Name);
-                AddressSpaceDestroy(Space);
+                ProcessRemoveThread(Process);
                 kfree(Image); kfree(SectionBase); kfree(Module);
                 return Error;
             }
         }
-        for (Offset = 0; Offset < StackSize; Offset += PAGE_SIZE) {
-            PhysicalAddress_t Frame = MmPhysicalAllocateBlock(__MASK, 1);
-            if (Frame == 0 || MmVirtualMap(Space->PageDirectory, Frame,
-                    (UserStackTop - StackSize) + Offset, PAGE_USER) != Success) {
-                LogFatal("Module", "could not map a stack for '%s'", Name);
-                AddressSpaceDestroy(Space);
-                kfree(Image); kfree(SectionBase); kfree(Module);
-                return Error;
-            }
+        /* The process owns stack allocation, so a second thread in the
+         * same process gets its own rather than sharing this one. */
+        UserStackTop = ProcessAllocateUserStack(Process);
+        if (UserStackTop == 0) {
+            ProcessRemoveThread(Process);
+            kfree(Image); kfree(SectionBase); kfree(Module);
+            return Error;
         }
 
         /* Relocations were resolved against the kernel-heap copy, so
@@ -469,7 +471,7 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
          * address inside the image. */
         if (ModuleRelocateAgain(Raw, Header, Sections, SectionBase,
                 (uintptr_t)Image, UserImage, Name) != Success) {
-            AddressSpaceDestroy(Space);
+            ProcessRemoveThread(Process);
             kfree(Image); kfree(SectionBase); kfree(Module);
             return Error;
         }
@@ -480,20 +482,35 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
         State = InterruptDisable();
         AddressSpaceSwitch(Space);
         memcpy((void*)UserImage, Image, ImageSize);
-        memset((void*)(UserStackTop - StackSize), 0, StackSize);
+        memset((void*)(UserStackTop - PROCESS_USER_STACK_SIZE), 0,
+            PROCESS_USER_STACK_SIZE);
         AddressSpaceSwitch(AddressSpaceGetKernel());
         InterruptRestoreState(State);
 
         LogInformation("Module", "'%s' mapped at 0x%x in its own space",
             Name, UserImage);
 
-        if (ThreadingCreateUserThreadInSpace("umodule",
-                UserImage + EntryOffset, Space, UserStackTop, 0)
-            == UUID_INVALID) {
-            LogFatal("Module", "could not create a user thread for '%s'", Name);
-            AddressSpaceDestroy(Space);
-            kfree(Image); kfree(SectionBase); kfree(Module);
-            return Error;
+        {
+            UUId_t Tid = ThreadingCreateUserThreadInSpace("umodule",
+                UserImage + EntryOffset, Space, UserStackTop, 0);
+            Thread_t *Thread;
+
+            if (Tid == UUID_INVALID) {
+                LogFatal("Module", "could not create a user thread for '%s'",
+                    Name);
+                ProcessRemoveThread(Process);
+                kfree(Image); kfree(SectionBase); kfree(Module);
+                return Error;
+            }
+
+            Thread = ThreadingGetThread(Tid);
+            if (Thread != NULL) {
+                Thread->Process = Process;
+            }
+            /* Drop the reference held across setup now the real thread
+             * owns one. */
+            ProcessAddThread(Process);
+            ProcessRemoveThread(Process);
         }
 
         /* The kernel-side staging copy has done its job. */
@@ -516,10 +533,19 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode)
 /* ModuleLoad / ModuleLoadUser */
 OsStatus_t ModuleLoad(const char *Name)
 {
-    return ModuleLoadInternal(Name, 0);
+    return ModuleLoadInternal(Name, 0, PROCESS_PRIV_NONE);
 }
 
 OsStatus_t ModuleLoadUser(const char *Name)
 {
-    return ModuleLoadInternal(Name, 1);
+    return ModuleLoadInternal(Name, 1, PROCESS_PRIV_NONE);
+}
+
+/* ModuleLoadServer
+ * A user module granted hardware privileges. Reserved for modules
+ * started from the ramdisk at boot - an application loaded later must
+ * not be able to claim an interrupt line. */
+OsStatus_t ModuleLoadServer(const char *Name)
+{
+    return ModuleLoadInternal(Name, 1, PROCESS_PRIV_HARDWARE);
 }

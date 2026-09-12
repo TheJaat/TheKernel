@@ -342,6 +342,53 @@ MmVirtualSetPageFlags(
 	return Success;
 }
 
+/* MmVirtualGetPageFlags
+ * Returns Success if every bit in <Flags> is set on both the page-table
+ * entry and the directory entry above it.
+ *
+ * Both levels, because the cpu checks permission at every level of the
+ * walk. A page marked PAGE_USER under a supervisor-only directory entry
+ * is not reachable from ring 3, and a validator that only looked at the
+ * page-table entry would wrongly approve it. */
+OsStatus_t
+MmVirtualGetPageFlags(
+	 void *PageDirectory,
+	 VirtualAddress_t vAddress,
+	 Flags_t Flags)
+{
+	PageDirectory_t *Directory = (PageDirectory_t*)PageDirectory;
+	PageTable_t *Table = NULL;
+	unsigned Index;
+
+	if (Directory == NULL) {
+		Directory = g_PageDirectories[CpuGetCurrentId()];
+	}
+	if (Directory == NULL) {
+		return Error;
+	}
+
+	Index = PAGE_DIRECTORY_INDEX(vAddress);
+	if (!(Directory->pTables[Index] & PAGE_PRESENT)) {
+		return Error;
+	}
+	if ((Directory->pTables[Index] & Flags) != Flags) {
+		return Error;
+	}
+
+	Table = (PageTable_t*)Directory->vTables[Index];
+	if (Table == NULL) {
+		return Error;
+	}
+	if (!(Table->Pages[PAGE_TABLE_INDEX(vAddress)] & PAGE_PRESENT)) {
+		return Error;
+	}
+	if ((Table->Pages[PAGE_TABLE_INDEX(vAddress)] & Flags) != Flags) {
+		return Error;
+	}
+
+	return Success;
+}
+
 /* MmVirtualUnmap
  * Removes a mapping and optionally releases the physical frame behind
  * it. Returns Error if nothing was mapped there.

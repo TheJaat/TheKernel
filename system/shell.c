@@ -9,6 +9,7 @@
 #include <system/modules.h>
 #include <system/moduleloader.h>
 #include <system/syscalls.h>
+#include <system/process.h>
 #include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
@@ -79,6 +80,9 @@ static void ShellCommandHelp(void)
     printf("  cat <file>    print a file from the ramdisk\n");
     printf("  run <file>    load and run a module from the ramdisk\n");
     printf("  urun <file>   load and run a module in ring 3\n");
+    printf("  srun <file>   run a ring 3 module with hardware privileges\n");
+    printf("  procs         process table\n");
+    printf("  names         registered service names\n");
     printf("  exports       kernel symbols modules may call\n");
     printf("  sys           syscall counter\n");
     printf("  reap          return unused heap pages to the allocator\n");
@@ -193,6 +197,25 @@ static void ShellExecute(char *Line)
     }
     else if (strcmp(Line, "sys") == 0) {
         printf("%u syscalls made\n", SyscallsGetCount());
+    }
+    else if (strncmp(Line, "srun", 4) == 0
+             && (Line[4] == ' ' || Line[4] == '\0')) {
+        const char *Name = ShellSkipSpaces(Line + 4);
+        if (*Name == '\0') {
+            printf("srun: expected a module name\n");
+        }
+        else if (ModuleLoadServer(Name) != Success) {
+            printf("srun: %s could not be loaded\n", Name);
+        }
+    }
+    else if (strcmp(Line, "procs") == 0) {
+        if (ProcessGetCount() == 0) {
+            printf("no processes\n");
+        }
+        ProcessPrint();
+    }
+    else if (strcmp(Line, "names") == 0) {
+        SyscallsPrintNames();
     }
     else if (strcmp(Line, "exports") == 0) {
         ModuleLoaderPrintExports();

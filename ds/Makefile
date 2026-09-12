@@ -42,13 +42,13 @@ $(SUBDIRS):
 # Compile C sources
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling $<..."
-	$(CC) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
+	$(CC) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_LIBC) -I$(KERNEL_LIB) -I$(KERNEL_DRIVER) -c $< -o $@ $(GCC_FLAGS) -O2 -Wall -Wextra
 
-# 	$(CC) -I$(KERNEL_INCLUDE) -I$(LIBC_INCLUDE) -I$(KERNEL_DRIVER) -c $< -o $@ $(CFLAGS) -O2 -Wall -Wextra
+# 	$(CC) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(LIBC_INCLUDE) -I$(KERNEL_DRIVER) -c $< -o $@ $(CFLAGS) -O2 -Wall -Wextra
 
 $(BUILD_DIR)/%.o: %.cpp
 	@echo "Compiling $<..."
-	$(CXX) -I$(KERNEL_INCLUDE) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
+	$(CXX) -I$(SHARED_INCLUDE) -I$(KERNEL_INCLUDE) -I$(KERNEL_DRIVER) -c $< -o $@ $(CXX_FLAGS) -O2 -Wall -Wextra
 
 # Create build directory if not exists
 $(BUILD_DIR):
