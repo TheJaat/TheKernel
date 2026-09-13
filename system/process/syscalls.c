@@ -285,6 +285,56 @@ static int SyscallLookupName(const char *UserName)
     return ProcessHandleAdd(Process, HandlePipe, Pipe, 0);
 }
 
+/* SyscallSetReply
+ * Nominates one of the caller's pipes as the channel replies arrive on.
+ * A process has exactly one, which is what makes SYS_OPEN_REPLY
+ * unambiguous. */
+static int SyscallSetReply(int PipeHandle)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    Entry = ProcessHandleGet(Process, PipeHandle, HandlePipe);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    if (ProcessSetReplyPipe(Process, Entry->Object) != Success) {
+        return SYSCALL_ERROR;
+    }
+    return SYSCALL_OK;
+}
+
+/* SyscallOpenReply
+ * Returns a handle to <ProcessId>'s reply channel.
+ *
+ * This is the only way one process obtains a reference to another's
+ * pipe, and it is deliberately narrow: the target must have nominated a
+ * reply channel itself, and the handle is not owned, so closing it
+ * cannot destroy the other process's pipe.
+ *
+ * It is also why a client's identity in an RPC header cannot be forged
+ * usefully - the kernel fills nothing in, but a server replying to a
+ * claimed pid reaches that process's own channel and nobody else's. */
+static int SyscallOpenReply(UUId_t ProcessId)
+{
+    Process_t *Process = ProcessGetCurrent();
+    void *Pipe;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+
+    Pipe = ProcessGetReplyPipe(ProcessId);
+    if (Pipe == NULL) {
+        return SYSCALL_NOTFOUND;
+    }
+
+    return ProcessHandleAdd(Process, HandlePipe, Pipe, 0);
+}
+
 /* --- dispatch ------------------------------------------------------ */
 
 static InterruptStatus_t SyscallHandler(void *Data)
@@ -361,6 +411,14 @@ static InterruptStatus_t SyscallHandler(void *Data)
 
         case SYS_PIPE_AVAILABLE:
             Result = SyscallPipeAvailable((int)Registers->Ebx);
+            break;
+
+        case SYS_SET_REPLY:
+            Result = SyscallSetReply((int)Registers->Ebx);
+            break;
+
+        case SYS_OPEN_REPLY:
+            Result = SyscallOpenReply((UUId_t)Registers->Ebx);
             break;
 
         case SYS_REGISTER_NAME:

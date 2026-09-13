@@ -13,6 +13,16 @@
 #define PIPE_NOBLOCK_WRITE          0x2
 #define PIPE_NOBLOCK                (PIPE_NOBLOCK_READ | PIPE_NOBLOCK_WRITE)
 
+/* All-or-nothing writes.
+ *
+ * Without this a write larger than the free space is split: the ring
+ * takes what fits and the writer blocks for the rest. With two writers
+ * that interleaves - the reader gets the first half of one message and
+ * the second half of another, and there is no way to detect it. RPC
+ * needs the header and its payload to arrive as one unit, so an atomic
+ * write is what makes a shared request channel safe. */
+#define PIPE_ATOMIC                 0x4
+
 /* A byte ring buffer with a blocking reader and writer. */
 typedef struct _Pipe {
     Flags_t         Flags;

@@ -107,11 +107,30 @@ size_t PipeWrite(Pipe_t *Pipe, const uint8_t *Data, size_t Length)
         return 0;
     }
 
+    /* An atomic write must fit whole. A message larger than the pipe can
+     * never be written, so refuse rather than block forever. */
+    if ((Pipe->Flags & PIPE_ATOMIC) && Length > (Pipe->Length - 1)) {
+        return 0;
+    }
+
     while (Written < Length) {
         int WakeReader = 0;
         int MustWait = 0;
 
         SpinlockAcquireIrq(&Pipe->Lock);
+
+        /* Atomic: take the lock, and if the whole message does not fit,
+         * write nothing and wait. Partial progress is what interleaves. */
+        if ((Pipe->Flags & PIPE_ATOMIC) && PipeInternalFree(Pipe) < Length) {
+            if (Pipe->Flags & PIPE_NOBLOCK_WRITE) {
+                SpinlockReleaseIrq(&Pipe->Lock);
+                break;
+            }
+            Pipe->WriteWaiting++;
+            SpinlockReleaseIrq(&Pipe->Lock);
+            SemaphoreP(&Pipe->WriteQueue, 0);
+            continue;
+        }
 
         while (Written < Length && PipeInternalFree(Pipe) > 0) {
             Pipe->Buffer[Pipe->IndexWrite] = Data[Written++];

@@ -292,6 +292,27 @@ OsStatus_t ProcessHandleClose(Process_t *Process, int Index)
     return Success;
 }
 
+/* ProcessSetReplyPipe */
+OsStatus_t ProcessSetReplyPipe(Process_t *Process, void *Pipe)
+{
+    if (Process == NULL || Pipe == NULL) {
+        return Error;
+    }
+    Process->ReplyPipe = Pipe;
+    return Success;
+}
+
+/* ProcessGetReplyPipe */
+void *ProcessGetReplyPipe(UUId_t ProcessId)
+{
+    Process_t *Process = ProcessGet(ProcessId);
+
+    if (Process == NULL) {
+        return NULL;
+    }
+    return Process->ReplyPipe;
+}
+
 /* ProcessGetCount */
 size_t ProcessGetCount(void)
 {

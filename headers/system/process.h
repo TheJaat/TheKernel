@@ -48,6 +48,16 @@ typedef struct _Process {
     int             Threads;
 
     Handle_t        Handles[PROCESS_MAX_HANDLES];
+
+    /* Where replies to this process's RPC calls arrive.
+     *
+     * A reply cannot be addressed by handle: handles are per-process
+     * indices, so the client's handle number means nothing to the
+     * server. Addressing by process id instead lets the kernel resolve
+     * it - and the kernel is the only party that can be trusted to say
+     * which pipe belongs to which process. */
+    void           *ReplyPipe;
+
     int             Used;
 } Process_t;
 
@@ -76,6 +86,10 @@ int        ProcessHandleAdd(Process_t *Process, HandleType_t Type,
                             void *Object, int Owned);
 Handle_t  *ProcessHandleGet(Process_t *Process, int Index, HandleType_t Type);
 OsStatus_t ProcessHandleClose(Process_t *Process, int Index);
+
+/* ProcessSetReplyPipe / ProcessGetReplyPipe */
+OsStatus_t ProcessSetReplyPipe(Process_t *Process, void *Pipe);
+void      *ProcessGetReplyPipe(UUId_t ProcessId);
 
 size_t     ProcessGetCount(void);
 void       ProcessPrint(void);
