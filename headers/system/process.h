@@ -58,6 +58,14 @@ typedef struct _Process {
      * which pipe belongs to which process. */
     void           *ReplyPipe;
 
+    /* x86 I/O permission bitmap, one bit per port, 1 = denied.
+     *
+     * The cpu consults this on every in/out executed in ring 3, so a
+     * granted port runs at full speed with no syscall and no emulation.
+     * NULL until the process is granted something - most processes
+     * never are, and a 2 KB copy on every context switch is not free. */
+    uint8_t        *IoMap;
+
     int             Used;
 } Process_t;
 
@@ -90,6 +98,16 @@ OsStatus_t ProcessHandleClose(Process_t *Process, int Index);
 /* ProcessSetReplyPipe / ProcessGetReplyPipe */
 OsStatus_t ProcessSetReplyPipe(Process_t *Process, void *Pipe);
 void      *ProcessGetReplyPipe(UUId_t ProcessId);
+
+/* ProcessGrantPorts
+ * Opens [Port, Port+Count) for this process. Requires
+ * PROCESS_PRIV_HARDWARE - checked by the caller. */
+OsStatus_t ProcessGrantPorts(Process_t *Process, uint16_t Port, size_t Count);
+
+/* ProcessLoadIoMap
+ * Installs a process's bitmap into the TSS. Called from the context
+ * switch; a process with no map gets the all-denied one. */
+void       ProcessLoadIoMap(Process_t *Process);
 
 size_t     ProcessGetCount(void);
 void       ProcessPrint(void);

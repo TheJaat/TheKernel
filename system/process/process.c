@@ -3,9 +3,12 @@
 #include <system/process.h>
 #include <system/threading.h>
 #include <system/pipe.h>
+#include <system/heap.h>
+#include <system/userirq.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
+#include <arch/x86/x32/gdt.h>
 #include <interrupts/interrupts.h>
 
 /* Includes
@@ -17,11 +20,21 @@ static Process_t GlbProcesses[PROCESS_MAX];
 static UUId_t GlbProcessIds = 1;
 static int GlbProcessInitialized = 0;
 
+/* All ports denied. Loaded for any process without a map of its own, so
+ * one driver's permissions cannot persist into whatever runs next - a
+ * silent privilege leak rather than a crash, and therefore worth being
+ * unconditional about. */
+static uint8_t GlbIoMapDenyAll[GDT_IOMAP_SIZE];
+static uint8_t *GlbLoadedIoMap = NULL;
+
+
 /* ProcessInitialize */
 void ProcessInitialize(void)
 {
     memset(GlbProcesses, 0, sizeof(GlbProcesses));
     GlbProcessIds = 1;
+    memset(GlbIoMapDenyAll, 0xFF, sizeof(GlbIoMapDenyAll));
+    GlbLoadedIoMap = NULL;
     GlbProcessInitialized = 1;
     LogInformation("Process", "Ready, %d slots, %d handles each",
         PROCESS_MAX, PROCESS_MAX_HANDLES);
@@ -285,11 +298,69 @@ OsStatus_t ProcessHandleClose(Process_t *Process, int Index)
         case HandlePipe:
             PipeDestroy((Pipe_t*)Object);
             break;
+        case HandleInterrupt:
+            /* Releasing the line here is what stops a crashed driver
+             * leaving its device masked and silent forever. */
+            UserIrqUnregister((UserInterrupt_t*)Object);
+            break;
         default:
             break;
     }
 
     return Success;
+}
+
+/* ProcessGrantPorts */
+OsStatus_t ProcessGrantPorts(Process_t *Process, uint16_t Port, size_t Count)
+{
+    size_t i;
+
+    if (Process == NULL || Count == 0) {
+        return Error;
+    }
+    if (((size_t)Port + Count) > 0x10000) {
+        return Error;
+    }
+
+    if (Process->IoMap == NULL) {
+        Process->IoMap = (uint8_t*)kmalloc(GDT_IOMAP_SIZE);
+        if (Process->IoMap == NULL) {
+            return Error;
+        }
+        memset(Process->IoMap, 0xFF, GDT_IOMAP_SIZE);   /* deny everything */
+    }
+
+    for (i = 0; i < Count; i++) {
+        uint16_t p = (uint16_t)(Port + i);
+        Process->IoMap[p / 8] &= (uint8_t)~(1 << (p % 8));
+    }
+
+    /* If this process is the one running, the TSS copy is stale. */
+    if (ProcessGetCurrent() == Process) {
+        GlbLoadedIoMap = NULL;
+        ProcessLoadIoMap(Process);
+    }
+
+    LogInformation("Process", "'%s' granted ports 0x%x + %u",
+        Process->Name, Port, Count);
+    return Success;
+}
+
+/* ProcessLoadIoMap */
+void ProcessLoadIoMap(Process_t *Process)
+{
+    uint8_t *Map = (Process != NULL && Process->IoMap != NULL)
+        ? Process->IoMap : GlbIoMapDenyAll;
+
+    /* Skip the 2 KB copy when the same map is already loaded. Without
+     * this every context switch pays for it, exactly as reloading CR3
+     * on every switch would. */
+    if (Map == GlbLoadedIoMap) {
+        return;
+    }
+
+    TssUpdateIo(0, Map);
+    GlbLoadedIoMap = Map;
 }
 
 /* ProcessSetReplyPipe */

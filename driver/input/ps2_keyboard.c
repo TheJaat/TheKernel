@@ -198,6 +198,29 @@ OsStatus_t Ps2KeyboardInitialize(void)
     return Success;
 }
 
+/* Ps2KeyboardShutdown */
+OsStatus_t Ps2KeyboardShutdown(void)
+{
+    if (GlbPs2Initialized == 0) {
+        return Error;
+    }
+
+    /* Unregister first. InterruptUnregister masks the line once its last
+     * handler is gone, so the controller goes quiet before the ports are
+     * released - no window where an interrupt arrives with nobody able
+     * to service it. */
+    if (InterruptUnregister(GlbPs2.Irq) != Success) {
+        return Error;
+    }
+
+    IoSpaceRelease(&GlbPs2.Io);
+    IoSpaceDestroy(GlbPs2.Io.Id);
+
+    GlbPs2Initialized = 0;
+    LogInformation("PS2", "in-kernel driver stood down");
+    return Success;
+}
+
 /* Ps2KeyboardGetPipe */
 Pipe_t *Ps2KeyboardGetPipe(void)
 {

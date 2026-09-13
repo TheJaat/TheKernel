@@ -19,6 +19,11 @@ extern "C" {
  * a keystroke pipe. */
 OsStatus_t ShellStart(Pipe_t *Input);
 
+/* ShellSetInput
+ * Switches where the shell reads keystrokes from. Used when a ring-3
+ * driver takes over from the in-kernel one. */
+void ShellSetInput(Pipe_t *Input);
+
 #ifdef __cplusplus
 }
 #endif

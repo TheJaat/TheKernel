@@ -6,7 +6,7 @@ BUILD_DIR = $(ROOT_DIR)/build/system/process
 LIB_DIR   = $(ROOT_DIR)/build/lib
 LIBRARY   = $(LIB_DIR)/libprocess.a
 
-C_SOURCES   = process.c syscalls.c
+C_SOURCES   = process.c syscalls.c userirq.c
 C_OBJECTS   = $(C_SOURCES:%.c=$(BUILD_DIR)/%.o)
 
 all: $(BUILD_DIR) $(C_OBJECTS) lib

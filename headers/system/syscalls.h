@@ -17,6 +17,12 @@ OsStatus_t SyscallsInitialize(void);
 size_t     SyscallsGetCount(void);
 void       SyscallsPrintNames(void);
 
+/* SyscallsFindNamedPipe
+ * Kernel-side lookup in the service registry. Lets in-kernel code be a
+ * client of a ring-3 server - which is how the shell reads keystrokes
+ * from the userspace keyboard driver. */
+void      *SyscallsFindNamedPipe(const char *Name);
+
 #ifdef __cplusplus
 }
 #endif

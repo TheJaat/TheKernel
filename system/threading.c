@@ -676,6 +676,12 @@ Context_t *_ThreadingSwitch(Context_t *Regs, int PreEmptive)
      * address space shares the kernel half - the code executing right
      * now is mapped identically in both, so the instruction after the
      * CR3 write is still there. */
+    /* Install the incoming process's port permissions. Unconditional on
+     * purpose: a kernel thread, or a process with no grants, gets the
+     * all-denied map. Skip this and a driver's port access persists into
+     * whatever runs next. */
+    ProcessLoadIoMap((Process_t*)Next->Process);
+
     {
         AddressSpace_t *NextSpace = (Next->AddressSpace != NULL)
             ? Next->AddressSpace : AddressSpaceGetKernel();

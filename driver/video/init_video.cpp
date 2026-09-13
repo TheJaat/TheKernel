@@ -4,6 +4,8 @@
 #include <video/vbe.h>
 #include <video/vga.h>
 
+// #include <stdio.h>
+
 #include <video/interface/video_interface.h>
 
 extern VideoDriver VBE_DRIVER;

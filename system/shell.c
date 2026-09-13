@@ -10,6 +10,8 @@
 #include <system/moduleloader.h>
 #include <system/syscalls.h>
 #include <system/process.h>
+#include <system/userirq.h>
+#include <driver/ps2_keyboard.h>
 #include <ds/list.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
@@ -28,6 +30,15 @@
 #define SHELL_PROMPT                "taaj> "
 
 static int GlbShellRunning = 0;
+static Pipe_t * volatile GlbShellInput = NULL;
+
+/* ShellSetInput */
+void ShellSetInput(Pipe_t *Input)
+{
+    if (Input != NULL) {
+        GlbShellInput = Input;
+    }
+}
 
 /* ShellSkipSpaces */
 static const char *ShellSkipSpaces(const char *Text)
@@ -83,6 +94,8 @@ static void ShellCommandHelp(void)
     printf("  srun <file>   run a ring 3 module with hardware privileges\n");
     printf("  procs         process table\n");
     printf("  names         registered service names\n");
+    printf("  irqs          interrupt lines forwarded to processes\n");
+    printf("  handoff       hand the keyboard to the ring 3 driver\n");
     printf("  exports       kernel symbols modules may call\n");
     printf("  sys           syscall counter\n");
     printf("  reap          return unused heap pages to the allocator\n");
@@ -213,6 +226,40 @@ static void ShellExecute(char *Line)
             printf("no processes\n");
         }
         ProcessPrint();
+    }
+    else if (strcmp(Line, "irqs") == 0) {
+        UserIrqPrint();
+    }
+    else if (strcmp(Line, "handoff") == 0) {
+        Pipe_t *Keyboard;
+        int i;
+
+        printf("standing down the in-kernel keyboard driver...\n");
+        if (Ps2KeyboardShutdown() != Success) {
+            printf("handoff: the in-kernel driver is not running\n");
+        }
+
+        if (ModuleLoadServer("ps2.mod") != Success) {
+            printf("handoff: ps2.mod failed to load - no keyboard now\n");
+        }
+        else {
+            /* The driver is a separate process and has to be scheduled,
+             * claim its ports and register its name. Poll rather than
+             * assume; if it never appears there is no input at all and
+             * the only way out is a reboot. */
+            for (i = 0; i < 40; i++) {
+                Keyboard = SyscallsFindNamedPipe("keyboard");
+                if (Keyboard != NULL) {
+                    ShellSetInput(Keyboard);
+                    printf("keyboard is now driven from ring 3 - type away\n");
+                    break;
+                }
+                SleepMs(50);
+            }
+            if (i == 40) {
+                printf("handoff: 'keyboard' never appeared\n");
+            }
+        }
     }
     else if (strcmp(Line, "names") == 0) {
         SyscallsPrintNames();
@@ -374,6 +421,7 @@ static void ShellExecute(char *Line)
 static void ShellThread(void *Args)
 {
     Pipe_t *Input = (Pipe_t*)Args;
+    (void)Input;
     char Line[SHELL_LINE_MAX];
     size_t Length = 0;
     uint8_t Character;
@@ -384,7 +432,10 @@ static void ShellThread(void *Args)
     for (;;) {
         /* One byte at a time. PipeRead blocks, so this thread costs
          * nothing at all while nobody is typing. */
-        if (PipeRead(Input, &Character, 1, 0) != 1) {
+        /* Re-read the source each time: a handover swaps it underneath
+         * us, and the read below must block on the new pipe rather than
+         * the old one. */
+        if (PipeRead(GlbShellInput, &Character, 1, 0) != 1) {
             continue;
         }
 
@@ -442,6 +493,7 @@ OsStatus_t ShellStart(Pipe_t *Input)
         return Error;
     }
 
+    GlbShellInput = Input;
     GlbShellRunning = 1;
     return Success;
 }

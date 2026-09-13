@@ -3,6 +3,7 @@
 #include <os/syscalls.h>
 #include <system/syscalls.h>
 #include <system/process.h>
+#include <system/userirq.h>
 #include <system/threading.h>
 #include <system/pipe.h>
 #include <system/timers.h>
@@ -335,6 +336,98 @@ static int SyscallOpenReply(UUId_t ProcessId)
     return ProcessHandleAdd(Process, HandlePipe, Pipe, 0);
 }
 
+/* --- hardware delegation ------------------------------------------- */
+
+/* SyscallIrqRegister
+ * Claims an interrupt line for the calling process.
+ *
+ * The privilege check is the whole point of PROCESS_PRIV_HARDWARE.
+ * Without it any program could claim IRQ 1 and starve the real keyboard
+ * driver - the drivers would have left the kernel but the trust would
+ * not have. */
+static int SyscallIrqRegister(int Line)
+{
+    Process_t *Process = ProcessGetCurrent();
+    UserInterrupt_t *Entry;
+    int Handle;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        LogFatal("Syscall", "process %u may not claim interrupts",
+            Process->Id);
+        return SYSCALL_DENIED;
+    }
+
+    Entry = UserIrqRegister(Process, Line);
+    if (Entry == NULL) {
+        return SYSCALL_ERROR;
+    }
+
+    Handle = ProcessHandleAdd(Process, HandleInterrupt, Entry, 1);
+    if (Handle < 0) {
+        UserIrqUnregister(Entry);
+        return SYSCALL_ERROR;
+    }
+    return Handle;
+}
+
+static int SyscallIrqWait(int HandleIndex)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    Entry = ProcessHandleGet(Process, HandleIndex, HandleInterrupt);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    return UserIrqWait((UserInterrupt_t*)Entry->Object);
+}
+
+static int SyscallIrqAck(int HandleIndex)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    Entry = ProcessHandleGet(Process, HandleIndex, HandleInterrupt);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    return (UserIrqAcknowledge((UserInterrupt_t*)Entry->Object) == Success)
+        ? SYSCALL_OK : SYSCALL_ERROR;
+}
+
+/* SyscallIoRequest
+ * Opens a port range in the calling process's I/O permission bitmap.
+ * After this the process executes in/out directly - the cpu checks the
+ * bitmap, so there is no further syscall and no cost per access. */
+static int SyscallIoRequest(unsigned Port, unsigned Count)
+{
+    Process_t *Process = ProcessGetCurrent();
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        LogFatal("Syscall", "process %u may not request io ports",
+            Process->Id);
+        return SYSCALL_DENIED;
+    }
+    if (Port > 0xFFFF || Count == 0 || Count > 32) {
+        return SYSCALL_ERROR;
+    }
+
+    return (ProcessGrantPorts(Process, (uint16_t)Port, Count) == Success)
+        ? SYSCALL_OK : SYSCALL_ERROR;
+}
+
 /* --- dispatch ------------------------------------------------------ */
 
 static InterruptStatus_t SyscallHandler(void *Data)
@@ -421,6 +514,23 @@ static InterruptStatus_t SyscallHandler(void *Data)
             Result = SyscallOpenReply((UUId_t)Registers->Ebx);
             break;
 
+        case SYS_IRQ_REGISTER:
+            Result = SyscallIrqRegister((int)Registers->Ebx);
+            break;
+
+        case SYS_IRQ_WAIT:
+            Result = SyscallIrqWait((int)Registers->Ebx);
+            break;
+
+        case SYS_IRQ_ACK:
+            Result = SyscallIrqAck((int)Registers->Ebx);
+            break;
+
+        case SYS_IO_REQUEST:
+            Result = SyscallIoRequest((unsigned)Registers->Ebx,
+                (unsigned)Registers->Ecx);
+            break;
+
         case SYS_REGISTER_NAME:
             Result = SyscallRegisterName((const char*)Registers->Ebx,
                 (int)Registers->Ecx);
@@ -477,6 +587,19 @@ OsStatus_t SyscallsInitialize(void)
 }
 
 size_t SyscallsGetCount(void) { return GlbSyscallCount; }
+
+/* SyscallsFindNamedPipe */
+void *SyscallsFindNamedPipe(const char *Name)
+{
+    int i;
+
+    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
+        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
+            return GlbNames[i].Pipe;
+        }
+    }
+    return NULL;
+}
 
 /* SyscallsPrintNames */
 void SyscallsPrintNames(void)

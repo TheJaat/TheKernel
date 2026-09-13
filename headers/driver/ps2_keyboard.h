@@ -35,6 +35,13 @@ OsStatus_t Ps2KeyboardInitialize(void);
  * initialization. */
 Pipe_t *Ps2KeyboardGetPipe(void);
 
+/* Ps2KeyboardShutdown
+ * Releases IRQ 1 and the controller ports so a ring-3 driver can claim
+ * them. The in-kernel driver cannot simply be left registered: the line
+ * is NOTSHARABLE, and both drivers draining the same output buffer would
+ * race for every scancode. */
+OsStatus_t Ps2KeyboardShutdown(void);
+
 /* Ps2KeyboardGetStats */
 size_t Ps2KeyboardGetScancodes(void);
 size_t Ps2KeyboardGetDropped(void);
