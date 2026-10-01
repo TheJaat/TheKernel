@@ -93,6 +93,12 @@ Process_t *ProcessCreate(const char *Name, Flags_t Privileges)
 
     memset(Process, 0, sizeof(Process_t));
     Process->Id           = GlbProcessIds++;
+    {
+        /* Whoever called us, if it was a process. A shell-started
+         * server has no parent, which is normal. */
+        Process_t *Creator = ProcessGetCurrent();
+        Process->ParentId = (Creator != NULL) ? Creator->Id : 0;
+    }
     Process->AddressSpace = Space;
     Process->Privileges   = Privileges;
     Process->NextStackTop = MEMORY_LOCATION_RING3_HEAP;

@@ -6,6 +6,7 @@
 #include <system/userirq.h>
 #include <system/endpoint.h>
 #include <system/shm.h>
+#include <os/registry.h>
 #include <system/moduleloader.h>
 #include <system/threading.h>
 #include <system/pipe.h>
@@ -28,19 +29,69 @@ static Interrupt_t GlbSyscallInterrupt;
 static volatile size_t GlbSyscallCount = 0;
 static int GlbSyscallsInitialized = 0;
 
-/* --- name registry ------------------------------------------------ */
+/* --- bootstrap ------------------------------------------------------ */
 
-typedef struct _NameEntry {
-    char            Name[NAME_MAX_LENGTH];
-    Pipe_t         *Pipe;           /* stream services      */
-    Endpoint_t     *Endpoint;       /* call services        */
-    SharedMemory_t *Shm;            /* optional bulk region */
-    UUId_t          Owner;
-    int             Used;
-} NameEntry_t;
+/* The endpoint every new process is handed at HANDLE_REGISTRY.
+ *
+ * This is all the kernel knows about naming, and it is one pointer. A
+ * process holding no capabilities can reach nothing, so something must
+ * be given to it at birth - that much is unavoidable mechanism. Which
+ * names exist, who may claim them, and when they expire are decisions,
+ * and decisions live in the registry server. */
+static Endpoint_t *GlbRegistryEndpoint = NULL;
 
-#define NAME_MAX_ENTRIES    16
-static NameEntry_t GlbNames[NAME_MAX_ENTRIES];
+/* SyscallSetRegistry
+ * Nominates the caller's endpoint as the one new processes inherit.
+ *
+ * Servers only, and only once. A second nomination would let a later
+ * process replace every subsequent process's view of the world, which
+ * is the one thing the bootstrap must not permit. */
+static int SyscallSetRegistry(int EndpointHandle)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        return SYSCALL_DENIED;
+    }
+    if (GlbRegistryEndpoint != NULL) {
+        LogFatal("Syscall", "a registry is already nominated");
+        return SYSCALL_DENIED;
+    }
+
+    Entry = ProcessHandleGet(Process, EndpointHandle, HandleEndpoint);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+
+    GlbRegistryEndpoint = (Endpoint_t*)Entry->Object;
+    LogInformation("Syscall", "process %u is now the registry", Process->Id);
+    return SYSCALL_OK;
+}
+
+/* SyscallsGrantRegistry
+ * Hands a new process its registry capability. Called by the loader
+ * before the process runs: a process cannot ask for this, because
+ * asking would need a capability it does not have yet.
+ *
+ * The badge is the new process's id, so the registry learns who is
+ * calling without the caller having any say in it. */
+void SyscallsGrantRegistry(void *ProcessPtr)
+{
+    Process_t *Process = (Process_t*)ProcessPtr;
+
+    if (GlbRegistryEndpoint == NULL || Process == NULL) {
+        return;
+    }
+
+    /* Not owned - a process closing handle 0 must not destroy the
+     * registry's endpoint for everyone else. */
+    ProcessHandleAddBadged(Process, HandleEndpoint, GlbRegistryEndpoint,
+        0, (unsigned int)Process->Id);
+}
 
 /* --- pointer validation ------------------------------------------- */
 
@@ -218,79 +269,7 @@ static int SyscallPipeAvailable(int Handle)
     return (int)PipeBytesAvailable((Pipe_t*)Entry->Object);
 }
 
-static int SyscallRegisterName(const char *UserName, int PipeHandle)
-{
-    Process_t *Process = ProcessGetCurrent();
-    char Name[NAME_MAX_LENGTH];
-    Handle_t *Entry;
-    int State, i, Slot = -1;
 
-    if (Process == NULL) {
-        return SYSCALL_DENIED;
-    }
-    if (SyscallCopyInString(UserName, Name, NAME_MAX_LENGTH) != Success) {
-        return SYSCALL_BADPOINTER;
-    }
-    Entry = ProcessHandleGet(Process, PipeHandle, HandlePipe);
-    if (Entry == NULL) {
-        return SYSCALL_BADHANDLE;
-    }
-
-    State = InterruptDisable();
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
-            InterruptRestoreState(State);
-            return SYSCALL_ERROR;       /* already taken */
-        }
-        if (GlbNames[i].Used == 0 && Slot < 0) {
-            Slot = i;
-        }
-    }
-    if (Slot < 0) {
-        InterruptRestoreState(State);
-        return SYSCALL_ERROR;
-    }
-
-    memcpy(GlbNames[Slot].Name, Name, NAME_MAX_LENGTH);
-    GlbNames[Slot].Pipe  = (Pipe_t*)Entry->Object;
-    GlbNames[Slot].Owner = Process->Id;
-    GlbNames[Slot].Used  = 1;
-    InterruptRestoreState(State);
-
-    LogInformation("Syscall", "'%s' registered by process %u",
-        Name, Process->Id);
-    return SYSCALL_OK;
-}
-
-static int SyscallLookupName(const char *UserName)
-{
-    Process_t *Process = ProcessGetCurrent();
-    char Name[NAME_MAX_LENGTH];
-    Pipe_t *Pipe = NULL;
-    int i;
-
-    if (Process == NULL) {
-        return SYSCALL_DENIED;
-    }
-    if (SyscallCopyInString(UserName, Name, NAME_MAX_LENGTH) != Success) {
-        return SYSCALL_BADPOINTER;
-    }
-
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
-            Pipe = GlbNames[i].Pipe;
-            break;
-        }
-    }
-    if (Pipe == NULL) {
-        return SYSCALL_NOTFOUND;
-    }
-
-    /* Owned = 0: the looked-up pipe belongs to the server. Closing this
-     * handle must not destroy it, or any client could take down the
-     * server's request channel by exiting. */
-    return ProcessHandleAdd(Process, HandlePipe, Pipe, 0);
-}
 
 /* SyscallSetReply
  * Nominates one of the caller's pipes as the channel replies arrive on.
@@ -493,127 +472,44 @@ static int SyscallProcessAlive(UUId_t Id)
     return (ProcessGet(Id) != NULL) ? 1 : 0;
 }
 
-/* SyscallRegisterEndpoint
- * Publishes a call-style service, optionally with a shared region. */
-static int SyscallRegisterEndpoint(const SysServiceArgs_t *UserArgs)
+
+
+/* The pipe the shell reads keystrokes from.
+ *
+ * With naming in user space the kernel cannot look a driver up by name,
+ * and it should not: a name table is exactly what was moved out. So the
+ * keyboard driver nominates its pipe explicitly, the same shape as the
+ * registry nomination - one pointer, handed over deliberately, with no
+ * namespace behind it. */
+static Pipe_t *GlbConsoleInput = NULL;
+
+static int SyscallSetConsoleInput(int PipeHandle)
 {
     Process_t *Process = ProcessGetCurrent();
-    SysServiceArgs_t Args;
-    char Name[NAME_MAX_LENGTH];
-    Handle_t *EndpointHandle, *ShmHandle = NULL;
-    int State, i, Slot = -1;
+    Handle_t *Entry;
 
     if (Process == NULL) {
         return SYSCALL_DENIED;
     }
-    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 0) != Success) {
-        return SYSCALL_BADPOINTER;
-    }
-    memcpy(&Args, UserArgs, sizeof(Args));
-
-    if (SyscallCopyInString(Args.Name, Name, NAME_MAX_LENGTH) != Success) {
-        return SYSCALL_BADPOINTER;
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        return SYSCALL_DENIED;
     }
 
-    EndpointHandle = ProcessHandleGet(Process, Args.Endpoint, HandleEndpoint);
-    if (EndpointHandle == NULL) {
+    Entry = ProcessHandleGet(Process, PipeHandle, HandlePipe);
+    if (Entry == NULL) {
         return SYSCALL_BADHANDLE;
     }
-    if (Args.Shm >= 0) {
-        ShmHandle = ProcessHandleGet(Process, Args.Shm, HandleShm);
-        if (ShmHandle == NULL) {
-            return SYSCALL_BADHANDLE;
-        }
-    }
 
-    State = InterruptDisable();
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
-            InterruptRestoreState(State);
-            return SYSCALL_ERROR;
-        }
-        if (GlbNames[i].Used == 0 && Slot < 0) {
-            Slot = i;
-        }
-    }
-    if (Slot < 0) {
-        InterruptRestoreState(State);
-        return SYSCALL_ERROR;
-    }
-
-    memcpy(GlbNames[Slot].Name, Name, NAME_MAX_LENGTH);
-    GlbNames[Slot].Pipe     = NULL;
-    GlbNames[Slot].Endpoint = (Endpoint_t*)EndpointHandle->Object;
-    GlbNames[Slot].Shm      = (ShmHandle != NULL)
-        ? (SharedMemory_t*)ShmHandle->Object : NULL;
-    GlbNames[Slot].Owner    = Process->Id;
-    GlbNames[Slot].Used     = 1;
-    InterruptRestoreState(State);
-
-    LogInformation("Syscall", "'%s' endpoint registered by process %u",
-        Name, Process->Id);
+    GlbConsoleInput = (Pipe_t*)Entry->Object;
+    LogInformation("Syscall", "process %u now drives console input",
+        Process->Id);
     return SYSCALL_OK;
 }
 
-/* SyscallLookupEndpoint
- * Grants the caller a capability to the named service.
- *
- * The badge is the caller's process id, stamped by the kernel. The
- * client never supplies it and cannot change it, so a server reading the
- * badge is reading the kernel's word for who is calling rather than the
- * client's claim about itself. */
-static int SyscallLookupEndpoint(SysServiceArgs_t *UserArgs)
+/* SyscallsGetConsoleInput */
+void *SyscallsGetConsoleInput(void)
 {
-    Process_t *Process = ProcessGetCurrent();
-    SysServiceArgs_t Args;
-    char Name[NAME_MAX_LENGTH];
-    Endpoint_t *Endpoint = NULL;
-    SharedMemory_t *Shm = NULL;
-    int EndpointHandle, ShmHandle = -1;
-    int i;
-
-    if (Process == NULL) {
-        return SYSCALL_DENIED;
-    }
-    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 1) != Success) {
-        return SYSCALL_BADPOINTER;
-    }
-    memcpy(&Args, UserArgs, sizeof(Args));
-
-    if (SyscallCopyInString(Args.Name, Name, NAME_MAX_LENGTH) != Success) {
-        return SYSCALL_BADPOINTER;
-    }
-
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
-            Endpoint = GlbNames[i].Endpoint;
-            Shm      = GlbNames[i].Shm;
-            break;
-        }
-    }
-    if (Endpoint == NULL) {
-        return SYSCALL_NOTFOUND;
-    }
-
-    /* Not owned: a client closing its capability must not destroy the
-     * server's endpoint. */
-    EndpointHandle = ProcessHandleAddBadged(Process, HandleEndpoint,
-        Endpoint, 0, (unsigned int)Process->Id);
-    if (EndpointHandle < 0) {
-        return SYSCALL_ERROR;
-    }
-
-    if (Shm != NULL) {
-        int State = InterruptDisable();
-        Shm->References++;
-        InterruptRestoreState(State);
-        ShmHandle = ProcessHandleAddBadged(Process, HandleShm, Shm, 1,
-            (unsigned int)Process->Id);
-    }
-
-    UserArgs->Endpoint = EndpointHandle;
-    UserArgs->Shm      = ShmHandle;
-    return SYSCALL_OK;
+    return GlbConsoleInput;
 }
 
 /* --- synchronous ipc ----------------------------------------------- */
@@ -677,7 +573,7 @@ static int SyscallCall(const SysCallArgs_t *UserArgs)
      * the value. */
     return EndpointCall((Endpoint_t*)Entry->Object, Entry->Badge,
         Args.Opcode, Args.SendBuffer, Args.SendLength,
-        Args.RecvBuffer, Args.RecvLength);
+        Args.RecvBuffer, Args.RecvLength, (size_t)Args.Timeout);
 }
 
 static int SyscallRecv(SysRecvArgs_t *UserArgs)
@@ -706,7 +602,7 @@ static int SyscallRecv(SysRecvArgs_t *UserArgs)
     }
 
     Result = EndpointReceive((Endpoint_t*)Entry->Object, Args.Buffer,
-        Args.Length, &Opcode, &Badge);
+        Args.Length, &Opcode, &Badge, (size_t)Args.Timeout);
 
     if (Result >= 0) {
         UserArgs->Length = (unsigned)Result;
@@ -772,6 +668,19 @@ static int SyscallCapGrant(const SysGrantArgs_t *UserArgs)
 
     Entry = ProcessHandleGet(Process, Args.Handle, HandleEndpoint);
     if (Entry == NULL) {
+        Entry = ProcessHandleGet(Process, Args.Handle, HandlePipe);
+        if (Entry != NULL) {
+            /* A pipe is as grantable as an endpoint. The copy is not
+             * owned, so the receiver closing it cannot destroy the
+             * granter's pipe - the same rule that makes a looked-up
+             * service safe to hold. */
+            Index = ProcessHandleAddBadged(Target, HandlePipe, Entry->Object,
+                0, Args.Badge);
+            if (Index < 0) {
+                return SYSCALL_ERROR;
+            }
+            return Index;
+        }
         Entry = ProcessHandleGet(Process, Args.Handle, HandleShm);
         if (Entry == NULL) {
             return SYSCALL_BADHANDLE;
@@ -970,14 +879,21 @@ static InterruptStatus_t SyscallHandler(void *Data)
             Result = SyscallProcessAlive((UUId_t)Registers->Ebx);
             break;
 
-        case SYS_REGISTER_ENDPOINT:
-            Result = SyscallRegisterEndpoint(
-                (const SysServiceArgs_t*)Registers->Ebx);
+
+
+        case SYS_SET_CONSOLE:
+            Result = SyscallSetConsoleInput((int)Registers->Ebx);
             break;
 
-        case SYS_LOOKUP_ENDPOINT:
-            Result = SyscallLookupEndpoint((SysServiceArgs_t*)Registers->Ebx);
+        case SYS_SET_REGISTRY:
+            Result = SyscallSetRegistry((int)Registers->Ebx);
             break;
+
+        case SYS_GETPPID: {
+            Process_t *Self = ProcessGetCurrent();
+            Result = (Self != NULL) ? (int)Self->ParentId : SYSCALL_ERROR;
+            break;
+        }
 
         case SYS_ENDPOINT_CREATE:
             Result = SyscallEndpointCreate();
@@ -1011,14 +927,7 @@ static InterruptStatus_t SyscallHandler(void *Data)
             Result = SyscallShmSize((int)Registers->Ebx);
             break;
 
-        case SYS_REGISTER_NAME:
-            Result = SyscallRegisterName((const char*)Registers->Ebx,
-                (int)Registers->Ecx);
-            break;
 
-        case SYS_LOOKUP_NAME:
-            Result = SyscallLookupName((const char*)Registers->Ebx);
-            break;
 
         default:
             LogFatal("Syscall", "thread %u made unknown call %u",
@@ -1040,7 +949,6 @@ OsStatus_t SyscallsInitialize(void)
         return Success;
     }
 
-    memset(GlbNames, 0, sizeof(GlbNames));
     memset(&GlbSyscallInterrupt, 0, sizeof(Interrupt_t));
     for (i = 0; i < INTERRUPT_MAXVECTORS; i++) {
         GlbSyscallInterrupt.Vectors[i] = INTERRUPT_NONE;
@@ -1068,28 +976,19 @@ OsStatus_t SyscallsInitialize(void)
 
 size_t SyscallsGetCount(void) { return GlbSyscallCount; }
 
-/* SyscallsFindNamedPipe */
+/* SyscallsFindNamedPipe
+ * There is no kernel name table any more, so this can no longer find
+ * anything. Kept as a stub rather than deleted so the one caller - the
+ * keyboard handover - fails visibly instead of silently compiling
+ * against something that moved. */
 void *SyscallsFindNamedPipe(const char *Name)
 {
-    int i;
-
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
-            return GlbNames[i].Pipe;
-        }
-    }
+    (void)Name;
     return NULL;
 }
 
 /* SyscallsPrintNames */
 void SyscallsPrintNames(void)
 {
-    int i;
-
-    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
-        if (GlbNames[i].Used != 0) {
-            LogInformation("Syscall", "  %-16s owned by process %u",
-                GlbNames[i].Name, GlbNames[i].Owner);
-        }
-    }
+    LogInformation("Syscall", "naming lives in the registry server");
 }

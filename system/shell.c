@@ -261,7 +261,7 @@ static void ShellExecute(char *Line)
              * assume; if it never appears there is no input at all and
              * the only way out is a reboot. */
             for (i = 0; i < 40; i++) {
-                Keyboard = SyscallsFindNamedPipe("keyboard");
+                Keyboard = (Pipe_t*)SyscallsGetConsoleInput();
                 if (Keyboard != NULL) {
                     ShellSetInput(Keyboard);
                     printf("keyboard is now driven from ring 3 - type away\n");

@@ -11,6 +11,7 @@
 #include <arch/x86/x32/arch_x32.h>
 #include <arch/x86/address_space.h>
 #include <system/process.h>
+#include <system/syscalls.h>
 #include <interrupts/interrupts.h>
 
 /* Includes
@@ -444,6 +445,11 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode,
         }
         Space = Process->AddressSpace;
         ProcessAddThread(Process);      /* held until the thread exists */
+
+        /* Give it the registry before anything else can take handle 0.
+         * A process with no capabilities can reach nothing, so the
+         * bootstrap has to be handed over rather than requested. */
+        SyscallsGrantRegistry(Process);
 
         /* Map private frames for the image and the stack into the new
          * space at the ring-3 addresses. These are the process's own

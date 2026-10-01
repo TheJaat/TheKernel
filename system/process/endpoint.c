@@ -304,11 +304,12 @@ static int EndpointDeliver(Endpoint_t *Endpoint, Thread_t *Receiver,
 /* EndpointCall */
 int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
                  const void *Send, size_t SendLength,
-                 void *Recv, size_t RecvLength)
+                 void *Recv, size_t RecvLength, size_t TimeoutMs)
 {
     Thread_t *Self = ThreadingGetCurrentThread(0);
     Thread_t *Receiver = NULL;
     int State;
+    int i;
 
     if (Endpoint == NULL || Endpoint->Used == 0 || Self == NULL) {
         return -1;
@@ -348,8 +349,49 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
 
     InterruptRestoreState(State);
 
-    /* Block until the reply arrives, or the endpoint dies. */
-    SemaphoreP(&Self->IpcWait, 0);
+    /* Block until the reply arrives, the endpoint dies, or we give up. */
+    if (SemaphoreP(&Self->IpcWait, TimeoutMs) != Success) {
+        int Found = 0;
+
+        /* Timed out. Two cases, and they must be distinguished under
+         * the lock:
+         *
+         *   still queued  - nobody has taken the message, so withdraw
+         *                   it and return. Leaving it would let a
+         *                   receiver deliver into a buffer whose owner
+         *                   has moved on.
+         *
+         *   already taken - a server holds us as its IpcPartner and
+         *                   will reply into our buffer. We cannot
+         *                   withdraw; the buffer must stay valid, so
+         *                   wait without a deadline. Giving up here
+         *                   would be a use-after-free in the server's
+         *                   reply path.
+         */
+        State = InterruptDisable();
+
+        for (i = 0; i < Endpoint->SenderCount; i++) {
+            if (Endpoint->Senders[i] == Self) {
+                int j;
+                for (j = i + 1; j < Endpoint->SenderCount; j++) {
+                    Endpoint->Senders[j - 1] = Endpoint->Senders[j];
+                }
+                Endpoint->SenderCount--;
+                Found = 1;
+                break;
+            }
+        }
+
+        InterruptRestoreState(State);
+
+        if (Found) {
+            Self->IpcEndpoint = NULL;
+            return -1;                  /* withdrawn cleanly */
+        }
+
+        /* In flight - see above. */
+        SemaphoreP(&Self->IpcWait, 0);
+    }
 
     Self->IpcEndpoint = NULL;
     return Self->IpcResult;
@@ -357,7 +399,7 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
 
 /* EndpointReceive */
 int EndpointReceive(Endpoint_t *Endpoint, void *Buffer, size_t Length,
-                    unsigned *Opcode, unsigned *Badge)
+                    unsigned *Opcode, unsigned *Badge, size_t TimeoutMs)
 {
     Thread_t *Self = ThreadingGetCurrentThread(0);
     int State;
@@ -393,7 +435,22 @@ int EndpointReceive(Endpoint_t *Endpoint, void *Buffer, size_t Length,
         }
         Endpoint->Receiver = Self;
         InterruptRestoreState(State);
-        SemaphoreP(&Self->IpcWait, 0);
+
+        if (SemaphoreP(&Self->IpcWait, TimeoutMs) != Success) {
+            /* Timed out. Withdraw as the receiver - but only if nobody
+             * has already claimed us. A sender that found us in the
+             * window between the timeout and the lock has already
+             * delivered, and dropping that message would lose a call
+             * the sender is still blocked on. */
+            State = InterruptDisable();
+            if (Endpoint->Receiver == Self) {
+                Endpoint->Receiver = NULL;
+                InterruptRestoreState(State);
+                return -1;
+            }
+            InterruptRestoreState(State);
+            /* Delivery happened; fall through and take it. */
+        }
     }
 
     if (Self->IpcResult < 0) {

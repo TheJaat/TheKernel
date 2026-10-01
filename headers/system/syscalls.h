@@ -23,6 +23,17 @@ void       SyscallsPrintNames(void);
  * from the userspace keyboard driver. */
 void      *SyscallsFindNamedPipe(const char *Name);
 
+/* SyscallsGrantRegistry
+ * Hands a new process its capability to the registry, at handle 0.
+ * Called by the loader before the process runs - a process cannot ask
+ * for this, because asking would require a capability it does not have
+ * yet. */
+void       SyscallsGrantRegistry(void *Process);
+
+/* SyscallsGetConsoleInput
+ * The pipe a ring-3 keyboard driver nominated, or NULL. */
+void      *SyscallsGetConsoleInput(void);
+
 #ifdef __cplusplus
 }
 #endif

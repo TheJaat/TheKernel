@@ -50,9 +50,10 @@ void        EndpointDestroy(Endpoint_t *Endpoint);
  * All three block. Return the number of payload bytes, or negative. */
 int         EndpointCall(Endpoint_t *, unsigned Badge, unsigned Opcode,
                          const void *Send, size_t SendLength,
-                         void *Recv, size_t RecvLength);
+                         void *Recv, size_t RecvLength, size_t TimeoutMs);
 int         EndpointReceive(Endpoint_t *, void *Buffer, size_t Length,
-                            unsigned *Opcode, unsigned *Badge);
+                            unsigned *Opcode, unsigned *Badge,
+                            size_t TimeoutMs);
 int         EndpointReply(const void *Buffer, size_t Length);
 
 void        EndpointPrint(void);

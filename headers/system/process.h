@@ -47,6 +47,7 @@ typedef struct _Handle {
 
 typedef struct _Process {
     UUId_t          Id;
+    UUId_t          ParentId;       /* 0 when started from the shell */
     char            Name[PROCESS_NAME_LENGTH];
     AddressSpace_t *AddressSpace;
     Flags_t         Privileges;
