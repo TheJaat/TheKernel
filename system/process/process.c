@@ -5,6 +5,8 @@
 #include <system/pipe.h>
 #include <system/heap.h>
 #include <system/userirq.h>
+#include <system/endpoint.h>
+#include <system/shm.h>
 #include <system/log.h>
 #include <arch/x86/memory.h>
 #include <arch/x86/x32/arch_x32.h>
@@ -227,8 +229,8 @@ void ProcessRemoveThread(Process_t *Process)
 }
 
 /* ProcessHandleAdd */
-int ProcessHandleAdd(Process_t *Process, HandleType_t Type,
-                     void *Object, int Owned)
+int ProcessHandleAddBadged(Process_t *Process, HandleType_t Type,
+                           void *Object, int Owned, unsigned int Badge)
 {
     int Index = -1;
     int State;
@@ -245,6 +247,11 @@ int ProcessHandleAdd(Process_t *Process, HandleType_t Type,
             Process->Handles[i].Type   = Type;
             Process->Handles[i].Object = Object;
             Process->Handles[i].Owned  = Owned;
+            /* The badge is written by the kernel and never exposed for
+             * modification. That is what makes it trustworthy: the
+             * holder of a capability cannot change how it identifies
+             * itself to the receiver. */
+            Process->Handles[i].Badge  = Badge;
             Index = i;
             break;
         }
@@ -252,6 +259,12 @@ int ProcessHandleAdd(Process_t *Process, HandleType_t Type,
 
     InterruptRestoreState(State);
     return Index;
+}
+
+int ProcessHandleAdd(Process_t *Process, HandleType_t Type,
+                     void *Object, int Owned)
+{
+    return ProcessHandleAddBadged(Process, Type, Object, Owned, 0);
 }
 
 /* ProcessHandleGet
@@ -288,6 +301,7 @@ OsStatus_t ProcessHandleClose(Process_t *Process, int Index)
     Process->Handles[Index].Type   = HandleFree;
     Process->Handles[Index].Object = NULL;
     Process->Handles[Index].Owned  = 0;
+    Process->Handles[Index].Badge  = 0;
     InterruptRestoreState(State);
 
     if (Type == HandleFree || Object == NULL || Owned == 0) {
@@ -298,6 +312,12 @@ OsStatus_t ProcessHandleClose(Process_t *Process, int Index)
     switch (Type) {
         case HandlePipe:
             PipeDestroy((Pipe_t*)Object);
+            break;
+        case HandleEndpoint:
+            EndpointDestroy((Endpoint_t*)Object);
+            break;
+        case HandleShm:
+            ShmRelease((SharedMemory_t*)Object);
             break;
         case HandleInterrupt:
             /* Releasing the line here is what stops a crashed driver

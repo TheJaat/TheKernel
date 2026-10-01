@@ -4,6 +4,8 @@
 #include <system/syscalls.h>
 #include <system/process.h>
 #include <system/userirq.h>
+#include <system/endpoint.h>
+#include <system/shm.h>
 #include <system/moduleloader.h>
 #include <system/threading.h>
 #include <system/pipe.h>
@@ -29,10 +31,12 @@ static int GlbSyscallsInitialized = 0;
 /* --- name registry ------------------------------------------------ */
 
 typedef struct _NameEntry {
-    char        Name[NAME_MAX_LENGTH];
-    Pipe_t     *Pipe;
-    UUId_t      Owner;
-    int         Used;
+    char            Name[NAME_MAX_LENGTH];
+    Pipe_t         *Pipe;           /* stream services      */
+    Endpoint_t     *Endpoint;       /* call services        */
+    SharedMemory_t *Shm;            /* optional bulk region */
+    UUId_t          Owner;
+    int             Used;
 } NameEntry_t;
 
 #define NAME_MAX_ENTRIES    16
@@ -489,6 +493,367 @@ static int SyscallProcessAlive(UUId_t Id)
     return (ProcessGet(Id) != NULL) ? 1 : 0;
 }
 
+/* SyscallRegisterEndpoint
+ * Publishes a call-style service, optionally with a shared region. */
+static int SyscallRegisterEndpoint(const SysServiceArgs_t *UserArgs)
+{
+    Process_t *Process = ProcessGetCurrent();
+    SysServiceArgs_t Args;
+    char Name[NAME_MAX_LENGTH];
+    Handle_t *EndpointHandle, *ShmHandle = NULL;
+    int State, i, Slot = -1;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    if (SyscallCopyInString(Args.Name, Name, NAME_MAX_LENGTH) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    EndpointHandle = ProcessHandleGet(Process, Args.Endpoint, HandleEndpoint);
+    if (EndpointHandle == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    if (Args.Shm >= 0) {
+        ShmHandle = ProcessHandleGet(Process, Args.Shm, HandleShm);
+        if (ShmHandle == NULL) {
+            return SYSCALL_BADHANDLE;
+        }
+    }
+
+    State = InterruptDisable();
+    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
+        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
+            InterruptRestoreState(State);
+            return SYSCALL_ERROR;
+        }
+        if (GlbNames[i].Used == 0 && Slot < 0) {
+            Slot = i;
+        }
+    }
+    if (Slot < 0) {
+        InterruptRestoreState(State);
+        return SYSCALL_ERROR;
+    }
+
+    memcpy(GlbNames[Slot].Name, Name, NAME_MAX_LENGTH);
+    GlbNames[Slot].Pipe     = NULL;
+    GlbNames[Slot].Endpoint = (Endpoint_t*)EndpointHandle->Object;
+    GlbNames[Slot].Shm      = (ShmHandle != NULL)
+        ? (SharedMemory_t*)ShmHandle->Object : NULL;
+    GlbNames[Slot].Owner    = Process->Id;
+    GlbNames[Slot].Used     = 1;
+    InterruptRestoreState(State);
+
+    LogInformation("Syscall", "'%s' endpoint registered by process %u",
+        Name, Process->Id);
+    return SYSCALL_OK;
+}
+
+/* SyscallLookupEndpoint
+ * Grants the caller a capability to the named service.
+ *
+ * The badge is the caller's process id, stamped by the kernel. The
+ * client never supplies it and cannot change it, so a server reading the
+ * badge is reading the kernel's word for who is calling rather than the
+ * client's claim about itself. */
+static int SyscallLookupEndpoint(SysServiceArgs_t *UserArgs)
+{
+    Process_t *Process = ProcessGetCurrent();
+    SysServiceArgs_t Args;
+    char Name[NAME_MAX_LENGTH];
+    Endpoint_t *Endpoint = NULL;
+    SharedMemory_t *Shm = NULL;
+    int EndpointHandle, ShmHandle = -1;
+    int i;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 1) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    if (SyscallCopyInString(Args.Name, Name, NAME_MAX_LENGTH) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    for (i = 0; i < NAME_MAX_ENTRIES; i++) {
+        if (GlbNames[i].Used != 0 && strcmp(GlbNames[i].Name, Name) == 0) {
+            Endpoint = GlbNames[i].Endpoint;
+            Shm      = GlbNames[i].Shm;
+            break;
+        }
+    }
+    if (Endpoint == NULL) {
+        return SYSCALL_NOTFOUND;
+    }
+
+    /* Not owned: a client closing its capability must not destroy the
+     * server's endpoint. */
+    EndpointHandle = ProcessHandleAddBadged(Process, HandleEndpoint,
+        Endpoint, 0, (unsigned int)Process->Id);
+    if (EndpointHandle < 0) {
+        return SYSCALL_ERROR;
+    }
+
+    if (Shm != NULL) {
+        int State = InterruptDisable();
+        Shm->References++;
+        InterruptRestoreState(State);
+        ShmHandle = ProcessHandleAddBadged(Process, HandleShm, Shm, 1,
+            (unsigned int)Process->Id);
+    }
+
+    UserArgs->Endpoint = EndpointHandle;
+    UserArgs->Shm      = ShmHandle;
+    return SYSCALL_OK;
+}
+
+/* --- synchronous ipc ----------------------------------------------- */
+
+static int SyscallEndpointCreate(void)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Endpoint_t *Endpoint;
+    int Handle;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+
+    Endpoint = EndpointCreate(Process);
+    if (Endpoint == NULL) {
+        return SYSCALL_ERROR;
+    }
+
+    Handle = ProcessHandleAdd(Process, HandleEndpoint, Endpoint, 1);
+    if (Handle < 0) {
+        EndpointDestroy(Endpoint);
+        return SYSCALL_ERROR;
+    }
+    return Handle;
+}
+
+static int SyscallCall(const SysCallArgs_t *UserArgs)
+{
+    Process_t *Process = ProcessGetCurrent();
+    SysCallArgs_t Args;
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    Entry = ProcessHandleGet(Process, Args.Endpoint, HandleEndpoint);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    if (Args.SendLength > IPC_MESSAGE_MAX
+        || Args.RecvLength > IPC_MESSAGE_MAX) {
+        return SYSCALL_ERROR;
+    }
+    if (Args.SendLength > 0
+        && SyscallValidateBuffer(Args.SendBuffer, Args.SendLength, 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    if (Args.RecvLength > 0
+        && SyscallValidateBuffer(Args.RecvBuffer, Args.RecvLength, 1) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    /* The badge comes from the capability, not from the caller. A
+     * client cannot claim to be someone else because it never supplies
+     * the value. */
+    return EndpointCall((Endpoint_t*)Entry->Object, Entry->Badge,
+        Args.Opcode, Args.SendBuffer, Args.SendLength,
+        Args.RecvBuffer, Args.RecvLength);
+}
+
+static int SyscallRecv(SysRecvArgs_t *UserArgs)
+{
+    Process_t *Process = ProcessGetCurrent();
+    SysRecvArgs_t Args;
+    Handle_t *Entry;
+    unsigned Opcode = 0, Badge = 0;
+    int Result;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 1) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    Entry = ProcessHandleGet(Process, Args.Endpoint, HandleEndpoint);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    if (Args.Length > 0
+        && SyscallValidateBuffer(Args.Buffer, Args.Length, 1) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    Result = EndpointReceive((Endpoint_t*)Entry->Object, Args.Buffer,
+        Args.Length, &Opcode, &Badge);
+
+    if (Result >= 0) {
+        UserArgs->Length = (unsigned)Result;
+        UserArgs->Opcode = Opcode;
+        UserArgs->Badge  = Badge;
+    }
+    return Result;
+}
+
+static int SyscallReply(const SysReplyArgs_t *UserArgs)
+{
+    SysReplyArgs_t Args;
+
+    if (ProcessGetCurrent() == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    if (Args.Length > IPC_MESSAGE_MAX) {
+        return SYSCALL_ERROR;
+    }
+    if (Args.Length > 0
+        && SyscallValidateBuffer(Args.Buffer, Args.Length, 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    return EndpointReply(Args.Buffer, Args.Length);
+}
+
+/* --- capabilities --------------------------------------------------- */
+
+/* SyscallCapGrant
+ * Hands a copy of one of the caller's capabilities to another process,
+ * stamped with a badge of the granter's choosing.
+ *
+ * The copy is not Owned: the receiver closing it must not destroy the
+ * granter's object. And only endpoints and shared memory can be
+ * granted - handing over an interrupt or an io-space would transfer
+ * hardware access that the privilege check was supposed to gate. */
+static int SyscallCapGrant(const SysGrantArgs_t *UserArgs)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Process_t *Target;
+    SysGrantArgs_t Args;
+    Handle_t *Entry;
+    int Index;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallValidateBuffer(UserArgs, sizeof(Args), 0) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+    memcpy(&Args, UserArgs, sizeof(Args));
+
+    Target = ProcessGet((UUId_t)Args.Process);
+    if (Target == NULL) {
+        return SYSCALL_NOTFOUND;
+    }
+
+    Entry = ProcessHandleGet(Process, Args.Handle, HandleEndpoint);
+    if (Entry == NULL) {
+        Entry = ProcessHandleGet(Process, Args.Handle, HandleShm);
+        if (Entry == NULL) {
+            return SYSCALL_BADHANDLE;
+        }
+        {
+            SharedMemory_t *Region = (SharedMemory_t*)Entry->Object;
+            int State = InterruptDisable();
+            Region->References++;
+            InterruptRestoreState(State);
+        }
+        Index = ProcessHandleAddBadged(Target, HandleShm, Entry->Object,
+            1, Args.Badge);
+    }
+    else {
+        Index = ProcessHandleAddBadged(Target, HandleEndpoint, Entry->Object,
+            0, Args.Badge);
+    }
+
+    if (Index < 0) {
+        return SYSCALL_ERROR;
+    }
+
+    LogInformation("Syscall", "process %u granted a capability to %u, badge %u",
+        Process->Id, Target->Id, Args.Badge);
+    return Index;
+}
+
+/* --- shared memory -------------------------------------------------- */
+
+static int SyscallShmCreate(unsigned Length)
+{
+    Process_t *Process = ProcessGetCurrent();
+    SharedMemory_t *Region;
+    int Handle;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+
+    Region = ShmCreate(Process, (size_t)Length);
+    if (Region == NULL) {
+        return SYSCALL_ERROR;
+    }
+
+    Handle = ProcessHandleAdd(Process, HandleShm, Region, 1);
+    if (Handle < 0) {
+        ShmRelease(Region);
+        return SYSCALL_ERROR;
+    }
+    return Handle;
+}
+
+static int SyscallShmMap(int HandleIndex)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    Entry = ProcessHandleGet(Process, HandleIndex, HandleShm);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    return (int)ShmMap((SharedMemory_t*)Entry->Object, Process);
+}
+
+static int SyscallShmSize(int HandleIndex)
+{
+    Process_t *Process = ProcessGetCurrent();
+    Handle_t *Entry;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    Entry = ProcessHandleGet(Process, HandleIndex, HandleShm);
+    if (Entry == NULL) {
+        return SYSCALL_BADHANDLE;
+    }
+    return (int)((SharedMemory_t*)Entry->Object)->Length;
+}
+
 /* --- dispatch ------------------------------------------------------ */
 
 static InterruptStatus_t SyscallHandler(void *Data)
@@ -603,6 +968,47 @@ static InterruptStatus_t SyscallHandler(void *Data)
 
         case SYS_PROCESS_ALIVE:
             Result = SyscallProcessAlive((UUId_t)Registers->Ebx);
+            break;
+
+        case SYS_REGISTER_ENDPOINT:
+            Result = SyscallRegisterEndpoint(
+                (const SysServiceArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_LOOKUP_ENDPOINT:
+            Result = SyscallLookupEndpoint((SysServiceArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_ENDPOINT_CREATE:
+            Result = SyscallEndpointCreate();
+            break;
+
+        case SYS_CALL:
+            Result = SyscallCall((const SysCallArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_RECV:
+            Result = SyscallRecv((SysRecvArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_REPLY:
+            Result = SyscallReply((const SysReplyArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_CAP_GRANT:
+            Result = SyscallCapGrant((const SysGrantArgs_t*)Registers->Ebx);
+            break;
+
+        case SYS_SHM_CREATE:
+            Result = SyscallShmCreate((unsigned)Registers->Ebx);
+            break;
+
+        case SYS_SHM_MAP:
+            Result = SyscallShmMap((int)Registers->Ebx);
+            break;
+
+        case SYS_SHM_SIZE:
+            Result = SyscallShmSize((int)Registers->Ebx);
             break;
 
         case SYS_REGISTER_NAME:

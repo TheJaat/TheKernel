@@ -11,6 +11,8 @@
 #include <system/syscalls.h>
 #include <system/process.h>
 #include <system/userirq.h>
+#include <system/endpoint.h>
+#include <system/shm.h>
 #include <driver/ps2_keyboard.h>
 #include <ds/list.h>
 #include <system/log.h>
@@ -95,6 +97,7 @@ static void ShellCommandHelp(void)
     printf("  procs         process table\n");
     printf("  names         registered service names\n");
     printf("  irqs          interrupt lines forwarded to processes\n");
+    printf("  ipc           endpoints and shared memory regions\n");
     printf("  handoff       hand the keyboard to the ring 3 driver\n");
     printf("  init          start the supervisor (pci + serial)\n");
     printf("  exports       kernel symbols modules may call\n");
@@ -232,6 +235,10 @@ static void ShellExecute(char *Line)
         if (ModuleLoadServer("init.mod") != Success) {
             printf("init: could not start the supervisor\n");
         }
+    }
+    else if (strcmp(Line, "ipc") == 0) {
+        EndpointPrint();
+        ShmPrint();
     }
     else if (strcmp(Line, "irqs") == 0) {
         UserIrqPrint();

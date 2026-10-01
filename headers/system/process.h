@@ -29,13 +29,20 @@ typedef enum {
     HandleFree = 0,
     HandlePipe,
     HandleIoSpace,
-    HandleInterrupt
+    HandleInterrupt,
+    HandleEndpoint,
+    HandleShm
 } HandleType_t;
 
 typedef struct _Handle {
     HandleType_t    Type;
     void           *Object;
     int             Owned;      /* close destroys the object */
+
+    /* A kernel-stamped value the receiver sees when this capability is
+     * invoked. The holder cannot change it, so a server can tell its
+     * clients apart without trusting anything they send. */
+    unsigned int    Badge;
 } Handle_t;
 
 typedef struct _Process {
@@ -98,6 +105,11 @@ void       ProcessRemoveThread(Process_t *Process);
  * is what stops one process naming another's objects. */
 int        ProcessHandleAdd(Process_t *Process, HandleType_t Type,
                             void *Object, int Owned);
+
+/* ProcessHandleAddBadged
+ * As above, with a badge the invoker cannot alter. */
+int        ProcessHandleAddBadged(Process_t *Process, HandleType_t Type,
+                            void *Object, int Owned, unsigned int Badge);
 Handle_t  *ProcessHandleGet(Process_t *Process, int Index, HandleType_t Type);
 OsStatus_t ProcessHandleClose(Process_t *Process, int Index);
 

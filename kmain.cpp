@@ -35,6 +35,8 @@
 #include <system/syscalls.h>
 #include <system/process.h>
 #include <system/userirq.h>
+#include <system/endpoint.h>
+#include <system/shm.h>
 #include <string.h>
 
 BootInfo_t x86BootInfo;
@@ -436,6 +438,8 @@ extern "C" void kmain(Multiboot_t* BootInfo, BootDescriptor_t* bootDescriptor) {
         // absent - the shell just has nothing to list.
         ProcessInitialize();
         UserIrqInitialize();
+        EndpointInitialize();
+        ShmInitialize();
         SyscallsInitialize();
 
         ModulesInitialize(bootDescriptor);

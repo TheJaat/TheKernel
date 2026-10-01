@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <arch/x86/x32/context.h>
 #include <arch/x86/address_space.h>
+#include <system/semaphore.h>
 
 /* Fixed table, same reasoning as the timers and io-spaces: no list
  * implementation, and the scheduler runs in interrupt context where
@@ -79,6 +80,20 @@ typedef struct _Thread {
      * The address space above belongs to the process - the thread does
      * not own it, which is why only the last thread out destroys it. */
     void           *Process;
+
+    /* Synchronous IPC state. A thread is in exactly one of: not doing
+     * IPC, blocked in a call waiting to be received, blocked in a call
+     * waiting for its reply, or blocked in a receive. */
+    void           *IpcEndpoint;    /* Endpoint_t * it is queued on   */
+    void           *IpcSendBuffer;  /* where the message is, in ITS space */
+    size_t          IpcSendLength;
+    void           *IpcRecvBuffer;  /* where the reply goes           */
+    size_t          IpcRecvLength;
+    unsigned int    IpcOpcode;
+    unsigned int    IpcBadge;
+    int             IpcResult;
+    void           *IpcPartner;     /* the thread being replied to    */
+    Semaphore_t     IpcWait;
 } Thread_t;
 
 #ifdef __cplusplus
