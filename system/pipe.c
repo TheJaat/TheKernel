@@ -29,6 +29,53 @@ static size_t PipeInternalFree(Pipe_t *Pipe)
     return (Pipe->Length - 1) - PipeInternalAvailable(Pipe);
 }
 
+/* PipeEnter / PipeLeave
+ * Reference counting for the duration of a read or write.
+ *
+ * PipeDestroy cannot simply free: a thread blocked inside SemaphoreP
+ * will come back and touch the structure. Instead it marks the pipe dead
+ * and wakes everyone, and whichever thread leaves last frees it. */
+static int PipeEnter(Pipe_t *Pipe)
+{
+    int Ok;
+    int State = InterruptDisable();
+
+    /* Refusing once Destroyed is set is what makes the count a reliable
+     * decision. If a new user could still appear after PipeDestroy has
+     * read it, both would see themselves as the last one out and both
+     * would free. */
+    if (Pipe->Destroyed) {
+        Ok = 0;
+    }
+    else {
+        Pipe->Users++;
+        Ok = 1;
+    }
+
+    InterruptRestoreState(State);
+    return Ok;
+}
+
+/* PipeLeave
+ * Returns 1 if the caller freed the pipe, meaning it must not be touched
+ * again. */
+static int PipeLeave(Pipe_t *Pipe)
+{
+    int Last;
+    int State = InterruptDisable();
+
+    Pipe->Users--;
+    Last = (Pipe->Destroyed != 0 && Pipe->Users == 0);
+    InterruptRestoreState(State);
+
+    if (Last && Pipe->Owned) {
+        kfree(Pipe->Buffer);
+        kfree(Pipe);
+        return 1;
+    }
+    return Last;
+}
+
 /* PipeConstruct */
 void PipeConstruct(Pipe_t *Pipe, uint8_t *Buffer, size_t Length, Flags_t Flags)
 {
@@ -44,6 +91,8 @@ void PipeConstruct(Pipe_t *Pipe, uint8_t *Buffer, size_t Length, Flags_t Flags)
     Pipe->ReadWaiting  = 0;
     Pipe->WriteWaiting = 0;
     Pipe->Owned        = 0;
+    Pipe->Destroyed    = 0;
+    Pipe->Users        = 0;
 
     SpinlockReset(&Pipe->Lock);
     SemaphoreConstruct(&Pipe->ReadQueue, 0);
@@ -83,16 +132,27 @@ Pipe_t *PipeCreate(size_t Size, Flags_t Flags)
 /* PipeDestroy */
 void PipeDestroy(Pipe_t *Pipe)
 {
+    int State, Busy;
+
     if (Pipe == NULL) {
         return;
     }
 
-    /* Release both queues first. A thread blocked on a pipe that is
-     * being torn down would otherwise wait forever. */
+    State = InterruptDisable();
+    if (Pipe->Destroyed) {
+        InterruptRestoreState(State);
+        return;                     /* already being torn down */
+    }
+    Pipe->Destroyed = 1;
+    Busy = Pipe->Users;
+    InterruptRestoreState(State);
+
+    /* Release anyone blocked. They wake, see Destroyed, and leave -
+     * the last one out does the free. */
     SchedulerWakeAll(&Pipe->ReadQueue);
     SchedulerWakeAll(&Pipe->WriteQueue);
 
-    if (Pipe->Owned) {
+    if (Busy == 0 && Pipe->Owned) {
         kfree(Pipe->Buffer);
         kfree(Pipe);
     }
@@ -113,6 +173,10 @@ size_t PipeWrite(Pipe_t *Pipe, const uint8_t *Data, size_t Length)
         return 0;
     }
 
+    if (!PipeEnter(Pipe)) {
+        return 0;               /* being torn down */
+    }
+
     while (Written < Length) {
         int WakeReader = 0;
         int MustWait = 0;
@@ -129,6 +193,11 @@ size_t PipeWrite(Pipe_t *Pipe, const uint8_t *Data, size_t Length)
             Pipe->WriteWaiting++;
             SpinlockReleaseIrq(&Pipe->Lock);
             SemaphoreP(&Pipe->WriteQueue, 0);
+            /* Woken - but possibly by PipeDestroy rather than by room
+             * appearing. Check before touching the lock again. */
+            if (Pipe->Destroyed) {
+                break;
+            }
             continue;
         }
 
@@ -162,9 +231,13 @@ size_t PipeWrite(Pipe_t *Pipe, const uint8_t *Data, size_t Length)
 
         if (MustWait) {
             SemaphoreP(&Pipe->WriteQueue, 0);
+            if (Pipe->Destroyed) {
+                break;
+            }
         }
     }
 
+    PipeLeave(Pipe);
     return Written;
 }
 
@@ -175,6 +248,10 @@ size_t PipeRead(Pipe_t *Pipe, uint8_t *Buffer, size_t Length, int Peek)
 
     if (Pipe == NULL || Buffer == NULL || Length == 0) {
         return 0;
+    }
+
+    if (!PipeEnter(Pipe)) {
+        return 0;               /* being torn down */
     }
 
     for (;;) {
@@ -227,8 +304,12 @@ size_t PipeRead(Pipe_t *Pipe, uint8_t *Buffer, size_t Length, int Peek)
         }
 
         SemaphoreP(&Pipe->ReadQueue, 0);
+        if (Pipe->Destroyed) {
+            break;
+        }
     }
 
+    PipeLeave(Pipe);
     return Read;
 }
 

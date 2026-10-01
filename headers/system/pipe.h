@@ -38,6 +38,16 @@ typedef struct _Pipe {
     int             WriteWaiting;
 
     int             Owned;          /* buffer was allocated by PipeCreate */
+
+    /* Teardown accounting.
+     *
+     * Waking a blocked thread and freeing the pipe underneath it is a
+     * use-after-free: the woken thread returns from SemaphoreP inside
+     * PipeRead/PipeWrite and reaches for Pipe->Lock. So destruction is
+     * two-phase - mark it dead and wake everyone, then let whoever
+     * leaves last do the freeing. */
+    volatile int    Destroyed;
+    volatile int    Users;          /* threads currently inside read/write */
 } Pipe_t;
 
 #ifdef __cplusplus
