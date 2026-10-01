@@ -94,6 +94,7 @@ Process_t *ProcessCreate(const char *Name, Flags_t Privileges)
     Process->AddressSpace = Space;
     Process->Privileges   = Privileges;
     Process->NextStackTop = MEMORY_LOCATION_RING3_HEAP;
+    Process->NextIoSpace  = MEMORY_LOCATION_RING3_IOSPACE;
     Process->Threads      = 0;
     Process->Used         = 1;
     ProcessSetName(Process, Name);
@@ -344,6 +345,53 @@ OsStatus_t ProcessGrantPorts(Process_t *Process, uint16_t Port, size_t Count)
     LogInformation("Process", "'%s' granted ports 0x%x + %u",
         Process->Name, Port, Count);
     return Success;
+}
+
+/* ProcessMapDevice */
+uintptr_t ProcessMapDevice(Process_t *Process, uintptr_t Physical, size_t Length)
+{
+    uintptr_t PageOffset, Base, Virtual, Offset;
+    size_t Pages;
+
+    if (Process == NULL || Process->AddressSpace == NULL || Length == 0) {
+        return 0;
+    }
+
+    /* A device aperture rarely starts on a page boundary. Map from the
+     * containing page and hand back the address with its offset intact,
+     * so the driver sees the register it actually asked for. */
+    PageOffset = Physical & ATTRIBUTE_MASK;
+    Base       = Physical & PAGE_MASK;
+    Pages      = DIVUP((PageOffset + Length), PAGE_SIZE);
+
+    if ((Process->NextIoSpace + (Pages * PAGE_SIZE))
+        >= MEMORY_LOCATION_RING3_IOSPACE_END) {
+        LogFatal("Process", "'%s' is out of device mapping space",
+            Process->Name);
+        return 0;
+    }
+
+    Virtual = Process->NextIoSpace;
+
+    for (Offset = 0; Offset < (Pages * PAGE_SIZE); Offset += PAGE_SIZE) {
+        /* Cache-disabled, or the cpu caches a status register and hands
+         * back the same stale value forever. User, or ring 3 cannot
+         * reach it at all. */
+        if (MmVirtualMap(Process->AddressSpace->PageDirectory,
+                Base + Offset, Virtual + Offset,
+                PAGE_USER | PAGE_CACHE_DISABLE) != Success) {
+            LogFatal("Process", "could not map 0x%x for '%s'",
+                Base + Offset, Process->Name);
+            return 0;
+        }
+    }
+
+    Process->NextIoSpace = Virtual + (Pages * PAGE_SIZE);
+
+    LogInformation("Process", "'%s' mapped device 0x%x -> 0x%x (%u pages)",
+        Process->Name, Physical, Virtual + PageOffset, Pages);
+
+    return Virtual + PageOffset;
 }
 
 /* ProcessLoadIoMap */

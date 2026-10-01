@@ -4,8 +4,10 @@
 #include <system/syscalls.h>
 #include <system/process.h>
 #include <system/userirq.h>
+#include <system/moduleloader.h>
 #include <system/threading.h>
 #include <system/pipe.h>
+#include <boot/ramdisk.h>
 #include <system/timers.h>
 #include <system/heap.h>
 #include <system/log.h>
@@ -428,6 +430,65 @@ static int SyscallIoRequest(unsigned Port, unsigned Count)
         ? SYSCALL_OK : SYSCALL_ERROR;
 }
 
+/* SyscallIoMap
+ * Maps a device aperture into the calling process. */
+static int SyscallIoMap(unsigned Physical, unsigned Length)
+{
+    Process_t *Process = ProcessGetCurrent();
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        LogFatal("Syscall", "process %u may not map devices", Process->Id);
+        return SYSCALL_DENIED;
+    }
+    if (Length == 0 || Length > 0x100000) {
+        return SYSCALL_ERROR;
+    }
+
+    /* Refusing anything below the end of the kernel half is the check
+     * that stops a "driver" mapping ordinary RAM - or the kernel's own
+     * image - and reading it from ring 3. */
+    if (Physical < MEMORY_LOCATION_KERNEL_END) {
+        LogFatal("Syscall", "process %u asked to map 0x%x, which is not "
+            "device memory", Process->Id, Physical);
+        return SYSCALL_DENIED;
+    }
+
+    return (int)ProcessMapDevice(Process, (uintptr_t)Physical, Length);
+}
+
+/* SyscallSpawn
+ * Starts another server from the ramdisk. Servers only: this is how a
+ * supervisor restarts a driver that died, and it must not be something
+ * an application can do. */
+static int SyscallSpawn(const char *UserName)
+{
+    Process_t *Process = ProcessGetCurrent();
+    char Name[RAMDISK_NAME_LENGTH];
+    UUId_t Id;
+
+    if (Process == NULL) {
+        return SYSCALL_DENIED;
+    }
+    if (!(Process->Privileges & PROCESS_PRIV_HARDWARE)) {
+        return SYSCALL_DENIED;
+    }
+    if (SyscallCopyInString(UserName, Name, RAMDISK_NAME_LENGTH) != Success) {
+        return SYSCALL_BADPOINTER;
+    }
+
+    Id = ModuleLoadServerId(Name);
+    return (Id == UUID_INVALID) ? SYSCALL_ERROR : (int)Id;
+}
+
+/* SyscallProcessAlive */
+static int SyscallProcessAlive(UUId_t Id)
+{
+    return (ProcessGet(Id) != NULL) ? 1 : 0;
+}
+
 /* --- dispatch ------------------------------------------------------ */
 
 static InterruptStatus_t SyscallHandler(void *Data)
@@ -529,6 +590,19 @@ static InterruptStatus_t SyscallHandler(void *Data)
         case SYS_IO_REQUEST:
             Result = SyscallIoRequest((unsigned)Registers->Ebx,
                 (unsigned)Registers->Ecx);
+            break;
+
+        case SYS_IO_MAP:
+            Result = SyscallIoMap((unsigned)Registers->Ebx,
+                (unsigned)Registers->Ecx);
+            break;
+
+        case SYS_SPAWN:
+            Result = SyscallSpawn((const char*)Registers->Ebx);
+            break;
+
+        case SYS_PROCESS_ALIVE:
+            Result = SyscallProcessAlive((UUId_t)Registers->Ebx);
             break;
 
         case SYS_REGISTER_NAME:

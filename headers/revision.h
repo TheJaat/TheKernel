@@ -3,12 +3,12 @@
 #ifndef _KERNEL_REVISION_H_
 #define _KERNEL_REVISION_H_
 
-#define BUILD_DATE "13 September 2026"
-#define BUILD_TIME "08:56:38"
+#define BUILD_DATE "01 October 2026"
+#define BUILD_TIME "19:12:33"
 
 #define BUILD_SYSTEM "gcc"
 #define REVISION_MAJOR 0
 #define REVISION_MINOR 2
-#define REVISION_BUILD 207
+#define REVISION_BUILD 208
 
 #endif //!_KERNEL_REVISION_H_

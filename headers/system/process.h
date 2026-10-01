@@ -66,6 +66,12 @@ typedef struct _Process {
      * never are, and a 2 KB copy on every context switch is not free. */
     uint8_t        *IoMap;
 
+    /* Bump pointer through this process's slice of
+     * MEMORY_LOCATION_RING3_IOSPACE. Device apertures are mapped here,
+     * never into the kernel's directory - a driver's registers must be
+     * reachable from the driver and from nothing else. */
+    uintptr_t       NextIoSpace;
+
     int             Used;
 } Process_t;
 
@@ -103,6 +109,13 @@ void      *ProcessGetReplyPipe(UUId_t ProcessId);
  * Opens [Port, Port+Count) for this process. Requires
  * PROCESS_PRIV_HARDWARE - checked by the caller. */
 OsStatus_t ProcessGrantPorts(Process_t *Process, uint16_t Port, size_t Count);
+
+/* ProcessMapDevice
+ * Maps a physical device aperture into the process at a user address.
+ * Returns the virtual address of <Physical> with its page offset
+ * preserved, or 0. */
+uintptr_t  ProcessMapDevice(Process_t *Process, uintptr_t Physical,
+                            size_t Length);
 
 /* ProcessLoadIoMap
  * Installs a process's bitmap into the TSS. Called from the context

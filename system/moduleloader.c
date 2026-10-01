@@ -29,6 +29,10 @@ typedef struct _KernelExport {
     uintptr_t   Address;
 } KernelExport_t;
 
+/* Set by the most recent user-module load. Read immediately by
+ * ModuleLoadServerId; not a general-purpose accessor. */
+static UUId_t GlbLastProcessId = UUID_INVALID;
+
 static const KernelExport_t GlbExports[] = {
     { "printf",                     (uintptr_t)&printf                  },
     { "LogInformation",             (uintptr_t)&LogInformation          },
@@ -479,13 +483,25 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode,
         /* Copy the prepared image into the process. Switching CR3 is
          * the simplest way to reach those addresses; interrupts are off
          * so no thread switch can reload CR3 underneath us. */
-        State = InterruptDisable();
-        AddressSpaceSwitch(Space);
-        memcpy((void*)UserImage, Image, ImageSize);
-        memset((void*)(UserStackTop - PROCESS_USER_STACK_SIZE), 0,
-            PROCESS_USER_STACK_SIZE);
-        AddressSpaceSwitch(AddressSpaceGetKernel());
-        InterruptRestoreState(State);
+        {
+            /* Restore whatever space the CALLER was in, not the
+             * kernel's. A spawn issued by a running server arrives here
+             * through a syscall; returning with the kernel directory
+             * loaded would drop that server into an address space where
+             * its own code is not mapped. */
+            Thread_t *Self = ThreadingGetCurrentThread(0);
+            AddressSpace_t *Previous = (Self != NULL
+                && Self->AddressSpace != NULL)
+                ? Self->AddressSpace : AddressSpaceGetKernel();
+
+            State = InterruptDisable();
+            AddressSpaceSwitch(Space);
+            memcpy((void*)UserImage, Image, ImageSize);
+            memset((void*)(UserStackTop - PROCESS_USER_STACK_SIZE), 0,
+                PROCESS_USER_STACK_SIZE);
+            AddressSpaceSwitch(Previous);
+            InterruptRestoreState(State);
+        }
 
         LogInformation("Module", "'%s' mapped at 0x%x in its own space",
             Name, UserImage);
@@ -511,6 +527,7 @@ static OsStatus_t ModuleLoadInternal(const char *Name, int UserMode,
              * owns one. */
             ProcessAddThread(Process);
             ProcessRemoveThread(Process);
+            GlbLastProcessId = Process->Id;
         }
 
         /* The kernel-side staging copy has done its job. */
@@ -548,4 +565,16 @@ OsStatus_t ModuleLoadUser(const char *Name)
 OsStatus_t ModuleLoadServer(const char *Name)
 {
     return ModuleLoadInternal(Name, 1, PROCESS_PRIV_HARDWARE);
+}
+
+/* ModuleLoadServerId
+ * As ModuleLoadServer, but reports the process id it created so a
+ * supervisor can watch for its death. */
+UUId_t ModuleLoadServerId(const char *Name)
+{
+    GlbLastProcessId = UUID_INVALID;
+    if (ModuleLoadInternal(Name, 1, PROCESS_PRIV_HARDWARE) != Success) {
+        return UUID_INVALID;
+    }
+    return GlbLastProcessId;
 }

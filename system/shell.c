@@ -96,6 +96,7 @@ static void ShellCommandHelp(void)
     printf("  names         registered service names\n");
     printf("  irqs          interrupt lines forwarded to processes\n");
     printf("  handoff       hand the keyboard to the ring 3 driver\n");
+    printf("  init          start the supervisor (pci + serial)\n");
     printf("  exports       kernel symbols modules may call\n");
     printf("  sys           syscall counter\n");
     printf("  reap          return unused heap pages to the allocator\n");
@@ -226,6 +227,11 @@ static void ShellExecute(char *Line)
             printf("no processes\n");
         }
         ProcessPrint();
+    }
+    else if (strcmp(Line, "init") == 0) {
+        if (ModuleLoadServer("init.mod") != Success) {
+            printf("init: could not start the supervisor\n");
+        }
     }
     else if (strcmp(Line, "irqs") == 0) {
         UserIrqPrint();

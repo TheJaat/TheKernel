@@ -35,6 +35,10 @@ OsStatus_t ModuleLoadUser(const char *Name);
  * For drivers started at boot, not for anything loaded on request. */
 OsStatus_t ModuleLoadServer(const char *Name);
 
+/* ModuleLoadServerId
+ * As above, reporting the new process id. */
+UUId_t ModuleLoadServerId(const char *Name);
+
 /* ModuleLoaderPrintExports
  * Lists the kernel symbols modules are allowed to call. */
 void ModuleLoaderPrintExports(void);
