@@ -10,6 +10,7 @@
 #include <arch/x86/x32/idt.h>
 #include <arch/x86/x32/arch_x32.h>
 #include <arch/x86/pic.h>
+#include <arch/x86/memory.h>   /* MmVirtualGetMapping, for the eip dump */
 #include <system/timers.h>
 #include <system/threading.h>
 
@@ -400,6 +401,29 @@ void ExceptionEntry(Context_t *Registers)
 	if ((Registers->Cs & 0x3) == 0x3) {
 		LogFatal("Interrupts", "  user esp 0x%x  ss 0x%x  (fault was in ring 3)",
 			Registers->UserEsp, Registers->UserSs);
+	}
+
+	/* The bytes at eip.
+	 *
+	 * A register dump says where and with what, but not WHICH
+	 * instruction - and that is usually the whole question. Eight bytes
+	 * of opcode can be disassembled by hand or fed to objdump, and they
+	 * turn "a read of 0xe8 with eax holding 0xe8" into a definite
+	 * answer about which operand was the bad one.
+	 *
+	 * Reading them is safe: the faulting address space is still loaded,
+	 * and the mapping is checked first - a fault inside the fault
+	 * handler would lose the report entirely. */
+	if (MmVirtualGetMapping(NULL, Registers->Eip & PAGE_MASK) != 0) {
+		uint8_t *Code = (uint8_t*)Registers->Eip;
+
+		LogFatal("Interrupts", "  bytes at eip: %x %x %x %x %x %x %x %x",
+			Code[0], Code[1], Code[2], Code[3],
+			Code[4], Code[5], Code[6], Code[7]);
+	}
+	else {
+		LogFatal("Interrupts", "  eip itself is not mapped - "
+			"a jump through a bad pointer, not a bad access");
 	}
 
 	/* A page fault says far more once you can see the faulting address
