@@ -308,6 +308,7 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
 {
     Thread_t *Self = ThreadingGetCurrentThread(0);
     Thread_t *Receiver = NULL;
+    Thread_t *SavedPartner;
     int State;
     int i;
 
@@ -322,8 +323,18 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
 
     if (Endpoint->SenderCount >= ENDPOINT_QUEUE_MAX) {
         InterruptRestoreState(State);
-        return -1;
+        return -1;          /* nothing was changed yet */
     }
+
+    /* Save the caller we are part-way through serving.
+     *
+     * A server that calls out while handling a request - fat32 asking
+     * ata for sectors - would otherwise lose the record of who its own
+     * reply is owed to, and the original caller waits out its timeout
+     * for an answer that can never be sent. One thread genuinely has
+     * two roles at once here, so the outgoing call must not trample the
+     * incoming one. */
+    SavedPartner = Self->IpcPartner;
 
     Self->IpcEndpoint   = Endpoint;
     Self->IpcSendBuffer = (void*)Send;
@@ -386,6 +397,7 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
 
         if (Found) {
             Self->IpcEndpoint = NULL;
+            Self->IpcPartner  = SavedPartner;
             return -1;                  /* withdrawn cleanly */
         }
 
@@ -394,6 +406,10 @@ int EndpointCall(Endpoint_t *Endpoint, unsigned Badge, unsigned Opcode,
     }
 
     Self->IpcEndpoint = NULL;
+
+    /* Put the incoming call back so SysReply can still find it. */
+    Self->IpcPartner = SavedPartner;
+
     return Self->IpcResult;
 }
 

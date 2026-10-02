@@ -121,7 +121,18 @@ static OsStatus_t SyscallValidateBuffer(const void *Buffer, size_t Length,
     if (End < Start) {
         return Error;
     }
-    if (Start < MEMORY_LOCATION_RING3_CODE || End > MEMORY_LOCATION_RING3_HEAP) {
+    /* Anything at or above the end of the kernel half may be a legal
+     * user address. Naming the specific ring-3 sub-regions here was a
+     * mistake: the bound said "code and stacks", so every pointer into
+     * a shared region or a device mapping - both of which live at
+     * MEMORY_LOCATION_RING3_IOSPACE, far above it - was rejected as a
+     * bad pointer.
+     *
+     * The real protection is per page, below: a page is only acceptable
+     * if it is mapped and carries PAGE_USER. A kernel page in this range
+     * does not, so widening the bound costs nothing. The bound exists
+     * only to reject addresses that are obviously the kernel's. */
+    if (Start < MEMORY_LOCATION_KERNEL_END) {
         return Error;
     }
 

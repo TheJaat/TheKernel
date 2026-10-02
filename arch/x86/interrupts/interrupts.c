@@ -392,6 +392,16 @@ void ExceptionEntry(Context_t *Registers)
 	LogFatal("Interrupts", "esi 0x%x  edi 0x%x  ebp 0x%x  esp 0x%x",
 		Registers->Esi, Registers->Edi, Registers->Ebp, Registers->Esp);
 
+	/* On a fault from ring 3 the cpu pushes the user stack pointer and
+	 * segment, and Esp above is the KERNEL stack - which is why it
+	 * always looks like a heap address and tells you nothing. The user
+	 * stack is the one that says whether the fault was a stack overflow,
+	 * and it was not being printed. */
+	if ((Registers->Cs & 0x3) == 0x3) {
+		LogFatal("Interrupts", "  user esp 0x%x  ss 0x%x  (fault was in ring 3)",
+			Registers->UserEsp, Registers->UserSs);
+	}
+
 	/* A page fault says far more once you can see the faulting address
 	 * and why it faulted. CR2 holds the address; the error code bits
 	 * are present/write/user/reserved/instruction-fetch. */
