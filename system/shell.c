@@ -33,6 +33,13 @@
 
 static int GlbShellRunning = 0;
 static Pipe_t * volatile GlbShellInput = NULL;
+static volatile int GlbShellSuspended = 0;
+
+/* ShellSuspend */
+void ShellSuspend(void)
+{
+    GlbShellSuspended = 1;
+}
 
 /* ShellSetInput */
 void ShellSetInput(Pipe_t *Input)
@@ -99,7 +106,8 @@ static void ShellCommandHelp(void)
     printf("  irqs          interrupt lines forwarded to processes\n");
     printf("  ipc           endpoints and shared memory regions\n");
     printf("  handoff       hand the keyboard to the ring 3 driver\n");
-    printf("  init          start the supervisor (pci + serial)\n");
+    printf("  init          start the supervisor\n");
+    printf("  sh            hand the console to the ring 3 shell\n");
     printf("  exports       kernel symbols modules may call\n");
     printf("  sys           syscall counter\n");
     printf("  reap          return unused heap pages to the allocator\n");
@@ -239,6 +247,23 @@ static void ShellExecute(char *Line)
     else if (strcmp(Line, "ipc") == 0) {
         EndpointPrint();
         ShmPrint();
+    }
+    else if (strcmp(Line, "sh") == 0) {
+        if (SyscallsGetConsoleInput() == NULL) {
+            printf("sh: run 'handoff' first - the ring 3 shell reads\n");
+            printf("    keystrokes from the ring 3 keyboard driver\n");
+        }
+        else if (ModuleLoadUser("sh.mod") != Success) {
+            printf("sh: could not start sh.mod\n");
+        }
+        else {
+            /* Give it a moment to find its services before standing
+             * down: if it fails, this shell is still reading and the
+             * machine is still usable. */
+            SleepMs(600);
+            printf("handing the console to the ring 3 shell\n");
+            ShellSuspend();
+        }
     }
     else if (strcmp(Line, "irqs") == 0) {
         UserIrqPrint();
@@ -448,6 +473,14 @@ static void ShellThread(void *Args)
         /* Re-read the source each time: a handover swaps it underneath
          * us, and the read below must block on the new pipe rather than
          * the old one. */
+        /* Once a ring-3 shell owns the keyboard, stop reading. Both
+         * shells draining the same pipe would give each of them a random
+         * half of every line. */
+        if (GlbShellSuspended) {
+            SleepMs(200);
+            continue;
+        }
+
         if (PipeRead(GlbShellInput, &Character, 1, 0) != 1) {
             continue;
         }

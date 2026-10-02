@@ -24,6 +24,11 @@ OsStatus_t ShellStart(Pipe_t *Input);
  * driver takes over from the in-kernel one. */
 void ShellSetInput(Pipe_t *Input);
 
+/* ShellSuspend
+ * Stops the in-kernel shell consuming keystrokes. Two readers on one
+ * pipe split the input between them, so exactly one must be reading. */
+void ShellSuspend(void);
+
 #ifdef __cplusplus
 }
 #endif
