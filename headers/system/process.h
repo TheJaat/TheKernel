@@ -15,7 +15,17 @@
  * The gap is not wasted space: a thread overrunning its stack hits a
  * missing page and faults, rather than silently writing into the stack
  * of whichever thread was allocated before it. */
-#define PROCESS_USER_STACK_SIZE     (PAGE_SIZE * 4)
+/* 64 KB.
+ *
+ * It was 16 KB, which is ample for a driver and not for anything that
+ * handles disk blocks: a single 4 KB buffer is a quarter of it, and two
+ * nested calls holding one each is most of it. The guard page caught the
+ * overflow rather than letting it corrupt the next thread's stack, which
+ * is what it is for - but the right size is one where ordinary code does
+ * not reach it.
+ *
+ * The cost is 16 pages per thread instead of 4. */
+#define PROCESS_USER_STACK_SIZE     (PAGE_SIZE * 16)
 #define PROCESS_STACK_GUARD         PAGE_SIZE
 
 /* Privileges. A microkernel that lets any process claim IRQ 1 has moved
