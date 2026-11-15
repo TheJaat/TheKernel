@@ -6,7 +6,7 @@
 
 macro_rules! program {
     ($name:literal) => {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../user/target/x86_64-unknown-none/release/", $name))
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../user/target/x86_64-unknown-none/release/", $name))
     };
 }
 
