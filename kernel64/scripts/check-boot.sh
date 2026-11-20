@@ -107,6 +107,13 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         get big2 | cmp -s - "$LOG.twice" || fail "\"big2\" is not \"big\": 50 messages did not come through an input and an output whole"
         [ "$(get err)" = "cat: none: no such file or directory" ] || fail "cat's complaint is not in \"err\""
         [ "$("$TFSTOOL" ls "$DISK" 2>&1 | grep -c '^ *empty  *0 *$')" -eq 1 ] || fail "\"empty\" is not an empty file"
+        # And pipes: a count that went from one program through another
+        # into a file, twice - the second time with the first program
+        # reading a file as its input, and >> - and 50 KB through three
+        # programs.
+        [ "$(get piped)" = "300 lines, 1200 words, 4692 bytes
+300 lines, 1200 words, 4692 bytes" ] || fail "\"piped\" does not hold what wc counted of cat's output, twice"
+        get big3 | cmp -s - "$LOG.twice" || fail "\"big3\" is not \"big\": cat ls ls | cat | cat > big3 lost or changed bytes"
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi

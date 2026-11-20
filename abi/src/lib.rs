@@ -421,6 +421,13 @@ pub const USER_END: u64 = 0x0000_8000_0000_0000;
 pub const KILLED: i64 = -1000;
 /// Exit code of a process ended by process_kill.
 pub const STOPPED: i64 = -1001;
+/// Exit code of a program that ended itself because nobody was reading
+/// its standard output any more: the other end of the stream was
+/// closed. Not the kernel's doing - the program's runtime exits with
+/// this when a write finds no reader - but agreed here, so that whoever
+/// started the program can tell it from a failure. In `yes | given`
+/// this is how `yes` ends.
+pub const NO_READER: i64 = -1002;
 
 /// The display service's messages: the first byte says which.
 pub mod display {
