@@ -105,7 +105,10 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         { get ls; get ls; } > "$LOG.twice"
         get big | cmp -s - "$LOG.twice"  || fail "\"big\" is not the program ls twice over: cat ls ls > big lost or changed bytes"
         get big2 | cmp -s - "$LOG.twice" || fail "\"big2\" is not \"big\": 50 messages did not come through an input and an output whole"
-        [ "$(get err)" = "cat: none: no such file or directory" ] || fail "cat's complaint is not in \"err\""
+        # A complaint is not output: it went to standard error, the
+        # screen, and the file the output went to holds nothing.
+        [ "$("$TFSTOOL" ls "$DISK" 2>&1 | grep -c '^ *err  *0 *$')" -eq 1 ]   || fail "\"err\" is not empty: cat's complaint went into the file"
+        [ "$("$TFSTOOL" ls "$DISK" 2>&1 | grep -c '^ *lsout  *0 *$')" -eq 1 ] || fail "\"lsout\" is not empty: ls's complaint went into the file"
         [ "$("$TFSTOOL" ls "$DISK" 2>&1 | grep -c '^ *empty  *0 *$')" -eq 1 ] || fail "\"empty\" is not an empty file"
         # And pipes: a count that went from one program through another
         # into a file, twice - the second time with the first program
@@ -128,6 +131,9 @@ second" ] || fail "\"both\" is not the two files, one after the other"
 argc 3
 argv[1] a
 argv[2] b" ] || fail "\"cout\" does not hold what the C program wrote"
+            [ "$(get cerr)" = "Hello from C
+argc 2
+argv[1] err" ] || fail "\"cerr\" holds more, or less, than the C program's standard output"
         fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi

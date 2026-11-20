@@ -164,6 +164,13 @@ pub mod startup {
     /// When the other end is closed and everything sent has been read,
     /// the input has ended. Absent means there is no input at all.
     pub const STDIN: u64 = 1 << 4;
+    /// Standard error: a channel to send on, as standard output is -
+    /// for what the program has to say that is not its result: that a
+    /// file is not there, how it should have been called. It is a
+    /// second output so that it can go somewhere else: when the result
+    /// is sent to a file or to another program, the complaint still
+    /// reaches whoever is watching. For now it is always the screen.
+    pub const STDERR: u64 = 1 << 5;
     /// Not a handle - the one flag that is not, kept above the ones
     /// that are: standard output is the screen. A program need not
     /// care, and should not; the runtime does two things differently
@@ -239,7 +246,7 @@ pub mod arguments {
 ///
 /// `kind` is BUILT_IN (a program in the kernel image, by name) or IMAGE
 /// (the first handle is a memory object holding the program's file).
-/// `flags` are startup flags, STDOUT, SERVICES and STDIN: for each one
+/// `flags` are startup flags, STDOUT, SERVICES, STDIN and STDERR: for each one
 /// set, one more handle follows, in that order - the caller's own
 /// handles, which it hands down to the new program. SCREEN may be set
 /// with STDOUT, and brings no handle. init adds nothing of its own, so a
