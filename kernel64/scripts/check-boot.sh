@@ -134,6 +134,13 @@ argv[2] b" ] || fail "\"cout\" does not hold what the C program wrote"
             [ "$(get cerr)" = "Hello from C
 argc 2
 argv[1] err" ] || fail "\"cerr\" holds more, or less, than the C program's standard output"
+            [ "$(get pout)" = "printf: 42 -7 ff 0X2A [   hi] [hi   ] [00042] x 100%
+sizes: 18446744073709551615 -9223372036854775808
+12345
+printf returned 6
+snprintf: wanted 12, kept <hello, >
+puts: a line of its own
+fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program printed with printf"
         fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
