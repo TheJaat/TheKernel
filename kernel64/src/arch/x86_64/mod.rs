@@ -5,6 +5,7 @@ pub mod context;
 mod entry;
 mod gdt;
 mod idt;
+pub mod percpu;
 pub mod mmu;
 pub mod pci;
 mod pic;
@@ -42,6 +43,9 @@ pub fn init_cpu() {
     // with interrupts disabled - the conditions both inits require.
     unsafe {
         gdt::init();
+        // Right after the GDT: loading it reset GS, and from here on
+        // "this CPU's block" must be findable.
+        percpu::install(percpu::boot(), gdt::boot_tables());
         idt::init();
         syscall::init();
     }

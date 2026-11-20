@@ -52,6 +52,7 @@ use kernel64::sync::SpinLock;
 
 use super::gdt::{self, CpuTables};
 use super::mmu::{self, Control};
+use super::percpu::{self, PerCpu};
 use super::{apic, idt, platform, syscall};
 use crate::mm;
 
@@ -198,8 +199,8 @@ const START_TIMEOUT_US: u64 = 500_000;
 
 /// Everything a new CPU is handed. Made by the boot CPU, never freed.
 struct Start {
-    cpu: Cpu,
     tables: *mut CpuTables,
+    block: *mut PerCpu,
     double_fault_stack: u64,
     stack_top: u64,
     control: Control,
@@ -285,8 +286,8 @@ pub unsafe fn start(madt: &Madt) {
             continue;
         };
         let start: &'static Start = Box::leak(Box::new(Start {
-            cpu,
             tables: gdt::new_tables(),
+            block: Box::into_raw(Box::new(PerCpu::new(cpu.index))),
             double_fault_stack: double_fault_stack.top(),
             stack_top: stack.top(),
             control,
@@ -356,6 +357,7 @@ extern "C" fn ap_main(start: &'static Start) -> ! {
         mmu::set_control(start.control);
         mmu::activate(mm::kernel_root());
         gdt::load(start.tables, start.double_fault_stack);
+        percpu::install(start.block, start.tables);
         // From here a fault on this CPU is a message, as on the first.
         idt::load();
         syscall::init();
@@ -364,7 +366,8 @@ extern "C" fn ap_main(start: &'static Start) -> ! {
 
     kprintln!(
         "[smp] CPU {} awake: APIC id {}, stack below {:#x}",
-        start.cpu.index,
+        // Not from `start`: from this CPU's own block, found through GS.
+        percpu::index(),
         apic::local_id(),
         start.stack_top
     );

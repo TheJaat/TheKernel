@@ -12,6 +12,7 @@ macro_rules! program {
 
 pub static HELLO: &[u8] = program!("hello");
 pub static PEEK: &[u8] = program!("peek");
+pub static GS: &[u8] = program!("gs");
 pub static CLI: &[u8] = program!("cli");
 pub static SPIN: &[u8] = program!("spin");
 pub static ECHOD: &[u8] = program!("echod");

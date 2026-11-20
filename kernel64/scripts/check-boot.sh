@@ -42,6 +42,10 @@ fi
 ! grep -qE "\[smp\].*(FAILED|did not answer|not started|staying with 1 CPU)" "$LOG" || fail "a CPU could not be started"
 grep -q "\[selftest\] threads: sleep" "$LOG"      || fail "threads self-test"
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
+# The program that reads through GS must fault at its own offset from
+# address 0 - twice, the self-test runs everything twice - and not in
+# the kernel's memory: every swapgs is in its place.
+[ "$(grep -c "user read at 0x5a5: page not present" "$LOG")" -eq 2 ] || fail "a program's GS is not its own"
 grep -q "\[selftest\] ipc:" "$LOG"                || fail "IPC self-test"
 grep -q "\[selftest\] files:" "$LOG"              || fail "file service self-test"
 grep -q "\[selftest\] kill:" "$LOG"               || fail "kill self-test"

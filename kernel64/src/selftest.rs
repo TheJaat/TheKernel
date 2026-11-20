@@ -241,7 +241,7 @@ pub fn user() {
     use crate::{process, programs};
 
     let run_all = || {
-        let programs: [(&'static str, &[u8]); 7] = [
+        let programs: [(&'static str, &[u8]); 8] = [
             ("hello", programs::HELLO),
             ("peek", programs::PEEK),
             ("cli", programs::CLI),
@@ -249,6 +249,7 @@ pub fn user() {
             ("memro", programs::MEMRO),
             ("spin", programs::SPIN),
             ("heapcheck", programs::HEAPCHECK),
+            ("gs", programs::GS),
         ];
         let started: Vec<_> = programs
             .iter()
@@ -272,6 +273,7 @@ pub fn user() {
         ("memro", Some(abi::KILLED)),
         ("spin", Some(0)),
         ("heapcheck", Some(0)),
+        ("gs", Some(abi::KILLED)),
     ];
     assert_eq!(results, expected, "user programs did not end as expected");
 
@@ -287,7 +289,7 @@ pub fn user() {
     assert!(process::load("text", &[b'x'; 200]).is_err());
     assert!(process::load("half", &programs::HELLO[..programs::HELLO.len() / 2]).is_err());
     assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "refused programs leaked frames");
-    kprintln!("[selftest] user: hello exited 42, spin and heapcheck exited 0, peek, cli, port and memro were killed; 14 processes, nothing leaked");
+    kprintln!("[selftest] user: hello exited 42, spin and heapcheck exited 0, peek, cli, port, memro and gs were killed; 16 processes, nothing leaked");
 }
 
 /// IPC: a service and its client, connected by one channel the kernel

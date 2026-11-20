@@ -123,6 +123,14 @@ global_asm!(
     ".endr",
     "",
     "isr_common:",
+    // From a program? The CPU pushed CS, whose low two bits are the ring
+    // that was interrupted; it sits above the stub's two values and RIP.
+    // Then GS is the program's: exchange it for this CPU's block. From
+    // the kernel, GS is the kernel's already and must be left alone.
+    "    test byte ptr [rsp + 24], 3",
+    "    jz 2f",
+    "    swapgs",
+    "2:",
     // Save every general register. Pushing RAX first puts it highest,
     // which is why InterruptFrame lists them in reverse.
     "    push rax",
@@ -162,6 +170,15 @@ global_asm!(
     "    pop rbx",
     "    pop rax",
     "    add rsp, 16", // drop the vector and error code
+    // Going back to a program: its GS again. The saved CS is asked, not
+    // remembered - the handler may have switched threads, and this is
+    // then another thread's frame. Interrupts off, so that none arrives
+    // between the swap and the return.
+    "    cli",
+    "    test byte ptr [rsp + 8], 3",
+    "    jz 3f",
+    "    swapgs",
+    "3:",
     "    iretq",
     "",
     // The stubs' addresses, for building the IDT. Global, because Rust

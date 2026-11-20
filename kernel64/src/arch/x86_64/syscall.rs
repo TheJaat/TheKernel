@@ -9,7 +9,9 @@
 //! and SS come from the STAR register, RIP from LSTAR, and the flags in
 //! FMASK are cleared (interrupts among them). It does NOT switch stacks -
 //! RSP is still the user's, which the kernel must never trust or use. So
-//! the entry stub's first act is to swap in the thread's kernel stack.
+//! the entry stub's first act is to swap in the thread's kernel stack -
+//! which it finds in this CPU's own block, through GS (percpu.rs), since
+//! every other register still holds something of the program's.
 //!
 //! Back to the user: `sysretq`, the mirror image - RCX to RIP, R11 to
 //! RFLAGS, user CS and SS from STAR.
@@ -18,6 +20,7 @@ use core::arch::{asm, global_asm};
 
 use super::gdt::{KERNEL_CODE, USER_CODE, USER_DATA};
 use super::mmu::{read_msr, write_msr, EFER};
+use super::percpu;
 
 const STAR: u32 = 0xC000_0081;
 const LSTAR: u32 = 0xC000_0082;
@@ -27,15 +30,6 @@ const EFER_SCE: u64 = 1 << 0; // system call extensions: syscall/sysret on
 /// RFLAGS bits cleared on entry: TF (trap), IF (interrupts), DF
 /// (direction - the ABI wants it clear), NT, AC (alignment checks).
 const ENTRY_CLEARED_FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x4000 | 0x40000;
-
-/// The kernel stack `syscall_entry` switches to: the running thread's,
-/// set on every thread switch. One CPU, so one global; with SMP this
-/// becomes per-CPU data reached through GS (and `swapgs`).
-static mut KERNEL_RSP: u64 = 0;
-/// Where the entry stub parks the user's RSP for the two instructions
-/// before it is on the kernel stack. Safe on one CPU because interrupts
-/// are off until it has been pushed.
-static mut USER_RSP: u64 = 0;
 
 /// The user's registers, as `syscall_entry` saves them (lowest address
 /// first - the reverse of the pushes).
@@ -62,9 +56,12 @@ pub struct SyscallFrame {
 global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    "    mov [rip + {user_rsp}], rsp",
-    "    mov rsp, [rip + {kernel_rsp}]",
-    "    push qword ptr [rip + {user_rsp}]",
+    // From the program's GS to this CPU's block. Interrupts are off
+    // (FMASK), so nothing can come between this and the kernel stack.
+    "    swapgs",
+    "    mov gs:[{user_rsp}], rsp",
+    "    mov rsp, gs:[{kernel_rsp}]",
+    "    push qword ptr gs:[{user_rsp}]",
     "    push r11",
     "    push rcx",
     "    push rax",
@@ -102,9 +99,11 @@ global_asm!(
     "    pop rcx",
     "    pop r11",
     "    pop rsp",
+    // The last thing: the program's GS back.
+    "    swapgs",
     "    sysretq",
-    user_rsp = sym USER_RSP,
-    kernel_rsp = sym KERNEL_RSP,
+    user_rsp = const percpu::USER_RSP,
+    kernel_rsp = const percpu::KERNEL_RSP,
     handler = sym syscall_handler,
 );
 
@@ -132,7 +131,8 @@ extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
 /// Turns on `syscall`/`sysret`.
 ///
 /// # Safety
-/// Once, on the boot CPU, after the GDT is loaded.
+/// Once on each CPU, after its GDT is loaded: the registers written
+/// here are the CPU's own.
 pub unsafe fn init() {
     write_msr(EFER, read_msr(EFER) | EFER_SCE);
     // STAR[47:32]: the kernel CS (SS is CS + 8). STAR[63:48]: a base from
@@ -146,11 +146,10 @@ pub unsafe fn init() {
 }
 
 /// The kernel stack for the next `syscall` and for interrupts from ring 3.
+/// On the CPU this runs on.
 pub fn set_kernel_stack(top: u64) {
     super::gdt::set_kernel_stack(top);
-    // SAFETY: written with interrupts off on a thread switch; read only by
-    // syscall_entry, which runs with interrupts off until it is done.
-    unsafe { KERNEL_RSP = top };
+    percpu::set_kernel_rsp(top);
 }
 
 /// Drops to ring 3 at `entry`, with stack pointer `stack` and two
@@ -162,6 +161,10 @@ pub fn set_kernel_stack(top: u64) {
 /// mode, and `set_kernel_stack` must name this thread's kernel stack.
 pub unsafe fn enter_user(entry: u64, stack: u64, first: u64, second: u64) -> ! {
     asm!(
+        // Interrupts off until the `iretq` turns them on: after the
+        // `swapgs` this is ring 0 with the program's GS, and an
+        // interrupt taken then would run the kernel with it.
+        "cli",
         "push {ss}",
         "push {rsp}",
         "push {rflags}",
@@ -180,6 +183,7 @@ pub unsafe fn enter_user(entry: u64, stack: u64, first: u64, second: u64) -> ! {
         "xor r13d, r13d",
         "xor r14d, r14d",
         "xor r15d, r15d",
+        "swapgs",
         "iretq",
         ss = const USER_DATA as u64,
         cs = const USER_CODE as u64,

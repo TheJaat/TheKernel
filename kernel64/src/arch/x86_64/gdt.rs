@@ -148,6 +148,10 @@ impl CpuTables {
 /// heap to put anything in.
 static mut BOOT_TABLES: CpuTables = CpuTables::new();
 
+pub fn boot_tables() -> *mut CpuTables {
+    &raw mut BOOT_TABLES
+}
+
 /// Tables for one more CPU, from the heap, never freed: a CPU that has
 /// started stays. Made by the boot CPU and handed over, so that the new
 /// CPU's first steps need nothing but what it is given.
@@ -237,15 +241,14 @@ pub unsafe fn load(tables: *mut CpuTables, double_fault_stack: u64) {
 /// arrives in user mode (TSS.RSP0) - the running thread's kernel stack.
 /// User-mode RSP cannot be trusted, so the CPU never pushes onto it.
 ///
-/// The boot CPU's TSS, always: it is the only CPU that runs threads so
-/// far. The others are awake and have tables of their own, but nothing
-/// is scheduled on them yet.
+/// In the TSS of the CPU this runs on.
 pub fn set_kernel_stack(top: u64) {
-    // SAFETY: the TSS is only written here, with interrupts disabled (on
-    // a thread switch); the CPU reads it only when entering ring 0.
-    // `packed`: the field may be unaligned, so write it unaligned.
+    // SAFETY: this CPU's TSS is only written here, by this CPU, with
+    // interrupts disabled (on a thread switch); the CPU reads it only
+    // when entering ring 0. `packed`: the field may be unaligned, so
+    // write it unaligned.
     unsafe {
-        let tss = &raw mut BOOT_TABLES.tss;
+        let tss = &raw mut (*(*super::percpu::current()).tables).tss;
         core::ptr::addr_of_mut!((*tss).tss.privilege_stacks).cast::<u64>().write_unaligned(top);
     }
 }
@@ -255,10 +258,10 @@ pub fn set_kernel_stack(top: u64) {
 pub fn set_io_bitmap(map: &PortBitmap) {
     let bytes = map.bytes();
     // SAFETY: as for set_kernel_stack - written only with interrupts
-    // disabled, on this CPU; the CPU reads the bitmap only on an `in` or
-    // `out` in ring 3.
+    // disabled, on this CPU, in this CPU's TSS; the CPU reads the bitmap
+    // only on an `in` or `out` in ring 3.
     unsafe {
-        let tables = &raw mut BOOT_TABLES;
+        let tables = (*super::percpu::current()).tables;
         let bitmap = &mut (*tables).tss.io_bitmap;
         let loaded = (*tables).loaded;
         bitmap[..bytes.len()].copy_from_slice(bytes);
