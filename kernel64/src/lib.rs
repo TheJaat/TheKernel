@@ -31,4 +31,5 @@ pub mod pci;
 pub mod queue;
 pub mod regions;
 pub mod sched;
+pub mod smp;
 pub mod sync;

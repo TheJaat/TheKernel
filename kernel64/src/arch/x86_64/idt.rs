@@ -250,6 +250,18 @@ pub unsafe fn init() {
         (*idt)[vector] = gate(first + IRQ_STUB_SIZE * (vector as u64 - 32), 0);
     }
 
+    load();
+}
+
+/// Points the CPU this runs on at the IDT. The table is one for all
+/// CPUs - an exception means the same thing on each of them - but every
+/// CPU has its own register saying where the table is.
+///
+/// # Safety
+/// After `init` has filled the table, and after this CPU's GDT is
+/// loaded.
+pub unsafe fn load() {
+    let idt = &raw mut IDT;
     let pointer = TablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: idt as u64 };
     asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
 }

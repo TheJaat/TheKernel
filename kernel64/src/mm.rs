@@ -69,6 +69,19 @@ static NO_EXECUTE: AtomicBool = AtomicBool::new(false);
 /// threads run in.
 static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// A page of ordinary memory below 1 MiB that nothing uses, or 0 if
+/// there is none: where another CPU can be started (arch::smp). Found
+/// here because here is where it is known what the loader left in low
+/// memory that the kernel still reads.
+static LOW_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn low_page() -> Option<u64> {
+    match LOW_PAGE.load(Ordering::Relaxed) {
+        0 => None,
+        page => Some(page),
+    }
+}
+
 pub fn kernel_root() -> u64 {
     KERNEL_ROOT.load(Ordering::Relaxed)
 }
@@ -187,6 +200,25 @@ pub fn init(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
         info_address..info_address + size_of::<BootInfo>() as u64,
         map_start..map_start + size_of_val(regions) as u64,
     ];
+
+    // The first megabyte is kept out of the allocator whole; one page
+    // of it is put aside for starting the other CPUs, which begin in
+    // real mode and can run nowhere else. Not page 0 (the firmware's
+    // tables), and not the two things of the loader's the kernel goes
+    // on reading - of everything else down there the loader is done.
+    let still_read = [
+        0..PAGE_SIZE,
+        info_address..info_address + size_of::<BootInfo>() as u64,
+        map_start..map_start + size_of_val(regions) as u64,
+    ];
+    if let Some(page) = find_free_space(usable(), &still_read, PAGE_SIZE, PAGE_SIZE, MIB) {
+        // Firmware maps can overlap, and anything not usable wins: a
+        // page that is also in a region of another kind is not free.
+        let disputed = regions.iter().any(|r| !r.is_usable() && r.base < page + PAGE_SIZE && page < r.base + r.length);
+        if !disputed {
+            LOW_PAGE.store(page, Ordering::Relaxed);
+        }
+    }
 
     // Below 4 GiB: until the switch, only the loader's identity map can
     // reach it.

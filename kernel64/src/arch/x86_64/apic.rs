@@ -23,6 +23,8 @@ const ID: u64 = 0x020;
 const TASK_PRIORITY: u64 = 0x080;
 const EOI: u64 = 0x0B0;
 const SPURIOUS: u64 = 0x0F0;
+const COMMAND_LOW: u64 = 0x300;
+const COMMAND_HIGH: u64 = 0x310;
 const LVT_TIMER: u64 = 0x320;
 const LVT_ERROR: u64 = 0x370;
 const TIMER_INITIAL: u64 = 0x380;
@@ -33,8 +35,12 @@ const SOFTWARE_ENABLE: u32 = 1 << 8;
 const MASKED: u32 = 1 << 16;
 const TIMER_PERIODIC: u32 = 1 << 17;
 const DIVIDE_BY_16: u32 = 0b0011;
+/// In the command register: the last message has not left yet.
+const SENDING: u32 = 1 << 12;
 
-/// Virtual address of this CPU's local APIC registers.
+/// Virtual address of the local APIC's registers. One address for all
+/// CPUs: each CPU has its own local APIC, and they all answer at the
+/// same place - a CPU reading it sees its own.
 static LOCAL_BASE: AtomicU64 = AtomicU64::new(0);
 
 fn read(register: u64) -> u32 {
@@ -57,10 +63,27 @@ fn write(register: u64, value: u32) {
 /// `base` must be an uncached mapping of the local APIC's registers.
 pub unsafe fn init_local(base: u64, spurious_vector: u8) {
     LOCAL_BASE.store(base, Ordering::Relaxed);
+    enable_local(spurious_vector);
+}
+
+/// Turns on the local APIC of the CPU this runs on. For every CPU after
+/// the first, which finds the registers already mapped.
+pub fn enable_local(spurious_vector: u8) {
     write(TASK_PRIORITY, 0); // accept every priority
     write(LVT_ERROR, MASKED);
     write(LVT_TIMER, MASKED);
     write(SPURIOUS, SOFTWARE_ENABLE | u32::from(spurious_vector));
+}
+
+/// Sends `message` (see kernel64::smp) to the CPU whose local APIC id
+/// is `apic_id`, and waits until it has left this APIC.
+pub fn send(apic_id: u8, message: u32) {
+    // The high half first: writing the low half is what sends.
+    write(COMMAND_HIGH, kernel64::smp::destination(apic_id));
+    write(COMMAND_LOW, message);
+    while read(COMMAND_LOW) & SENDING != 0 {
+        core::hint::spin_loop();
+    }
 }
 
 pub fn local_id() -> u8 {

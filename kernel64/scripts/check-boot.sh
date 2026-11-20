@@ -6,7 +6,8 @@
 #
 # With a boot method, also checks the kernel saw that method - proof the
 # boot info really came from that loader. With $TYPED set, checks the
-# kernel echoed that line from the keyboard.
+# kernel echoed that line from the keyboard. $SMP is how many CPUs the
+# machine was given (default 4, as in qemu-boot.sh): all must wake.
 
 LOG=$1
 METHOD=${2:-}
@@ -22,6 +23,23 @@ grep -q "Hello from TheTaaJ" "$LOG"                || fail "no greeting"
 grep -q "resumed after the breakpoint" "$LOG"      || fail "exception path broken"
 grep -q "\[selftest\] memory: all passed" "$LOG"   || fail "memory self-test"
 grep -q "\[selftest\] timer" "$LOG"               || fail "timer self-test"
+CPUS=${SMP:-4}
+if [ "$CPUS" -eq 1 ]; then
+    grep -q "\[smp\] 1 CPU: no others to start" "$LOG" || fail "one CPU: the kernel did not say there were no others"
+else
+    # Every CPU says so itself, with the id the hardware gave it; then
+    # all of them count at once, and with a lock nothing may be lost.
+    n=1
+    while [ "$n" -lt "$CPUS" ]; do
+        grep -q "\[smp\] CPU $n awake: APIC id" "$LOG" || fail "CPU $n did not wake"
+        n=$((n + 1))
+    done
+    grep -q "\[smp\] $CPUS CPUs awake" "$LOG"        || fail "not all $CPUS CPUs woke"
+    total=$((CPUS * 100000))
+    grep -q "\[smp\] counting together: $CPUS CPUs reached $total of $total with a lock" "$LOG" \
+        || fail "the CPUs did not count to $total together under a lock"
+fi
+! grep -qE "\[smp\].*(FAILED|did not answer|not started|staying with 1 CPU)" "$LOG" || fail "a CPU could not be started"
 grep -q "\[selftest\] threads: sleep" "$LOG"      || fail "threads self-test"
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
 grep -q "\[selftest\] ipc:" "$LOG"                || fail "IPC self-test"

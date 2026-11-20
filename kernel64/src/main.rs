@@ -93,12 +93,18 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     kprintln!();
     let madt = read_madt(info.acpi_rsdp);
     let ids: alloc::vec::Vec<u8> = madt.processors.iter().filter(|p| p.enabled).map(|p| p.apic_id).collect();
-    kprintln!("[acpi] {} CPU(s), APIC ids {ids:?} - this one runs; the rest wait for SMP", ids.len());
+    kprintln!("[acpi] {} CPU(s), APIC ids {ids:?}", ids.len());
     // SAFETY: once, on the boot CPU, interrupts still disabled.
     let platform = unsafe { arch::platform::init(&madt, interrupts::HZ) };
     report_platform(&platform);
     arch::enable_interrupts();
     selftest::timer();
+
+    // The other CPUs: woken, checked, and - until the scheduler knows
+    // what to do with them - put to rest.
+    // SAFETY: once, on the boot CPU, after platform::init, before any
+    // process exists.
+    unsafe { arch::smp::start(&madt) };
 
     // Threads: the code running now becomes thread 1, "boot"; thread 0
     // is the idle thread.

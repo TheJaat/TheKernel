@@ -17,6 +17,7 @@
 #              the shell has run every line typed so far. The script then waits
 #              for the shell to echo a line.
 #   DISK       a raw disk image, attached as a virtio block device
+#   SMP        how many CPUs the machine has (default 4)
 
 set -u
 
@@ -39,7 +40,7 @@ MONITOR="$LOG.monitor"
 rm -f "$LOG" "$LOG.ppm" "$LOG.hang.ppm" "$LOG.qemu" "$MONITOR"
 : > "$LOG"
 qemu-system-x86_64 -m 512M -cdrom "$ISO" -boot d \
-    -display none -no-reboot -serial "file:$LOG" \
+    -smp "${SMP:-4}" -display none -no-reboot -serial "file:$LOG" \
     -monitor "unix:$MONITOR,server,nowait" \
     -d cpu_reset -D "$LOG.qemu" $DISK_ARGS ${QEMU_ARGS:-} &
 qemu=$!

@@ -12,6 +12,7 @@ mod pit;
 pub mod platform;
 mod port;
 mod serial;
+pub mod smp;
 pub mod syscall;
 
 pub use gdt::set_io_bitmap;
@@ -88,6 +89,17 @@ pub fn tsc() -> u64 {
     // SAFETY: rdtsc only reads the counter.
     unsafe { asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) };
     (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Waits about `microseconds`, by watching the time-stamp counter - for
+/// the few places that must wait before there is a scheduler to sleep
+/// on, or with interrupts off. The CPU does nothing else meanwhile.
+pub fn delay_us(microseconds: u64) {
+    let cycles = platform::tsc_hz() / 1_000_000 * microseconds;
+    let start = tsc();
+    while tsc().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
+    }
 }
 
 /// Raises a breakpoint exception, which the IDT reports and resumes

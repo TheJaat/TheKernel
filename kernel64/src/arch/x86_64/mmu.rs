@@ -55,6 +55,38 @@ pub unsafe fn enable_protection(no_execute: bool) {
     asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
 }
 
+/// The control registers and EFER of the CPU this runs on - what a
+/// CPU started later must be given to be set up the same way.
+pub fn control() -> Control {
+    let (cr0, cr4): (u64, u64);
+    // SAFETY: reading control registers and an MSR every x86_64 CPU has
+    // changes nothing.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        Control { cr0, cr4, efer: read_msr(EFER) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Control {
+    pub cr0: u64,
+    pub cr4: u64,
+    pub efer: u64,
+}
+
+/// Makes this CPU's CR0 and CR4 the same as another's (EFER the
+/// start-up code has already set: paging needs it).
+///
+/// # Safety
+/// `control` must come from `control()` on a CPU of the same machine,
+/// already running the kernel: every bit in it is then one this code
+/// runs correctly with.
+pub unsafe fn set_control(control: Control) {
+    asm!("mov cr4, {}", in(reg) control.cr4, options(nostack, preserves_flags));
+    asm!("mov cr0, {}", in(reg) control.cr0, options(nostack, preserves_flags));
+}
+
 /// Switches to the address space whose PML4 is at physical `root`.
 /// Loading CR3 also flushes every non-global TLB entry.
 ///

@@ -9,9 +9,24 @@
 //!     CPU switches to when an interrupt arrives. Its IST entries are what
 //!     make a double fault survivable. Behind it sits the I/O permission
 //!     bitmap: which ports ring 3 may use (kernel64::ioports).
+//!
+//! Every CPU has its own of both. The TSS has to be separate: it holds
+//! the stacks *this* CPU switches to, and two CPUs taking an interrupt
+//! at the same moment onto one stack would each overwrite what the
+//! other had just saved. And the GDT is where a CPU finds its TSS - one
+//! slot, one address - so a GDT can describe only one of them.
+//!
+//! (Nothing stops two CPUs loading the same pair. The CPU marks a TSS
+//! "busy" when it is loaded and refuses a busy one, but `load` below
+//! writes the descriptor afresh each time, which clears the mark. I
+//! gave two CPUs the same tables to see the refusal, and both started;
+//! the damage would have come later, at the first interrupt they took
+//! together.)
 
 use core::arch::asm;
 use core::mem::size_of;
+
+use alloc::boxed::Box;
 
 use kernel64::ioports::{self, PortBitmap};
 
@@ -83,37 +98,62 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 #[repr(C, align(16))]
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
-/// The stack a double fault runs on. A double fault often *means* the
-/// normal stack is unusable - overflowed, or pointing at nothing - so
-/// its handler needs one that is known to be good.
+/// The stack a double fault runs on, on the boot CPU. A double fault
+/// often *means* the normal stack is unusable - overflowed, or pointing
+/// at nothing - so its handler needs one that is known to be good.
 static mut DOUBLE_FAULT_STACK: Stack = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
 
-static mut TSS_SEGMENT: TssBlock = TssBlock {
-    tss: TaskStateSegment {
-        reserved0: 0,
-        privilege_stacks: [0; 3],
-        reserved1: 0,
-        interrupt_stacks: [0; 7],
-        reserved2: 0,
-        reserved3: 0,
-        // The bitmap starts right after the TSS proper.
-        io_map_base: size_of::<TaskStateSegment>() as u16,
-    },
-    io_bitmap: [0xFF; ioports::BYTES],
-    terminator: 0xFF,
-};
+/// One CPU's descriptor tables.
+pub struct CpuTables {
+    /// Seven slots: null, four segments, and the TSS, which takes two
+    /// because it holds a full 64-bit base address.
+    gdt: [u64; 7],
+    tss: TssBlock,
+    /// How far the bitmap in the TSS has bytes that are not 0xFF.
+    loaded: usize,
+}
 
-/// Seven slots: null, four segments, and the TSS, which takes two
-/// because it holds a full 64-bit base address.
-static mut GDT: [u64; 7] = [
-    0,
-    code(false), // 0x08 kernel code
-    data(false), // 0x10 kernel data
-    data(true),  // 0x18 user data
-    code(true),  // 0x20 user code
-    0,           // 0x28 TSS, low half  - filled in by init()
-    0,           // 0x30 TSS, high half
-];
+impl CpuTables {
+    const fn new() -> CpuTables {
+        CpuTables {
+            gdt: [
+                0,
+                code(false), // 0x08 kernel code
+                data(false), // 0x10 kernel data
+                data(true),  // 0x18 user data
+                code(true),  // 0x20 user code
+                0,           // 0x28 TSS, low half  - filled in by load()
+                0,           // 0x30 TSS, high half
+            ],
+            tss: TssBlock {
+                tss: TaskStateSegment {
+                    reserved0: 0,
+                    privilege_stacks: [0; 3],
+                    reserved1: 0,
+                    interrupt_stacks: [0; 7],
+                    reserved2: 0,
+                    reserved3: 0,
+                    // The bitmap starts right after the TSS proper.
+                    io_map_base: size_of::<TaskStateSegment>() as u16,
+                },
+                io_bitmap: [0xFF; ioports::BYTES],
+                terminator: 0xFF,
+            },
+            loaded: 0,
+        }
+    }
+}
+
+/// The boot CPU's: a static, because it is needed before there is a
+/// heap to put anything in.
+static mut BOOT_TABLES: CpuTables = CpuTables::new();
+
+/// Tables for one more CPU, from the heap, never freed: a CPU that has
+/// started stays. Made by the boot CPU and handed over, so that the new
+/// CPU's first steps need nothing but what it is given.
+pub fn new_tables() -> *mut CpuTables {
+    Box::into_raw(Box::new(CpuTables::new()))
+}
 
 /// The operand of `lgdt` and `lidt`: a size and an address, packed.
 #[repr(C, packed)]
@@ -123,7 +163,7 @@ pub struct TablePointer {
 }
 
 /// Builds the TSS descriptor - the one entry whose contents depend on a
-/// runtime address, which is why GDT starts with zeros there.
+/// runtime address, which is why a GDT starts with zeros there.
 fn tss_descriptor(base: u64) -> (u64, u64) {
     // The limit covers the bitmap: ports past it are refused.
     let limit = (size_of::<TssBlock>() - 1) as u64;
@@ -137,7 +177,8 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
     (low, high)
 }
 
-/// Installs the GDT and TSS. Must run once, before interrupts are used.
+/// Installs the boot CPU's GDT and TSS. Must run once, before
+/// interrupts are used.
 ///
 /// # Safety
 /// Called once, on the boot CPU, with interrupts disabled. It rewrites
@@ -146,10 +187,21 @@ pub unsafe fn init() {
     // `&raw mut` takes an address without creating a Rust reference -
     // the right tool for statics the CPU itself reads and writes.
     let stack_top = (&raw mut DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
-    let tss = &raw mut TSS_SEGMENT;
-    (*tss).tss.interrupt_stacks[(DOUBLE_FAULT_IST - 1) as usize] = stack_top;
+    load(&raw mut BOOT_TABLES, stack_top);
+}
 
-    let gdt = &raw mut GDT;
+/// Makes `tables` the GDT and TSS of the CPU this runs on, with double
+/// faults handled on the stack ending at `double_fault_stack`.
+///
+/// # Safety
+/// Interrupts disabled; `tables` valid for as long as the CPU runs and
+/// loaded by no other CPU; the stack mapped, writable, and this CPU's
+/// alone.
+pub unsafe fn load(tables: *mut CpuTables, double_fault_stack: u64) {
+    let tss = &raw mut (*tables).tss;
+    (*tss).tss.interrupt_stacks[(DOUBLE_FAULT_IST - 1) as usize] = double_fault_stack;
+
+    let gdt = &raw mut (*tables).gdt;
     let (low, high) = tss_descriptor(tss as u64);
     (*gdt)[5] = low;
     (*gdt)[6] = high;
@@ -184,18 +236,19 @@ pub unsafe fn init() {
 /// Sets the stack the CPU switches to when an interrupt or exception
 /// arrives in user mode (TSS.RSP0) - the running thread's kernel stack.
 /// User-mode RSP cannot be trusted, so the CPU never pushes onto it.
+///
+/// The boot CPU's TSS, always: it is the only CPU that runs threads so
+/// far. The others are awake and have tables of their own, but nothing
+/// is scheduled on them yet.
 pub fn set_kernel_stack(top: u64) {
     // SAFETY: the TSS is only written here, with interrupts disabled (on
     // a thread switch); the CPU reads it only when entering ring 0.
     // `packed`: the field may be unaligned, so write it unaligned.
     unsafe {
-        let tss = &raw mut TSS_SEGMENT;
+        let tss = &raw mut BOOT_TABLES.tss;
         core::ptr::addr_of_mut!((*tss).tss.privilege_stacks).cast::<u64>().write_unaligned(top);
     }
 }
-
-/// How far the bitmap in the TSS has bytes that are not 0xFF.
-static mut LOADED: usize = 0;
 
 /// Loads the ports the next thread's process may use: its bytes, and
 /// 0xFF over whatever the last process allowed beyond them.
@@ -205,13 +258,13 @@ pub fn set_io_bitmap(map: &PortBitmap) {
     // disabled, on this CPU; the CPU reads the bitmap only on an `in` or
     // `out` in ring 3.
     unsafe {
-        let tss = &raw mut TSS_SEGMENT;
-        let bitmap = &mut (*tss).io_bitmap;
-        let loaded = LOADED;
+        let tables = &raw mut BOOT_TABLES;
+        let bitmap = &mut (*tables).tss.io_bitmap;
+        let loaded = (*tables).loaded;
         bitmap[..bytes.len()].copy_from_slice(bytes);
         if loaded > bytes.len() {
             bitmap[bytes.len()..loaded].fill(0xFF);
         }
-        LOADED = bytes.len();
+        (*tables).loaded = bytes.len();
     }
 }
