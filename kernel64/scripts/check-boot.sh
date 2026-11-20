@@ -157,6 +157,17 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
             get cend | cmp -s - "$LOG.want" || fail "\"cend\" does not hold what was in the buffer when main returned: exit did not flush it"
             printf 'kept\n' > "$LOG.want"
             get clost | cmp -s - "$LOG.want" || fail "\"clost\" is not the one flushed line: _exit must not send what is still in the buffer"
+            # And a whole program: the same C file was compiled for
+            # this machine with this machine's C library, and both were
+            # given the same input - the program's own 60 KB of machine
+            # code and a text file; and the text file alone, as standard
+            # input. What the two printed must be the same bytes.
+            if [ -n "${CWORDS_HOST:-}" ]; then
+                "$CWORDS_HOST" -n 25 "$CWORDS_TAAJ" "$DISK.long" > "$LOG.want"
+                get cw1 | cmp -s - "$LOG.want" || fail "\"cw1\" is not what the same C program prints on this machine from the same two files"
+                "$CWORDS_HOST" -n 5 < "$DISK.long" > "$LOG.want"
+                get cw2 | cmp -s - "$LOG.want" || fail "\"cw2\" is not what the same C program prints on this machine from the same standard input"
+            fi
             "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cstdio\.\(tmp\|new\) ' && fail "the C program's scratch files were left behind: remove or rename did not work"
         fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
