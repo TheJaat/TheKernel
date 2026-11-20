@@ -146,6 +146,18 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
             get clong2 | cmp -s - "$DISK.long" || fail "\"clong2\" is not \"long\": a C program's read of standard input lost or changed it"
             "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cfile\.tmp ' && fail "the C program's scratch file was left behind: unlink did not remove it"
             "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cno ' && fail "a C program made a file through a read-only channel"
+            # And its streams: lines read with fgets and numbered with
+            # printf, a copy made with fread and fwrite, and what was
+            # still in standard output's buffer when the program ended -
+            # sent if it ended by returning, lost if by _exit.
+            awk '{ printf "%4d  %s\n", NR, $0 }' "$DISK.long" > "$LOG.numbered"
+            get cnum | cmp -s - "$LOG.numbered" || fail "\"cnum\" is not \"long\" with its lines numbered: fgets or a buffered printf lost or changed it"
+            get ccopy | cmp -s - "$DISK.long" || fail "\"ccopy\" is not \"long\": a C program's fread and fwrite lost or changed it"
+            printf 'no new line, and still here' > "$LOG.want"
+            get cend | cmp -s - "$LOG.want" || fail "\"cend\" does not hold what was in the buffer when main returned: exit did not flush it"
+            printf 'kept\n' > "$LOG.want"
+            get clost | cmp -s - "$LOG.want" || fail "\"clost\" is not the one flushed line: _exit must not send what is still in the buffer"
+            "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cstdio\.\(tmp\|new\) ' && fail "the C program's scratch files were left behind: remove or rename did not work"
         fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
