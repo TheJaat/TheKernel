@@ -171,16 +171,26 @@ pub mod startup {
     /// is sent to a file or to another program, the complaint still
     /// reaches whoever is watching. For now it is always the screen.
     pub const STDERR: u64 = 1 << 5;
-    /// Not a handle - the one flag that is not, kept above the ones
-    /// that are: standard output is the screen. A program need not
+    /// Not a handle: standard input is the keyboard - a person, typing.
+    /// The program gets a channel for its input as always (STDIN), but
+    /// nothing is sent down it until the program asks: before it
+    /// waits for input, it sends a `stream::WANT` back up the same
+    /// channel, and whoever stands at the other end - the shell - then
+    /// lets the next line typed go to it. So what is typed belongs to
+    /// whoever is reading at the time, and a program that never reads
+    /// takes nothing. Without this flag an input is a file or another
+    /// program, which need no asking.
+    pub const KEYBOARD: u64 = 1 << 6;
+    /// Not a handle either: standard output is the screen. A program need not
     /// care, and should not; the runtime does two things differently
     /// for a screen. It copies what is printed to the kernel's debug
     /// log, so the serial line shows what the screen shows. And it
     /// gives up on a screen that takes nothing for a second, where on
     /// any other output it waits: text for a file must not be dropped.
     pub const SCREEN: u64 = 1 << 7;
-    /// The flags that each stand for one startup handle.
-    pub const HANDLES: u64 = SCREEN - 1;
+    /// The flags that each stand for one startup handle: the ones
+    /// below the two that do not.
+    pub const HANDLES: u64 = KEYBOARD - 1;
 }
 
 /// A stream: bytes in order, in messages, on a channel. What standard
@@ -194,11 +204,22 @@ pub mod startup {
 /// closing its end. A message that does not start with DATA is not
 /// part of the stream: the display, which takes text as a stream, has
 /// other messages of its own.
+///
+/// One message goes the other way, from the reader to the sender, and
+/// only when the sender is a keyboard (`startup::KEYBOARD`):
+///
+///   [WANT]
+///
+/// "I am about to wait for input." A file is sent whether or not it is
+/// asked for; a person's typing is not, because it may be meant for
+/// someone else - the shell, if the program is not reading.
 pub mod stream {
     /// The same byte as display::TEXT: text for the screen is a stream.
     pub const DATA: u8 = super::display::TEXT;
     /// Most bytes in one message.
     pub const DATA_MAX: usize = super::MESSAGE_MAX as usize - 1;
+    /// From the reader: it is waiting for input.
+    pub const WANT: u8 = 0x57;
 }
 
 /// How a program's arguments travel: each one followed by a zero byte.
