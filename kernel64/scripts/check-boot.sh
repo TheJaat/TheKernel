@@ -114,6 +114,13 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         [ "$(get piped)" = "300 lines, 1200 words, 4692 bytes
 300 lines, 1200 words, 4692 bytes" ] || fail "\"piped\" does not hold what wc counted of cat's output, twice"
         get big3 | cmp -s - "$LOG.twice" || fail "\"big3\" is not \"big\": cat ls ls | cat | cat > big3 lost or changed bytes"
+        # And background jobs: 50 KB written by a pipeline nobody
+        # waited for, while other lines ran; the one line a program
+        # printed into a file before it was killed; and a count made
+        # from what the shell itself printed.
+        get big4 | cmp -s - "$LOG.twice" || fail "\"big4\" is not \"big\": the background job's output was lost or changed"
+        [ "$(get flog)" = "forever: sleep until stopped (Ctrl+C)" ] || fail "\"flog\" does not hold what the background job printed"
+        [ "$(get bgcount)" = "1 line, 1 word, 3 bytes" ] || fail "\"bgcount\" does not hold the count of the shell's own output"
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
