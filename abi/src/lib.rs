@@ -149,8 +149,11 @@ pub mod startup {
     /// A channel holding one message: the program's arguments, each
     /// followed by a zero byte (see `arguments`).
     pub const ARGUMENTS: u64 = 1 << 1;
-    /// The file service's request channel.
-    pub const FILES: u64 = 1 << 2;
+    /// The program's channel to the registry: where it asks, by name,
+    /// for the services it was given - "files", say. Which names exist
+    /// on it, and what each means, whoever started the program decided
+    /// (the `registry` crate). A program with no services gets none.
+    pub const SERVICES: u64 = 1 << 2;
     /// A channel holding one message: the directory the program was
     /// started in, as a path from the root - what its relative paths
     /// start from. Absent means the root. It is a name and nothing
@@ -236,7 +239,7 @@ pub mod arguments {
 ///
 /// `kind` is BUILT_IN (a program in the kernel image, by name) or IMAGE
 /// (the first handle is a memory object holding the program's file).
-/// `flags` are startup flags, STDOUT, FILES and STDIN: for each one
+/// `flags` are startup flags, STDOUT, SERVICES and STDIN: for each one
 /// set, one more handle follows, in that order - the caller's own
 /// handles, which it hands down to the new program. SCREEN may be set
 /// with STDOUT, and brings no handle. init adds nothing of its own, so a
