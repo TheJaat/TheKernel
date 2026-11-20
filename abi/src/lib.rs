@@ -143,8 +143,8 @@ pub const PROGRAM_IMAGE_MAX: u64 = 4 << 20;
 pub mod startup {
     /// A channel to the display - print there too.
     pub const STDOUT: u64 = 1 << 0;
-    /// A channel holding one message: the program's arguments, as the
-    /// text typed after its name.
+    /// A channel holding one message: the program's arguments, each
+    /// followed by a zero byte (see `arguments`).
     pub const ARGUMENTS: u64 = 1 << 1;
     /// The file service's request channel.
     pub const FILES: u64 = 1 << 2;
@@ -154,6 +154,44 @@ pub mod startup {
     /// more: it lets the program reach no file it could not reach
     /// without it.
     pub const DIRECTORY: u64 = 1 << 3;
+}
+
+/// How a program's arguments travel: each one followed by a zero byte.
+///
+/// The shell has already decided where one argument ends and the next
+/// begins (quotes, spaces); this keeps that decision on the way to the
+/// program. A zero byte after each - not between them - so that no
+/// arguments (nothing) and one empty argument (a single zero) differ.
+/// It is what C calls a string, and how Unix lays out `argv`: the one
+/// byte that cannot be typed is the one that separates.
+pub mod arguments {
+    /// Lays `words` out in `out`; the length, or None if they do not
+    /// fit or one of them has a zero byte in it.
+    pub fn encode<'a>(words: impl Iterator<Item = &'a str>, out: &mut [u8]) -> Option<usize> {
+        let mut at = 0;
+        for word in words {
+            let end = at + word.len();
+            if end >= out.len() || word.as_bytes().contains(&0) {
+                return None;
+            }
+            out[at..end].copy_from_slice(word.as_bytes());
+            out[end] = 0;
+            at = end + 1;
+        }
+        Some(at)
+    }
+
+    /// The arguments in `bytes`, in order. Bytes after the last zero -
+    /// an argument that was cut off - are not one.
+    pub fn decode(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+        let mut rest = bytes;
+        core::iter::from_fn(move || {
+            let end = rest.iter().position(|&byte| byte == 0)?;
+            let (word, tail) = rest.split_at(end);
+            rest = &tail[1..];
+            Some(word)
+        })
+    }
 }
 
 /// Requests to init, from the shell: "start this program".
@@ -624,6 +662,31 @@ pub mod block {
 #[cfg(test)]
 mod tests {
     use super::init::{Run, BUILT_IN, IMAGE};
+
+    #[test]
+    fn arguments_round_trip() {
+        let mut out = [0u8; 32];
+        // The crate is no_std; its tests run on the host, where std
+        // exists but has to be asked for by name.
+        extern crate std;
+        use std::vec::Vec;
+        let decode = |bytes: &[u8]| -> Vec<Vec<u8>> { super::arguments::decode(bytes).map(<[u8]>::to_vec).collect() };
+        let words = ["notes", "two  words", ""];
+        let length = super::arguments::encode(words.into_iter(), &mut out).unwrap();
+        assert_eq!(&out[..length], b"notes\0two  words\0\0");
+        assert_eq!(decode(&out[..length]), [&b"notes"[..], b"two  words", b""]);
+        // None, and one that is empty, are not the same.
+        assert_eq!(super::arguments::encode([].into_iter(), &mut out), Some(0));
+        assert!(decode(b"").is_empty());
+        assert_eq!(super::arguments::encode([""].into_iter(), &mut out), Some(1));
+        assert_eq!(decode(b"\0"), [b""]);
+        // What does not fit, or cannot be told apart afterwards.
+        assert_eq!(super::arguments::encode(["abc"].into_iter(), &mut [0u8; 3]), None);
+        assert_eq!(super::arguments::encode(["abc"].into_iter(), &mut [0u8; 4]), Some(4));
+        assert_eq!(super::arguments::encode(["a\0b"].into_iter(), &mut out), None);
+        // A message cut short loses its last, unfinished argument.
+        assert_eq!(decode(b"one\0tw"), [b"one"]);
+    }
 
     #[test]
     fn a_run_request_round_trips() {

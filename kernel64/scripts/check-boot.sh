@@ -84,6 +84,11 @@ more" ] || fail "tfstool does not find \"inside\" and \"more\" in docs/here on t
         [ "$("$TFSTOOL" get "$DISK" docs/welcome 2>&1)" = "Hello from the host" ] || fail "the copy docs/welcome is not the file"
         "$TFSTOOL" get "$DISK" docs/long2 2>/dev/null | cmp -s - "$DISK.long" || fail "the copy docs/long2 differs from the file it was made from"
         ! "$TFSTOOL" ls "$DISK" tools/deep > /dev/null 2>&1  || fail "the directory moved back is still in tools"
+        # And quoting: the two spaces that double quotes kept, the one
+        # that is left without them, and names with spaces in them.
+        [ "$("$TFSTOOL" get "$DISK" quoted 2>&1)" = "two  words" ] || fail "the quoted text did not keep its two spaces"
+        [ "$("$TFSTOOL" get "$DISK" plain 2>&1)" = "two words" ]   || fail "the unquoted text is not two words and one space"
+        [ "$("$TFSTOOL" get "$DISK" "my docs/a file" 2>&1)" = "x" ] || fail "no file \"a file\" in the directory \"my docs\""
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
