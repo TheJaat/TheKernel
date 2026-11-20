@@ -121,6 +121,14 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         get big4 | cmp -s - "$LOG.twice" || fail "\"big4\" is not \"big\": the background job's output was lost or changed"
         [ "$(get flog)" = "forever: sleep until stopped (Ctrl+C)" ] || fail "\"flog\" does not hold what the background job printed"
         [ "$(get bgcount)" = "1 line, 1 word, 3 bytes" ] || fail "\"bgcount\" does not hold the count of the shell's own output"
+        # And the C program, if there was one: what it wrote with
+        # write() went where the shell pointed its standard output.
+        if grep -q 'line: "chello a b > cout"' "$LOG"; then
+            [ "$(get cout)" = "Hello from C
+argc 3
+argv[1] a
+argv[2] b" ] || fail "\"cout\" does not hold what the C program wrote"
+        fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
