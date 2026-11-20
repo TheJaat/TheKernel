@@ -64,6 +64,15 @@ if [ -n "${DISK:-}" ]; then
         [ "$("$TFSTOOL" get "$DISK" docs/deep/note 2>&1)" = "nested" ] \
             || fail "tfstool does not find \"nested\" in docs/deep/note on the disk"
         ! "$TFSTOOL" ls "$DISK" work > /dev/null 2>&1 || fail "the removed directory \"work\" is still on the disk"
+        # And the current directory: a file written by a bare name while
+        # in docs, added to from docs/deep by its whole path; files
+        # written by bare names after climbing back to the root; and the
+        # directory removed while the shell stood in it.
+        [ "$("$TFSTOOL" get "$DISK" docs/here 2>&1)" = "inside
+more" ] || fail "tfstool does not find \"inside\" and \"more\" in docs/here on the disk"
+        [ "$("$TFSTOOL" get "$DISK" rooted 2>&1)" = "yes" ] || fail "\"rooted\" is not in the root: cd .. did not climb back"
+        [ "$("$TFSTOOL" get "$DISK" home 2>&1)" = "yes" ]   || fail "\"home\" is not in the root: a bare cd did not go there"
+        ! "$TFSTOOL" ls "$DISK" tools/gone > /dev/null 2>&1 || fail "the removed directory \"tools/gone\" is still on the disk"
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
