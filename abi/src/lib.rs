@@ -141,7 +141,10 @@ pub const PROGRAM_IMAGE_MAX: u64 = 4 << 20;
 /// argument of process_spawn, in RSI. Each flag says one more startup
 /// handle is present; they come in the order of the flags' bits.
 pub mod startup {
-    /// A channel to the display - print there too.
+    /// Standard output: a channel to send what the program prints on,
+    /// as `stream` messages. Whoever started the program decides what
+    /// is at the other end - the screen, a file being written, another
+    /// program - and the program prints the same way whichever it is.
     pub const STDOUT: u64 = 1 << 0;
     /// A channel holding one message: the program's arguments, each
     /// followed by a zero byte (see `arguments`).
@@ -154,6 +157,38 @@ pub mod startup {
     /// more: it lets the program reach no file it could not reach
     /// without it.
     pub const DIRECTORY: u64 = 1 << 3;
+    /// Standard input: a channel to receive `stream` messages from.
+    /// When the other end is closed and everything sent has been read,
+    /// the input has ended. Absent means there is no input at all.
+    pub const STDIN: u64 = 1 << 4;
+    /// Not a handle - the one flag that is not, kept above the ones
+    /// that are: standard output is the screen. A program need not
+    /// care, and should not; the runtime does two things differently
+    /// for a screen. It copies what is printed to the kernel's debug
+    /// log, so the serial line shows what the screen shows. And it
+    /// gives up on a screen that takes nothing for a second, where on
+    /// any other output it waits: text for a file must not be dropped.
+    pub const SCREEN: u64 = 1 << 7;
+    /// The flags that each stand for one startup handle.
+    pub const HANDLES: u64 = SCREEN - 1;
+}
+
+/// A stream: bytes in order, in messages, on a channel. What standard
+/// output and standard input carry.
+///
+///   [DATA] [bytes]
+///
+/// A message may hold any number of bytes up to DATA_MAX, and where one
+/// message ends means nothing - a reader must not expect a line, or a
+/// whole anything, per message. The end of the stream is the sender
+/// closing its end. A message that does not start with DATA is not
+/// part of the stream: the display, which takes text as a stream, has
+/// other messages of its own.
+pub mod stream {
+    /// The same byte as display::TEXT: text for the screen is a stream.
+    pub const DATA: u8 = super::display::TEXT;
+    /// Most bytes in one message.
+    pub const DATA_MAX: usize = super::MESSAGE_MAX as usize - 1;
 }
 
 /// How a program's arguments travel: each one followed by a zero byte.
@@ -201,9 +236,10 @@ pub mod arguments {
 ///
 /// `kind` is BUILT_IN (a program in the kernel image, by name) or IMAGE
 /// (the first handle is a memory object holding the program's file).
-/// `flags` are startup flags, STDOUT and FILES: for each one set, one
-/// more handle follows, in that order - the caller's own handles, which
-/// it hands down to the new program. init adds nothing of its own, so a
+/// `flags` are startup flags, STDOUT, FILES and STDIN: for each one
+/// set, one more handle follows, in that order - the caller's own
+/// handles, which it hands down to the new program. SCREEN may be set
+/// with STDOUT, and brings no handle. init adds nothing of its own, so a
 /// program can get no more than whoever asked for it holds.
 /// `directory` is where the program is started: the caller's current
 /// directory, as a path from the root ("" is the root). init passes it

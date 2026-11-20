@@ -89,6 +89,24 @@ more" ] || fail "tfstool does not find \"inside\" and \"more\" in docs/here on t
         [ "$("$TFSTOOL" get "$DISK" quoted 2>&1)" = "two  words" ] || fail "the quoted text did not keep its two spaces"
         [ "$("$TFSTOOL" get "$DISK" plain 2>&1)" = "two words" ]   || fail "the unquoted text is not two words and one space"
         [ "$("$TFSTOOL" get "$DISK" "my docs/a file" 2>&1)" = "x" ] || fail "no file \"a file\" in the directory \"my docs\""
+        # And redirection: what > and >> put in a file; two files joined;
+        # the shell's own output; a text, and a file longer than a
+        # channel holds, sent through a program's input and output
+        # both, which must come out the same byte for byte; a program's complaint, which went where its
+        # output went; and the file a command that did not exist left.
+        get() { "$TFSTOOL" get "$DISK" "$1" 2>/dev/null; }
+        [ "$(get out)" = "first
+second" ] || fail "\"out\" does not hold what > and >> put there"
+        [ "$(get both)" = "Hello from the host
+first
+second" ] || fail "\"both\" is not the two files, one after the other"
+        get procs | grep -q "init  *running" || fail "the output of ps did not go into \"procs\""
+        get long3 | cmp -s - "$DISK.long" || fail "\"long3\" is not \"long\": cat < long > long3 changed it"
+        { get ls; get ls; } > "$LOG.twice"
+        get big | cmp -s - "$LOG.twice"  || fail "\"big\" is not the program ls twice over: cat ls ls > big lost or changed bytes"
+        get big2 | cmp -s - "$LOG.twice" || fail "\"big2\" is not \"big\": 50 messages did not come through an input and an output whole"
+        [ "$(get err)" = "cat: none: no such file or directory" ] || fail "cat's complaint is not in \"err\""
+        [ "$("$TFSTOOL" ls "$DISK" 2>&1 | grep -c '^ *empty  *0 *$')" -eq 1 ] || fail "\"empty\" is not an empty file"
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
