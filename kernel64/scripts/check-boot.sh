@@ -124,6 +124,13 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
 fi
+if [ -n "${EXPECT:-}" ] && echo "$EXPECT" | grep -q "registry"; then
+    # The registry was made to crash once. The one init started in its
+    # place must have been told everything again: both namespaces are
+    # announced a second time.
+    [ "$(grep -c "^\[registry\] shell may ask for:" "$LOG")" -ge 2 ] || fail "the new registry was not told the shell's namespace"
+    [ "$(grep -c "^\[registry\] fs may ask for:" "$LOG")" -ge 2 ]    || fail "the new registry was not told fs's namespace"
+fi
 if [ -n "${EXPECT:-}" ]; then
     # The output of the commands typed: each pattern must appear.
     old_ifs=$IFS
