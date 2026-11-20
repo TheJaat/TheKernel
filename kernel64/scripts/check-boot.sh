@@ -141,6 +141,11 @@ printf returned 6
 snprintf: wanted 12, kept <hello, >
 puts: a line of its own
 fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program printed with printf"
+            [ "$(get cnote)" = "made by c" ] || fail "\"cnote\" does not hold what the C program wrote with open and write"
+            get clong | cmp -s - "$DISK.long" || fail "\"clong\" is not \"long\": a C program's open and read lost or changed it"
+            get clong2 | cmp -s - "$DISK.long" || fail "\"clong2\" is not \"long\": a C program's read of standard input lost or changed it"
+            "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cfile\.tmp ' && fail "the C program's scratch file was left behind: unlink did not remove it"
+            "$TFSTOOL" ls "$DISK" 2>&1 | grep -q '^ *cno ' && fail "a C program made a file through a read-only channel"
         fi
         "$TFSTOOL" dump "$DISK" > "$LOG.dump" || fail "tfstool cannot read the volume the OS left"
     fi
