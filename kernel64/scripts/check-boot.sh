@@ -203,6 +203,25 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
             # given the same input - the program's own 60 KB of machine
             # code and a text file; and the text file alone, as standard
             # input. What the two printed must be the same bytes.
+            # The milestone: a C program compiled on this machine, put
+            # on the disk, and run four times at once. Each copy must
+            # print what the same C file prints here; and while the
+            # shell waited for them the CPUs must have done more work
+            # than one CPU can do in that time - which is what "at
+            # once" means. One and a half times is asked for, of a
+            # possible four: on one CPU it cannot be more than once.
+            if [ -n "${CPRIMES_HOST:-}" ] && grep -q 'line: "time wait"' "$LOG"; then
+                want=$("$CPRIMES_HOST" "$CPRIMES_LIMIT")
+                [ "$(grep -c "^$want\s*\$" "$LOG")" -eq 4 ] \
+                    || fail "four copies of cprimes did not each print what it prints on this machine: $want"
+                times=$(sed -n '/line: "time wait"/,$p' "$LOG" | grep -m1 "^took .* in all")
+                took=$(echo "$times" | sed 's/^took \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
+                worked=$(echo "$times" | sed 's/.*worked for \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
+                [ "${took:-0}" -gt 100 ] || fail "the four copies of cprimes were over before the shell waited for them: $times"
+                [ $((${worked:-0} * 2)) -ge $((took * 3)) ] \
+                    || fail "four programs did not run at once: $times"
+                echo "four copies of cprimes at once: $times"
+            fi
             if [ -n "${CWORDS_HOST:-}" ]; then
                 "$CWORDS_HOST" -n 25 "$CWORDS_TAAJ" "$DISK.long" > "$LOG.want"
                 get cw1 | cmp -s - "$LOG.want" || fail "\"cw1\" is not what the same C program prints on this machine from the same two files"

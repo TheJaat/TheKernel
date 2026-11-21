@@ -556,10 +556,17 @@ pub struct SystemInfo {
     pub processes: u64,
     pub threads: u64,
     pub channels: u64,
+    /// How many CPUs run programs.
+    pub cpus: u64,
+    /// Ticks in which a CPU was running something other than its idle
+    /// thread, added up over all the CPUs. `ticks` is time on the
+    /// clock; this is work done. On one CPU it can grow no faster than
+    /// `ticks`; on four, up to four times as fast.
+    pub busy_ticks: u64,
 }
 
 impl SystemInfo {
-    pub const WORDS: usize = 9;
+    pub const WORDS: usize = 11;
 
     pub fn to_words(&self) -> [u64; Self::WORDS] {
         [
@@ -572,6 +579,8 @@ impl SystemInfo {
             self.processes,
             self.threads,
             self.channels,
+            self.cpus,
+            self.busy_ticks,
         ]
     }
 
@@ -586,6 +595,8 @@ impl SystemInfo {
             processes: w[6],
             threads: w[7],
             channels: w[8],
+            cpus: w[9],
+            busy_ticks: w[10],
         }
     }
 }
@@ -735,6 +746,28 @@ pub mod block {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn system_info_survives_the_trip_through_words() {
+        // Every field different, so that two swapped ones would show.
+        use super::SystemInfo;
+        let info = SystemInfo {
+            ticks: 1,
+            ticks_per_second: 2,
+            frames_total: 3,
+            frames_free: 4,
+            heap_used: 5,
+            heap_total: 6,
+            processes: 7,
+            threads: 8,
+            channels: 9,
+            cpus: 10,
+            busy_ticks: 11,
+        };
+        let words = info.to_words();
+        assert_eq!(words, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(SystemInfo::from_words(words), info);
+    }
+
     use super::init::{Run, BUILT_IN, IMAGE};
 
     #[test]

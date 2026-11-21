@@ -14,7 +14,9 @@
 #              through QEMU's monitor (`sendkey`) - e.g. "shift-h i ret".
 #              A "/" waits until a new keyboard driver is ready (after a
 #              crash and restart) before typing on. A "~" waits until
-#              the shell has run every line typed so far. The script then waits
+#              the shell has run every line typed so far - for ten
+#              seconds at most; "~~" waits up to ninety, for a line that
+#              is meant to take a while. The script then waits
 #              for the shell to echo a line.
 #   DISK       a raw disk image, attached as a virtio block device
 #   SMP        how many CPUs the machine has (default 4)
@@ -108,8 +110,10 @@ if [ $finished -eq 0 ]; then
                 done
                 continue
             fi
-            if [ "$key" = "~" ]; then
+            if [ "$key" = "~" ] || [ "$key" = "~~" ]; then
+                # "~~" is for a line that is meant to take a while.
                 ticks=100
+                [ "$key" = "~~" ] && ticks=900
                 while [ "$(grep -c '\[shell\] ran' "$LOG")" -lt "$entered" ] && [ $ticks -gt 0 ]; do
                     sleep 0.1
                     ticks=$((ticks - 1))

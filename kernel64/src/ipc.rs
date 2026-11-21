@@ -542,6 +542,8 @@ pub fn system_info(system: Handle, out: u64) -> Result<u64, Error> {
         processes: process::all().len() as u64,
         threads: crate::threads::count() as u64,
         channels: live_channels() as u64,
+        cpus: crate::threads::cpus() as u64,
+        busy_ticks: crate::threads::busy_ticks(),
     };
     process::copy_to_user(out, &words_to_bytes(&info.to_words()))?;
     Ok(0)

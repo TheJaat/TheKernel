@@ -384,10 +384,29 @@ fn reap() {
     }
 }
 
+/// Ticks in which a CPU was found running something other than its
+/// idle thread, over all CPUs: the work done, as against the time
+/// passed. A sample, not a measurement - a thread that ran for most of
+/// a tick and slept just before its end is not counted - but over a
+/// second the samples add up to the truth.
+static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn busy_ticks() -> u64 {
+    BUSY_TICKS.load(Ordering::Relaxed)
+}
+
+/// One tick on this CPU: was it working?
+fn count_if_busy(t: &Threads) {
+    if !t.policy.is_idle(t.policy.current(arch::cpu())) {
+        BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Called by the timer interrupt of the CPU that keeps the time: `now`
 /// is the new tick count.
 pub fn on_tick(now: u64) {
     if let Some(t) = THREADS.lock().as_mut() {
+        count_if_busy(t);
         t.policy.tick(now, arch::cpu());
         // Sleepers whose time came: this CPU keeps the time for all,
         // but need not run them all.
@@ -398,6 +417,7 @@ pub fn on_tick(now: u64) {
 /// Called by the timer interrupt of every other CPU.
 pub fn on_tick_elsewhere() {
     if let Some(t) = THREADS.lock().as_mut() {
+        count_if_busy(t);
         t.policy.tick_slice(arch::cpu());
     }
 }
