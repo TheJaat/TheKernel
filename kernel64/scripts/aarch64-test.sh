@@ -10,11 +10,16 @@
 # The boots:
 #   plain      the virt machine as QEMU makes it: entered at level 1
 #   el2        entered at level 2, as real boards mostly do
+#   el2v3      the same with the newer interrupt controller, which the
+#              kernel must allow itself to use on the way down
 #   a53, max   other CPUs, with other sizes of physical address
 #   smp4       four CPUs, of which the kernel so far uses one
 #   dirty      random bytes in the memory the kernel must zero itself
 #   unnamed    a device tree that does not say which serial port to use
 #   clockless  a device tree that does not give the serial port's clock
+#   nogic      a device tree whose interrupt controller is unknown: the
+#              kernel must say it has no interrupts, and not wait for one
+#   notimer    a device tree that does not give the timer's interrupt
 #   reserved   device trees that keep some of the memory back: at the
 #              very start and the top of 512 MiB, and at the top of 6 GiB
 #   fault-*    kernels built to read through a null pointer, to read
@@ -100,8 +105,23 @@ boot() {
     need "$log" "\[tree\] cpus        $cpus, with ids \[0[, 0-9]*\]"
     need "$log" "\[tree\] serial      PL011 at 0x9000000, ${SERIAL:-named as the console}"
     need "$log" "\[tree\]             its clock ${CLOCK:-runs at 24000000 Hz}"
-    need "$log" "\[tree\] interrupts  GIC version $gic: shared part at 0x8000000, per-CPU part at 0x80[1a]0000"
-    need "$log" "\[tree\] timer       interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)"
+    if [ "$gic" = none ]; then
+        need "$log" "\[tree\] interrupts  no controller that this kernel knows"
+        need "$log" "\[irq\] the device tree describes no interrupt controller this kernel knows: no interrupts"
+        if grep -aq "\[selftest\] timer" "$log"; then fail "a timer test ran with no interrupt controller"; fi
+    else
+        need "$log" "\[tree\] interrupts  GIC version $gic: shared part at 0x8000000, per-CPU part at 0x80[1a]0000"
+        # Interrupts: the controller set up, the timer at its rate (ten
+        # ticks are 100 ms; an emulator on a busy machine may stretch
+        # them, never shorten them much), registers kept, masking kept.
+        need "$log" "\[irq\] GIC version $gic: 288 interrupt lines, all off but the timer's"
+        need "$log" "\[timer\] the CPU's own: counts at [0-9]+ Hz, interrupt 27, 100 ticks a second"
+        need "$log" "\[selftest\] timer: 10 ticks in (9[0-9]|[12][0-9][0-9]) ms \(expected 100\)"
+        need "$log" "\[selftest\] interrupts: 5 taken with a known value in each of 28 registers, none changed"
+        need "$log" "\[selftest\] interrupts masked for 35 ms: no tick arrived; unmasked: [3-9] counted at once"
+    fi
+    need "$log" "\[tree\] timer       ${TIMER:-interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)}"
+    if grep -aq "unexpected interrupt" "$log"; then fail "an interrupt arrived that nothing asked for"; fi
     need "$log" "\[tree\] firmware    called with $call"
     [ "$(grep -ac '^\[tree\] memory' "$log")" -eq 1 ] || fail "more than one memory range"
     if [ -z "${CLOCK:-}" ] && grep -aq "as a guess" "$log"; then
@@ -128,11 +148,12 @@ boot() {
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
         fail "the log has a panic, an exception or a failed check"
     fi
-    grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts\|frames free\|top of memory" "$log" | sed 's/^/  /' | cut -c1-110
+    grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts\|frames free\|top of memory\|selftest\] timer" "$log" | sed 's/^/  /' | cut -c1-110
 }
 
 boot plain 1 512 1 2 hvc
 MACHINE=,virtualization=on boot el2 2 512 1 2 smc
+MACHINE=,virtualization=on,gic-version=3 boot el2v3 2 512 1 3 smc
 # 6 GiB: the end of memory is above 4 GiB, a number that needs both of
 # the two cells the tree gives it. And five of the six are out of the
 # kernel's reach while it builds its page tables: this is the boot that
@@ -161,6 +182,13 @@ SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" boot unnamed 1 51
 "$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/clockless.dtb" pl011@9000000 clocks
 CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" boot clockless 1 512 1 2 hvc
 need "$OUT/clockless.log" "\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess"
+# The interrupt controller is one the kernel has never heard of (its
+# "compatible" is gone): no interrupts, said plainly, and no waiting.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/nogic.dtb" intc@8000000 compatible
+QEMU_ARGS="-dtb $OUT/nogic.dtb" boot nogic 1 512 1 none hvc
+# The timer's interrupts are not given: the usual number is used.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/notimer.dtb" timer interrupts
+TIMER="not described" QEMU_ARGS="-dtb $OUT/notimer.dtb" boot notimer 1 512 1 2 hvc
 # The loader keeps memory for itself: the top 16 MiB, and the first
 # 64 KiB - which is exactly where the kernel would otherwise put its
 # frame bitmap. The kernel must say so, have that much less, find its

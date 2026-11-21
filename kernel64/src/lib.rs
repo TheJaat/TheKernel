@@ -24,6 +24,7 @@ pub mod cap;
 pub mod channel;
 pub mod devicetree;
 pub mod elf;
+pub mod gic;
 pub mod ioports;
 pub mod logring;
 pub mod memory;

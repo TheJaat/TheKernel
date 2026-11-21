@@ -310,6 +310,29 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
     selftest::run();
     arch::mmu::selftest();
 
+    // Interrupts: the controller the tree describes, and the CPU's
+    // own timer.
+    kprintln!();
+    // SAFETY: once, on the only CPU running, interrupts still masked.
+    match unsafe { arch::init_interrupts(&machine) } {
+        Some(interrupts) => {
+            kprintln!(
+                "[irq] GIC version {}: {} interrupt lines, all off but the timer's",
+                interrupts.version,
+                interrupts.lines
+            );
+            kprintln!(
+                "[timer] the CPU's own: counts at {} Hz, interrupt {}, {} ticks a second",
+                interrupts.timer_hz,
+                interrupts.timer_interrupt,
+                arch::TIMER_HZ
+            );
+            arch::enable_interrupts();
+            arch::selftest_interrupts();
+        }
+        None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts"),
+    }
+
     #[cfg(feature = "fault-null")]
     {
         kprintln!();

@@ -101,6 +101,17 @@ _start:
     mov     x1, #0x33ff
     msr     cptr_el2, x1            // floating point does not trap to EL2
     msr     hstr_el2, xzr
+    // If the interrupt controller is one the CPU talks to through its
+    // own registers (GIC version 3), EL2 decides whether EL1 may use
+    // them. It may.
+    mrs     x1, id_aa64pfr0_el1
+    ubfx    x1, x1, #24, #4
+    cbz     x1, 1f
+    mrs     x1, s3_4_c12_c9_5       // ICC_SRE_EL2
+    orr     x1, x1, #0xf            // registers on, at EL2 and for EL1
+    msr     s3_4_c12_c9_5, x1
+    isb
+1:
     ldr     x1, ={control_off}
     msr     sctlr_el1, x1           // EL1 starts with its MMU off
     mov     x1, #0x3c5              // "came from": EL1, its own stack pointer, interrupts off

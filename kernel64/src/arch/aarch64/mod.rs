@@ -7,8 +7,10 @@
 //! is still to come, a piece at a time.
 
 mod entry;
+mod gic;
 pub mod mmu;
 mod pl011;
+pub mod timer;
 mod vectors;
 
 use core::arch::asm;
@@ -89,6 +91,116 @@ pub fn enable_interrupts() {
     // SAFETY: only clears the I mask bit; the vectors handle whatever
     // then arrives.
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+}
+
+/// Sleeps until an interrupt is pending. With interrupts on, it is
+/// taken at once on waking; a masked one wakes the CPU all the same.
+pub fn wait_for_interrupt() {
+    // SAFETY: wfi touches no memory and changes no register.
+    unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+}
+
+/// What `init_interrupts` set up, for the kernel to say.
+pub struct Interrupts {
+    pub version: u8,
+    pub lines: u32,
+    pub timer_interrupt: u32,
+    pub timer_hz: u64,
+}
+
+/// The virtual timer's interrupt on every machine that follows Arm's
+/// recommendation - used only if the device tree does not say.
+const USUAL_TIMER_INTERRUPT: u32 = 27;
+
+/// Sets up the interrupt controller the device tree describes and
+/// starts the timer. Interrupts stay masked: `enable_interrupts` is
+/// the caller's to call. None if the tree describes no controller this
+/// kernel knows.
+///
+/// # Safety
+/// Once, on the boot CPU, after `mm::init`, interrupts masked.
+pub unsafe fn init_interrupts(machine: &kernel64::devicetree::Machine) -> Option<Interrupts> {
+    let controller = machine.interrupt_controller?;
+    // SAFETY: the caller's promises are these functions' conditions.
+    unsafe {
+        let info = gic::init(controller);
+        // The tree's third timer interrupt is the virtual timer's.
+        let timer_interrupt = machine.timer_interrupts[2].unwrap_or(USUAL_TIMER_INTERRUPT);
+        let timer_hz = timer::init(timer_interrupt);
+        Some(Interrupts { version: info.version, lines: info.lines, timer_interrupt, timer_hz })
+    }
+}
+
+/// Interrupts that arrived and that nothing handles.
+static UNEXPECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called from the vectors when the CPU's interrupt input is raised:
+/// ask the controller which, handle, say done - until it has no more.
+fn interrupt() {
+    while let Some((id, raw)) = gic::acknowledge() {
+        if id == timer::interrupt() {
+            timer::on_interrupt();
+        } else {
+            // Nothing else is enabled, so this should not happen. If
+            // it does, say so once and silence the line: a device
+            // that keeps asking would otherwise be all the kernel
+            // ever did again.
+            UNEXPECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            gic::disable(id);
+            kprintln!("[irq] unexpected interrupt {id}: disabled");
+        }
+        gic::end(raw);
+    }
+}
+
+/// Checks interrupts on the real machine: the timer ticks at its
+/// rate, registers survive being interrupted, masked means masked,
+/// and time lost while masked is caught up.
+pub fn selftest_interrupts() {
+    use core::sync::atomic::Ordering;
+
+    // 1. Ten ticks, timed with the counter the timer compares against.
+    let first = timer::ticks();
+    while timer::ticks() == first {
+        wait_for_interrupt();
+    }
+    let (start_ticks, start) = (timer::ticks(), timer::counter());
+    while timer::ticks() < start_ticks + 10 {
+        wait_for_interrupt();
+    }
+    let ms = timer::milliseconds_since(start);
+    let expected = 10 * 1000 / timer::HZ;
+    // Generous bounds: an emulator's clocks can stretch under load.
+    assert!(ms >= expected * 9 / 10 && ms <= expected * 3, "10 timer ticks took {ms} ms, expected {expected}");
+    kprintln!("[selftest] timer: 10 ticks in {ms} ms (expected {expected})");
+
+    // 2. Interrupted five times in the middle of a loop that has a
+    // number in every register it can spare.
+    let changed = vectors::interrupted_round_trip(timer::tick_counter(), 5);
+    assert!(changed == 0, "{changed} of 28 registers were changed by interrupts");
+    kprintln!("[selftest] interrupts: 5 taken with a known value in each of 28 registers, none changed");
+
+    // 3. Masked for 35 ms: three ticks' worth. None may arrive; and
+    // once unmasked, all three must be counted - by the one interrupt
+    // that was waiting.
+    disable_interrupts();
+    let (before, start) = (timer::ticks(), timer::counter());
+    while timer::milliseconds_since(start) < 35 {
+        core::hint::spin_loop();
+    }
+    let during = timer::ticks() - before;
+    enable_interrupts();
+    let start = timer::counter();
+    while timer::ticks() < before + 3 && timer::milliseconds_since(start) < 5 {
+        core::hint::spin_loop();
+    }
+    let after = timer::ticks() - before;
+    assert!(during == 0, "{during} ticks arrived while interrupts were masked");
+    assert!(after >= 3, "after 35 ms masked only {after} ticks were counted, not the 3 that passed");
+    kprintln!("[selftest] interrupts masked for 35 ms: no tick arrived; unmasked: {after} counted at once");
+
+    let unexpected = UNEXPECTED.load(Ordering::Relaxed);
+    assert!(unexpected == 0, "{unexpected} interrupts arrived that nothing asked for");
 }
 
 /// There are no other CPUs running yet; this CPU just stops listening.

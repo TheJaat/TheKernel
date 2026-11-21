@@ -25,9 +25,13 @@ mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub use self::aarch64::{
-    breakpoint, console_write, console_write_bytes, device_tree, disable_interrupts, halt_forever, init_cpu,
-    init_early_console, mmu, report, restore_interrupts, stop_other_cpus,
+    breakpoint, console_write, console_write_bytes, device_tree, disable_interrupts, enable_interrupts, halt_forever,
+    init_cpu, init_early_console, init_interrupts, mmu, report, restore_interrupts, selftest_interrupts, stop_other_cpus,
 };
+
+/// Timer interrupts per second.
+#[cfg(target_arch = "aarch64")]
+pub use self::aarch64::timer::HZ as TIMER_HZ;
 
 #[cfg(all(target_arch = "aarch64", feature = "fault-tests"))]
 pub use self::aarch64::fault_tests;

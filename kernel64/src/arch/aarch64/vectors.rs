@@ -24,9 +24,9 @@
 //! with, notes which slot it is, and joins the common code, which saves
 //! the rest into a `Frame` and calls `exception` below.
 //!
-//! For now exactly one exception is expected: the breakpoint that
-//! proves this path works. Everything else is reported and the kernel
-//! stops.
+//! Two things are expected: the breakpoint that proves this path
+//! works, and interrupts, which are handed to `super::interrupt`.
+//! Everything else is reported and the kernel stops.
 
 use core::arch::{asm, global_asm};
 
@@ -166,12 +166,53 @@ exception_round_trip:
     ldp     x19, x20, [sp, #16]
     ldp     x29, x30, [sp], #96
     ret
+
+    // u64 interrupt_round_trip(const u64 *ticks, u64 wait)
+    //
+    // The same idea for interrupts: register n gets 0x900 + n, and
+    // this spins until *ticks has grown by `wait` - so that many
+    // interrupts were taken somewhere in the loop - then counts the
+    // registers that changed. x0, x1 and x2 are the loop's own; the
+    // other 28 are checked.
+    .global interrupt_round_trip
+interrupt_round_trip:
+    stp     x29, x30, [sp, #-96]!
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+    stp     x25, x26, [sp, #64]
+    stp     x27, x28, [sp, #80]
+    ldr     x2, [x0]
+    add     x1, x2, x1              // the tick count to wait for
+    .irp    n, 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+    mov     x\n, #(0x900 + \n)
+    .endr
+2:
+    ldr     x2, [x0]
+    cmp     x2, x1
+    b.lo    2b
+    mov     x0, #0
+    .irp    n, 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+    cmp     x\n, #(0x900 + \n)
+    cinc    x0, x0, ne
+    .endr
+    ldp     x27, x28, [sp, #80]
+    ldp     x25, x26, [sp, #64]
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #96
+    ret
 "#
 );
 
 extern "C" {
     /// The table above. Only its address is used.
     static exception_vectors: u8;
+
+    /// See the assembly: how many registers changed while interrupts
+    /// came and went.
+    fn interrupt_round_trip(ticks: *const u64, wait: u64) -> u64;
 
     /// See the assembly: how many registers an exception changed.
     fn exception_round_trip() -> u64;
@@ -185,6 +226,17 @@ pub fn round_trip() -> u64 {
     // vectors are loaded (`init` comes first), so the breakpoint
     // returns.
     unsafe { exception_round_trip() }
+}
+
+/// Waits for `wait` more timer ticks with a known value in 28
+/// registers, and returns how many hold something else afterwards.
+/// The breakpoint check is taken at one chosen instruction; an
+/// interrupt arrives wherever the CPU happens to be.
+pub fn interrupted_round_trip(ticks: &core::sync::atomic::AtomicU64, wait: u64) -> u64 {
+    // SAFETY: the function keeps to the calling convention and only
+    // reads the counter, which outlives it; interrupts are on (the
+    // caller's business - or this never returns).
+    unsafe { interrupt_round_trip(ticks.as_ptr(), wait) }
 }
 
 /// Points this CPU at the vector table.
@@ -219,6 +271,12 @@ fn fault_address() -> u64 {
 /// of the vector slot (0 to 15) and what was saved.
 #[no_mangle]
 extern "C" fn exception(vector: u64, frame: &mut Frame) {
+    // Slots 1, 5, 9 and 13 are interrupts.
+    if vector % 4 == 1 {
+        super::interrupt();
+        return;
+    }
+
     let syndrome = syndrome();
     let synchronous = vector.is_multiple_of(4);
 
