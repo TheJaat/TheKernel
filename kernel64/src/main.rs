@@ -139,7 +139,39 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     #[cfg(feature = "fault-tests")]
     run_fault_test();
 
+    #[cfg(feature = "big-image")]
+    check_big_image();
+
     idle()
+}
+
+/// Only in a `big-image` build: the kernel carries 768 KiB it does not
+/// need, which pushes its end above 2 MiB - where the BIOS loader used
+/// to refuse it. If the loader copied all of it to the right place,
+/// every byte is what the build script wrote.
+#[cfg(feature = "big-image")]
+fn check_big_image() {
+    static BALLAST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ballast.bin"));
+    // `black_box`: the compiler must read the bytes from memory when
+    // the kernel runs, not work the answer out while compiling.
+    let ballast = core::hint::black_box(BALLAST);
+    let wrong = ballast
+        .iter()
+        .enumerate()
+        .filter(|&(i, &byte)| byte != ((i as u32).wrapping_mul(2_654_435_761) >> 13) as u8)
+        .count();
+    let start = ballast.as_ptr() as u64 - mm::KERNEL_WINDOW;
+    let end = start + ballast.len() as u64;
+    let image_end = mm::kernel_layout().data.end - mm::KERNEL_WINDOW;
+    kprintln!();
+    if wrong == 0 && image_end > 0x20_0000 {
+        kprintln!(
+            "[test] big image: the kernel ends at {image_end:#x}, above 2 MiB; {} KiB of it at {start:#x}-{end:#x} is byte for byte what was built",
+            ballast.len() / 1024
+        );
+    } else {
+        kprintln!("[test] FAILED - big image: ends at {image_end:#x}, {wrong} of {} bytes wrong", ballast.len());
+    }
 }
 
 /// Reads the MADT, or - with no usable ACPI - assumes the standard PC

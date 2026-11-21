@@ -7,4 +7,14 @@ fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg-bins=-T{dir}/linker.ld");
     println!("cargo:rerun-if-changed=linker.ld");
+
+    // For the `big-image` feature: three quarters of a megabyte that
+    // cannot be compressed away or mistaken for zeroes, and that the
+    // kernel can check byte by byte once it runs. The rule for byte `i`
+    // is repeated in main.rs.
+    if std::env::var_os("CARGO_FEATURE_BIG_IMAGE").is_some() {
+        let out = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+        let ballast: Vec<u8> = (0..768 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(format!("{out}/ballast.bin"), ballast).expect("writing the ballast");
+    }
 }

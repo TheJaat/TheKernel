@@ -83,15 +83,17 @@ SECTIONS
     __data_end = .;
     __kernel_end = .;
 
-    /* The bootloader puts the ramdisk at physical 2 MiB and refuses a
-     * kernel that reaches it - with a message on the screen and nothing
-     * on the serial port, which in a headless test is a boot that just
-     * never starts. So the limit is checked here, where it is a build
-     * error with a reason. (Raising it means moving the ramdisk and the
-     * loader's staging area: RAMDISK_LOAD_ADDRESS in the bootloader.) */
-    KERNEL_LOAD_LIMIT = 0x200000;
+    /* The BIOS bootloader reads the kernel's file to physical 3 MiB and
+     * copies the segments down from there, so it refuses a kernel that
+     * reaches 3 MiB - with a message on the screen and nothing on the
+     * serial port, which in a headless test is a boot that just never
+     * starts. So the limit is checked here, where it is a build error
+     * with a reason. (It was 2 MiB until the kernel reached it. Raising
+     * it again means moving that staging buffer: KERNEL_LOAD_START in
+     * the bootloader, which the 32-bit kernel's loading shares.) */
+    KERNEL_LOAD_LIMIT = 0x300000;
     ASSERT(__kernel_end - KERNEL_WINDOW <= KERNEL_LOAD_LIMIT,
-        "the kernel image ends above 2 MiB, where the bootloader refuses to load it - see linker.ld")
+        "the kernel image ends above 3 MiB, where the bootloader refuses to load it - see linker.ld")
 
     /* Unwind tables are for panic=unwind, which this kernel never uses. */
     /DISCARD/ :

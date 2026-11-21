@@ -37,6 +37,11 @@ fault-stack = ["fault-tests"]       # overflow the boot stack
 fault-thread-stack = ["fault-tests"] # overflow a kernel thread's stack
 fault-init = ["fault-tests"]         # init is a program that ends
 
+# A kernel made deliberately large, so that it ends well above 2 MiB:
+# checks that the bootloaders load all of a big kernel, and correctly.
+# Never in a normal build; `make big64-test` builds and boots it.
+big-image = []
+
 # No unwinding: there is nothing to unwind into. A panic prints and halts.
 [profile.dev]
 panic = "abort"
