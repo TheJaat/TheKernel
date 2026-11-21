@@ -1366,6 +1366,21 @@ pub mod net {
     pub const INFO: u8 = 1;
     pub const PING: u8 = 2;
     pub const UDP_BIND: u8 = 3;
+    /// `[TCP_CONNECT, address (4 bytes), port (2, low byte first)]`
+    /// with two handles: where to answer, and one end of a channel -
+    /// the connection, if it is made (see "streams" below). The answer
+    /// comes when it is made, or cannot be: `[OK, port here (2)]`.
+    pub const TCP_CONNECT: u8 = 4;
+    /// `[TCP_LISTEN, port (2)]` with two handles: where to answer, and
+    /// one end of a channel - the listener. Answer: `[OK, port (2)]`.
+    /// On the listener's channel the program says `[LISTENER_ACCEPT]`
+    /// for each connection it is ready to take, and each connection
+    /// made to the port arrives as a message: who it is with
+    /// (`[address, port]`) and a handle - one end of the connection's
+    /// own channel. Closing the listener's channel ends the listening.
+    pub const TCP_LISTEN: u8 = 5;
+    /// On a listener's channel, from the program: "one more".
+    pub const LISTENER_ACCEPT: u8 = 1;
 
     pub const OK: u8 = 0;
     pub const BAD_REQUEST: u8 = 1;
@@ -1381,6 +1396,10 @@ pub mod net {
     pub const TOO_BIG: u8 = 6;
     /// The address is nowhere a packet can be sent.
     pub const NO_ROUTE: u8 = 7;
+    /// The machine answered: nothing is listening on that port.
+    pub const REFUSED: u8 = 8;
+    /// The other side cut the connection off, or forgot it.
+    pub const RESET: u8 = 9;
 
     pub fn describe(status: u8) -> &'static str {
         match status {
@@ -1391,6 +1410,8 @@ pub mod net {
             NO_ROOM => "the network service has no room for more",
             TOO_BIG => "more than one packet carries",
             NO_ROUTE => "that address is not on this network, and there is no way out of it",
+            REFUSED => "nothing is listening on that port there",
+            RESET => "the other side cut the connection off",
             _ => "the network service did not understand",
         }
     }
@@ -1419,6 +1440,41 @@ pub mod net {
     pub fn datagram_decode(message: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
         let (header, data) = message.split_at_checked(DATAGRAM_HEADER)?;
         Some(([header[0], header[1], header[2], header[3]], u16::from_le_bytes([header[4], header[5]]), data))
+    }
+
+    // Streams: what travels on a TCP connection's channel, in both
+    // directions. The first byte of each message says what it is.
+
+    /// `[STREAM_DATA, bytes...]`: the next bytes of the stream. From a
+    /// program: to be sent. To a program: what arrived.
+    pub const STREAM_DATA: u8 = 1;
+    /// `[STREAM_END]`: no more will come this way. From a program: it
+    /// has no more to send (the other direction stays open). To a
+    /// program: the other side has no more to send.
+    pub const STREAM_END: u8 = 2;
+    /// `[STREAM_FAILED, status]`, to a program only, and the last
+    /// message there will be: the connection ended, and not by both
+    /// sides saying so.
+    pub const STREAM_FAILED: u8 = 3;
+    /// The most bytes in one STREAM_DATA message.
+    pub const STREAM_DATA_MAX: usize = super::MESSAGE_MAX as usize - 1;
+
+    /// How long a program should be prepared to wait for the answer to
+    /// TCP_CONNECT, in ticks: the SYN is sent five times over 31
+    /// seconds before the service gives up.
+    pub const CONNECT_WAIT: u64 = 3500;
+
+    pub fn connect_encode(to: [u8; 4], port: u16) -> [u8; 7] {
+        let [low, high] = port.to_le_bytes();
+        [TCP_CONNECT, to[0], to[1], to[2], to[3], low, high]
+    }
+
+    /// None if `request` is not a TCP_CONNECT, or names port 0.
+    pub fn connect_decode(request: &[u8]) -> Option<([u8; 4], u16)> {
+        match *request {
+            [TCP_CONNECT, a, b, c, d, low, high] if (low, high) != (0, 0) => Some(([a, b, c, d], u16::from_le_bytes([low, high]))),
+            _ => None,
+        }
     }
 
     /// The most data a ping carries, and the longest it waits (ticks).
@@ -1478,7 +1534,7 @@ pub mod net {
     }
 
     /// `Info::counters`, in this order.
-    pub const COUNTERS: usize = 11;
+    pub const COUNTERS: usize = 14;
     pub const FRAMES_IN: usize = 0;
     pub const FRAMES_OUT: usize = 1;
     /// "Who has this address?" answered.
@@ -1498,6 +1554,12 @@ pub mod net {
     /// Datagrams a program had no room for, or that were too long for
     /// a message.
     pub const NOT_TAKEN: usize = 10;
+    /// TCP segments that arrived whole.
+    pub const SEGMENTS_IN: usize = 11;
+    /// TCP segments sent a second time.
+    pub const SEGMENTS_AGAIN: usize = 12;
+    /// TCP segments answered "no such connection here".
+    pub const SEGMENTS_REFUSED: usize = 13;
 
     impl Info {
         pub const SIZE: usize = 6 + 4 + 1 + 4 + COUNTERS * 8;
@@ -1530,6 +1592,25 @@ pub mod net {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_connect_request_there_and_back() {
+            let request = connect_encode([10, 0, 2, 2], 8080);
+            assert_eq!(request, [TCP_CONNECT, 10, 0, 2, 2, 0x90, 0x1F]);
+            assert_eq!(connect_decode(&request), Some(([10, 0, 2, 2], 8080)));
+            assert_eq!(connect_decode(&request[..6]), None);
+            assert_eq!(connect_decode(&[TCP_CONNECT, 10, 0, 2, 2, 0x90, 0x1F, 0]), None);
+            assert_eq!(connect_decode(&[TCP_LISTEN, 10, 0, 2, 2, 0x90, 0x1F]), None);
+            assert_eq!(connect_decode(&connect_encode([10, 0, 2, 2], 0)), None, "there is no port 0");
+            // A stream's message is a whole message: one byte of kind,
+            // the rest data.
+            assert_eq!(STREAM_DATA_MAX, 1023);
+            // Every status has words of its own.
+            let words: [&str; 10] = core::array::from_fn(|status| describe(status as u8));
+            for (n, text) in words.iter().enumerate() {
+                assert!(!words[..n].contains(text), "{text}");
+            }
+        }
 
         #[test]
         fn a_datagram_message_there_and_back() {
