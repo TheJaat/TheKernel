@@ -14,9 +14,17 @@ pub const HZ: u64 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// A timer interrupt, on whichever CPU it arrived. Every CPU has its
+/// own timer, at the same rate, for its own time slices. Time itself -
+/// the tick count, and waking sleepers - is kept by the boot CPU alone:
+/// four CPUs counting would make a second four times too short.
 pub fn timer_tick() {
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::threads::on_tick(now);
+    if crate::arch::cpu() == 0 {
+        let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::threads::on_tick(now);
+    } else {
+        crate::threads::on_tick_elsewhere();
+    }
 }
 
 /// The last thing every interrupt does, after acknowledging it: if the

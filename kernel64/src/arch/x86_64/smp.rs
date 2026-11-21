@@ -32,10 +32,11 @@
 //! The firmware's name for these CPUs is "application processors" (AP),
 //! and for the first one "bootstrap processor" (BSP); hence `ap_main`.
 //!
-//! What the started CPUs do afterwards is, so far, nothing: they prove
-//! they can run kernel code alongside the boot CPU (`count_together`),
-//! and then halt. Running threads on them is the scheduler's business,
-//! and the scheduler still believes in one CPU.
+//! What the started CPUs do afterwards: they prove they can run kernel
+//! code alongside the boot CPU (`count_together`), and wait. When the
+//! boot CPU has set up threads and calls `release`, each starts its own
+//! timer and becomes its idle thread - from then on it runs whatever
+//! the scheduler gives it (threads.rs).
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -47,7 +48,7 @@ use alloc::vec::Vec;
 use kernel64::acpi::Madt;
 use kernel64::memory::addr::{phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE};
 use kernel64::paging::{Flags, PageSize, PageTables};
-use kernel64::smp::{self, Cpu, MAX_CPUS};
+use kernel64::smp::{self, MAX_CPUS};
 use kernel64::sync::SpinLock;
 
 use super::gdt::{self, CpuTables};
@@ -204,8 +205,22 @@ struct Start {
     double_fault_stack: u64,
     stack_top: u64,
     control: Control,
-    awake: AtomicBool,
+    /// STARTING until the new CPU says AWAKE or the boot CPU, tired of
+    /// waiting, says ABANDONED. Whoever changes it first wins, so the
+    /// two always agree on whether this CPU is in use.
+    state: AtomicUsize,
 }
+
+const STARTING: usize = 0;
+const AWAKE: usize = 1;
+const ABANDONED: usize = 2;
+
+/// How many CPUs besides the boot CPU are awake.
+static OTHERS: AtomicUsize = AtomicUsize::new(0);
+/// Set by `release`: the scheduler is ready for them.
+static RELEASED: AtomicBool = AtomicBool::new(false);
+/// How many of them have started their timers and begun to idle.
+static IDLING: AtomicUsize = AtomicUsize::new(0);
 
 /// Writes `value` into the copy of the trampoline at `page`, at the
 /// field whose place in the original is `field`.
@@ -276,9 +291,13 @@ pub unsafe fn start(madt: &Madt) {
     set_field(page, &raw const ap_trampoline_efer, control.efer & !EFER_LMA);
     set_field(page, &raw const ap_trampoline_entry, ap_main as *const () as u64);
 
-    let mut awake: Vec<Cpu> = alloc::vec![plan.cpus[0]];
+    // The kernel's numbers of the CPUs that woke, in order: CPU n is
+    // the nth to answer, so the numbers have no holes even if a CPU
+    // the firmware listed stays silent.
+    let mut awake: Vec<usize> = alloc::vec![0];
     let mut silent = 0;
-    for &cpu in &plan.cpus[1..] {
+    for &listed in &plan.cpus[1..] {
+        let cpu = smp::Cpu { index: awake.len(), apic_id: listed.apic_id };
         // Two stacks of its own, each with a guard page below it: the
         // one it runs on, and the one for a double fault.
         let (Some(stack), Some(double_fault_stack)) = (mm::allocate_stack(), mm::allocate_stack()) else {
@@ -291,7 +310,7 @@ pub unsafe fn start(madt: &Madt) {
             double_fault_stack: double_fault_stack.top(),
             stack_top: stack.top(),
             control,
-            awake: AtomicBool::new(false),
+            state: AtomicUsize::new(STARTING),
         }));
         // The CPU keeps its stacks for as long as the machine is on.
         core::mem::forget(stack);
@@ -311,17 +330,20 @@ pub unsafe fn start(madt: &Madt) {
         }
 
         let mut waited = 0;
-        while !start.awake.load(Ordering::Acquire) && waited < START_TIMEOUT_US {
+        while start.state.load(Ordering::Acquire) == STARTING && waited < START_TIMEOUT_US {
             super::delay_us(50);
             waited += 50;
         }
-        if start.awake.load(Ordering::Acquire) {
-            awake.push(cpu);
+        // Giving up is a compare-and-exchange: it fails if the CPU
+        // answered in this very moment, and then it did answer.
+        if start.state.compare_exchange(STARTING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            awake.push(cpu.index);
         } else {
-            kprintln!("[smp] CPU {} (APIC id {}) did not answer: left out", cpu.index, cpu.apic_id);
+            kprintln!("[smp] the CPU with APIC id {} did not answer: left out", cpu.apic_id);
             silent += 1;
         }
     }
+    OTHERS.store(awake.len() - 1, Ordering::Release);
 
     if silent == 0 {
         mm::with_frames(|frames| climb.destroy(frames));
@@ -334,14 +356,39 @@ pub unsafe fn start(madt: &Madt) {
         if !others.is_empty() {
             others.push_str(", ");
         }
-        others.push_str(&alloc::format!("{}", cpu.index));
+        others.push_str(&alloc::format!("{cpu}"));
     }
-    kprintln!(
-        "[smp] {} CPUs awake: CPU 0 runs everything; CPU {others} started through the page at {page:#x}",
-        awake.len()
-    );
-    if awake.len() > 1 {
-        count_together(awake.len());
+    if awake.len() == 1 {
+        kprintln!("[smp] no other CPU answered: staying with 1 CPU");
+        return;
+    }
+    kprintln!("[smp] {} CPUs awake: CPU {others} started through the page at {page:#x}", awake.len());
+    count_together(awake.len());
+}
+
+/// Lets the started CPUs into the scheduler: gives it an idle thread
+/// for each, and tells them. Returns when every one has its timer
+/// running. Before this they wait; after it, any thread may run on any
+/// of them.
+///
+/// Called once by the boot CPU, after `threads::init`.
+pub fn release() {
+    let others = OTHERS.load(Ordering::Acquire);
+    if others == 0 {
+        return;
+    }
+    crate::threads::add_cpus(others);
+    RELEASED.store(true, Ordering::Release);
+    let mut waited = 0;
+    while IDLING.load(Ordering::Acquire) < others && waited < START_TIMEOUT_US {
+        super::delay_us(50);
+        waited += 50;
+    }
+    let idling = IDLING.load(Ordering::Acquire);
+    if idling == others {
+        kprintln!("[smp] {} CPUs run threads: each has its own timer and idle thread, and all take from one queue", others + 1);
+    } else {
+        kprintln!("[smp] FAILED - only {idling} of {others} started CPUs joined the scheduler");
     }
 }
 
@@ -372,10 +419,22 @@ extern "C" fn ap_main(start: &'static Start) -> ! {
         start.stack_top
     );
     // Release: the boot CPU, seeing this, also sees everything above.
-    start.awake.store(true, Ordering::Release);
+    if start.state.compare_exchange(STARTING, AWAKE, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        // The boot CPU gave up waiting and has gone on without this
+        // one; its number may be another CPU's by now.
+        kprintln!("[smp] ...too late: the boot CPU had stopped waiting. Halted.");
+        super::halt_forever();
+    }
 
     count();
-    super::halt_forever()
+    while !RELEASED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    platform::start_timer_here();
+    IDLING.fetch_add(1, Ordering::Release);
+    // Interrupts are still off; the idle loop turns them on as it
+    // halts, and the first timer tick may already bring a thread.
+    crate::threads::run_idle()
 }
 
 // ---- proof that they run at the same time --------------------------------

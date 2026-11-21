@@ -41,6 +41,15 @@ else
 fi
 ! grep -qE "\[smp\].*(FAILED|did not answer|not started|staying with 1 CPU)" "$LOG" || fail "a CPU could not be started"
 grep -q "\[selftest\] threads: sleep" "$LOG"      || fail "threads self-test"
+if [ "$CPUS" -eq 1 ]; then
+    grep -q "\[selftest\] smp: 1 CPU; 40000 hand-offs" "$LOG" || fail "SMP self-test (one CPU)"
+else
+    # The started CPUs must join the scheduler, and threads must then
+    # really be seen running on every one of them.
+    grep -q "\[smp\] $CPUS CPUs run threads" "$LOG"  || fail "the started CPUs did not join the scheduler"
+    grep -q "\[selftest\] smp: threads ran on all $CPUS CPUs at once; 40000 hand-offs between two threads, none lost; nothing leaked" "$LOG" \
+        || fail "SMP self-test"
+fi
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
 # The program that reads through GS must fault at its own offset from
 # address 0 - twice, the self-test runs everything twice - and not in

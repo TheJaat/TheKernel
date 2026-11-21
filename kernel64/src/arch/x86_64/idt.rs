@@ -259,7 +259,12 @@ pub unsafe fn init() {
     let stubs = &raw const isr_stub_table;
 
     for vector in 0..32 {
-        let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
+        // The double fault and the NMI get a stack of their own: both can
+        // arrive when the current stack is not one to push onto - the
+        // first by definition, the second because nothing holds it back,
+        // not even the instant after `syscall` when RSP is still the
+        // program's. They share one: each is the end of this CPU.
+        let ist = if vector == 8 || vector == 2 { DOUBLE_FAULT_IST } else { 0 };
         (*idt)[vector] = gate((*stubs)[vector], ist);
     }
     let first = &raw const irq_stubs as u64;
@@ -320,6 +325,7 @@ const NAMES: [&str; 32] = [
     "reserved",
 ];
 
+const NMI: u64 = 2;
 const BREAKPOINT: u64 = 3;
 const DOUBLE_FAULT: u64 = 8;
 const PAGE_FAULT: u64 = 14;
@@ -368,6 +374,12 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         }
         return;
     }
+    // The kernel is stopping, on another CPU, and this is how it tells
+    // the rest (arch::stop_other_cpus). Nothing to say, nothing to
+    // touch - not even GS, which may be a program's: just stop.
+    if vector == NMI && super::stopping() {
+        super::halt_forever();
+    }
     let name = NAMES.get(frame.vector as usize).copied().unwrap_or("unknown");
 
     if frame.vector == BREAKPOINT {
@@ -385,12 +397,19 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         crate::process::kill_current(name);
     }
 
-    // About to stop for good: if the fault came while the console was
-    // locked, take it anyway, or the report would deadlock.
+    // About to stop for good, and so must every other CPU.
+    super::stop_other_cpus();
+    // If the fault came while the console was locked, take it anyway,
+    // or the report would deadlock.
     // SAFETY: nothing runs after this handler.
     unsafe { crate::console::break_lock() };
     kprintln!();
     kprintln!("*** CPU EXCEPTION {}: {name}", frame.vector);
+    // Which CPU, from the hardware and not from GS: a fault can strike
+    // where GS is not yet, or no longer, the kernel's.
+    if let Some(id) = super::apic::local_id_if_mapped() {
+        kprintln!("    on the CPU with APIC id {id}");
+    }
     if (frame.vector == PAGE_FAULT || frame.vector == DOUBLE_FAULT) && is_stack_overflow() {
         kprintln!("    kernel stack overflow (hit the guard page at {:#x})", read_cr2());
     }

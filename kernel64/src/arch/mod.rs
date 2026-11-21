@@ -9,8 +9,8 @@ mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::{
-    breakpoint, console_write, console_write_bytes, disable_interrupts, enable_interrupts, halt_forever, init_cpu,
-    init_early_console, mmu, pci, platform, context, syscall, restore_interrupts, set_io_bitmap, smp, tsc,
+    breakpoint, console_write, console_write_bytes, cpu, disable_interrupts, enable_interrupts, halt_forever, init_cpu,
+    init_early_console, mmu, pci, platform, context, syscall, restore_interrupts, set_io_bitmap, smp, stop_other_cpus, tsc,
     wait_for_interrupt,
 };
 

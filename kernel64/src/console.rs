@@ -104,7 +104,20 @@ pub fn write_queued() -> bool {
 /// # Safety
 /// Only on the way to halting: whoever held the lock never runs again.
 pub unsafe fn break_lock() {
-    QUEUE.force_unlock();
+    // With several CPUs the lock may be held by another one, which is
+    // alive and about to let go: give it a moment, so that its line and
+    // the report do not come out letter by letter through each other.
+    // If the holder is this CPU - the fault struck while it was
+    // printing - nobody will ever let go, and the wait runs out.
+    for _ in 0..2_000_000 {
+        if !QUEUE.is_locked() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if QUEUE.is_locked() {
+        QUEUE.force_unlock();
+    }
     // The kernel is stopping: what it says now goes on the screen too.
     crate::lastwords::begin();
 }

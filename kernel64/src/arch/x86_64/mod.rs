@@ -51,6 +51,14 @@ pub fn init_cpu() {
     }
 }
 
+/// The kernel's number for the CPU this runs on; 0 is the boot CPU.
+///
+/// Only as good as the moment it is asked: with interrupts on, the
+/// thread asking may be on another CPU by the time it uses the answer.
+pub fn cpu() -> usize {
+    percpu::index()
+}
+
 /// Whether this CPU accepts interrupts now (RFLAGS.IF).
 pub fn interrupts_enabled() -> bool {
     let flags: u64;
@@ -112,6 +120,36 @@ pub fn delay_us(microseconds: u64) {
 pub fn breakpoint() {
     // SAFETY: int3 only raises vector 3, whose handler returns.
     unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
+}
+
+/// Set once, by the CPU that is stopping the system.
+static STOPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stops every other CPU, where it stands, for good. For the CPU that
+/// is about to report why the kernel cannot go on: the others must not
+/// carry on meanwhile - running programs, printing over the report,
+/// repainting the screen it is written on.
+///
+/// The others are sent a non-maskable interrupt, and halt in its
+/// handler (idt.rs). If another CPU is already stopping the system,
+/// this one halts instead: one report, not two through each other.
+pub fn stop_other_cpus() {
+    use core::sync::atomic::Ordering;
+    disable_interrupts();
+    if STOPPING.swap(true, Ordering::AcqRel) {
+        halt_forever();
+    }
+    apic::nmi_others();
+    // Long enough for them to get there. Not `delay_us`: it needs the
+    // clock's speed, and this may be called before that is measured.
+    for _ in 0..200_000 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether some CPU is stopping the system.
+pub fn stopping() -> bool {
+    STOPPING.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Stops this CPU for good. `hlt` waits for an interrupt; with

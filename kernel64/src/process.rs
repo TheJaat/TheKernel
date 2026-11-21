@@ -351,7 +351,7 @@ pub fn set_essential(process: &Process) {
 /// restarted, because the thing that restarts is what ended. So the
 /// kernel stops while the reason is still the last thing said.
 fn stop_the_system(name: &str, how: core::fmt::Arguments) -> ! {
-    crate::arch::disable_interrupts();
+    crate::arch::stop_other_cpus();
     // SAFETY: halting right after; whoever held the console never resumes.
     unsafe { crate::console::break_lock() };
     kprintln!();

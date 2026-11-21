@@ -100,8 +100,8 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     arch::enable_interrupts();
     selftest::timer();
 
-    // The other CPUs: woken, checked, and - until the scheduler knows
-    // what to do with them - put to rest.
+    // The other CPUs: woken and checked. They wait until there are
+    // threads for them to run.
     // SAFETY: once, on the boot CPU, after platform::init, before any
     // process exists.
     unsafe { arch::smp::start(&madt) };
@@ -109,7 +109,14 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     // Threads: the code running now becomes thread 1, "boot"; thread 0
     // is the idle thread.
     threads::init();
+    // Still on one CPU: these checks are about taking turns, and turns
+    // are only taken where there is one CPU to share.
     selftest::threads();
+
+    // Now all of them. Everything after this runs on whichever CPU is
+    // free.
+    arch::smp::release();
+    selftest::smp();
 
     // User mode: programs in their own address spaces, in ring 3.
     selftest::user();
@@ -353,7 +360,7 @@ fn report(info: &BootInfo) {
 /// and stop. `PanicInfo` formats as the location plus the message.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    arch::disable_interrupts();
+    arch::stop_other_cpus();
     // SAFETY: halting right after; whoever held the console never resumes.
     unsafe { console::break_lock() };
     kprintln!();

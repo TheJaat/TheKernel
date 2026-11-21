@@ -51,6 +51,13 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Whether someone holds the lock at this moment. By the time the
+    /// answer is used it may be out of date; good for waiting a little
+    /// and for nothing else.
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+
     /// Releases the lock whoever holds it.
     ///
     /// # Safety

@@ -224,13 +224,98 @@ pub fn threads() {
         threads::yield_now(); // let the last exited thread be reaped
     };
     churn();
-    let frames = mm::with_memory(|_, f| f.free_frames());
+    let frames = mm::unused_frames();
     let slots = mm::stack_slots_used();
     churn();
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "thread churn leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "thread churn leaked frames");
     assert_eq!(mm::stack_slots_used(), slots, "thread churn leaked stack slots");
     assert_eq!(threads::count(), 2, "only boot and idle should remain");
     kprintln!("[selftest] threads: sleep(5) took {slept} ticks; 200 threads spawned and reaped, nothing leaked");
+}
+
+/// Several CPUs: threads really run on all of them, a wake-up sent from
+/// one CPU to a thread going to sleep on another is never lost, and
+/// threads that end on any CPU give everything back.
+pub fn smp() {
+    use crate::threads::WaitQueue;
+    use core::sync::atomic::AtomicUsize;
+
+    let cpus = threads::cpus();
+    let work = || {
+        // 1. One thread for each CPU, none of which ever yields. Each
+        // notes which CPUs it finds itself on. One CPU could run them
+        // all in turn; but then only one CPU would ever be noted.
+        let seen = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..cpus)
+            .map(|_| {
+                let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+                threads::spawn("spinner", move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        seen.fetch_or(1 << arch::cpu(), Ordering::Relaxed);
+                        core::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let everyone = (1u64 << cpus) - 1;
+        let start = interrupts::ticks();
+        while seen.load(Ordering::Relaxed) != everyone && interrupts::ticks() < start + 200 {
+            threads::sleep(1);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for id in spinners {
+            threads::join(id);
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), everyone, "threads did not run on every CPU");
+
+        // 2. Two threads hand a token back and forth. Each waits for its
+        // turn - sometimes spinning a little first, so that it is still
+        // deciding to sleep when the other wakes it - takes it, and
+        // wakes the other. One lost wake-up and both sleep for ever.
+        const HANDOFFS: usize = 20_000;
+        struct Token {
+            turn: AtomicUsize,
+            passed: AtomicUsize,
+            queue: WaitQueue,
+        }
+        let token = Arc::new(Token { turn: AtomicUsize::new(0), passed: AtomicUsize::new(0), queue: WaitQueue::new() });
+        let players: Vec<_> = (0..2usize)
+            .map(|me| {
+                let token = Arc::clone(&token);
+                threads::spawn("handoff", move || {
+                    for round in 0..HANDOFFS / 2 {
+                        for _ in 0..round % 97 {
+                            if token.turn.load(Ordering::Acquire) == me {
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
+                        let mine = token.queue.wait_while(|| token.turn.load(Ordering::Acquire) != me);
+                        assert!(mine, "a kernel thread's wait was cut short");
+                        token.passed.fetch_add(1, Ordering::Relaxed);
+                        // The change first, the wake-up after.
+                        token.turn.store(1 - me, Ordering::Release);
+                        token.queue.wake_all();
+                    }
+                })
+            })
+            .collect();
+        for id in players {
+            threads::join(id);
+        }
+        assert_eq!(token.passed.load(Ordering::Relaxed), HANDOFFS);
+    };
+
+    work();
+    let frames = mm::unused_frames();
+    work();
+    assert_eq!(mm::unused_frames(), frames, "threads on several CPUs leaked frames");
+    if cpus == 1 {
+        kprintln!("[selftest] smp: 1 CPU; 40000 hand-offs between two threads, none lost; nothing leaked");
+    } else {
+        kprintln!("[selftest] smp: threads ran on all {cpus} CPUs at once; 40000 hand-offs between two threads, none lost; nothing leaked");
+    }
 }
 
 /// User mode: four programs, run at once. Two follow the rules and must
@@ -280,15 +365,15 @@ pub fn user() {
     // A second round must leave memory exactly as the first did: every
     // page of every process - code, data, stack, page tables - returned.
     threads::yield_now(); // let the last exited thread be reaped
-    let frames = mm::with_memory(|_, f| f.free_frames());
+    let frames = mm::unused_frames();
     assert_eq!(run_all(), expected);
     threads::yield_now();
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "processes leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "processes leaked frames");
     // Files that are not programs - which the disk may now hold - are
     // refused, and cost nothing: text, and a program cut in half.
     assert!(process::load("text", &[b'x'; 200]).is_err());
     assert!(process::load("half", &programs::HELLO[..programs::HELLO.len() / 2]).is_err());
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "refused programs leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "refused programs leaked frames");
     kprintln!("[selftest] user: hello exited 42, spin and heapcheck exited 0, peek, cli, port, memro and gs were killed; 16 processes, nothing leaked");
 }
 
@@ -314,10 +399,10 @@ pub fn ipc() {
 
     run();
     threads::yield_now();
-    let frames = mm::with_memory(|_, f| f.free_frames());
+    let frames = mm::unused_frames();
     run();
     threads::yield_now();
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "IPC leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "IPC leaked frames");
     assert_eq!(ipc::live_channels(), 0, "channels leaked");
     kprintln!("[selftest] ipc: echo service and client - rights, transfer, backpressure, crash isolation; 0 channels left");
 }
@@ -349,10 +434,10 @@ pub fn files() {
 
     run();
     threads::yield_now();
-    let frames = mm::with_memory(|_, f| f.free_frames());
+    let frames = mm::unused_frames();
     run();
     threads::yield_now();
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "the file service leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "the file service leaked frames");
     assert_eq!(ipc::live_channels(), 0, "channels leaked");
     kprintln!("[selftest] files: fs and fscheck, twice - every check passed, 0 channels and no frames left");
 }
@@ -399,10 +484,10 @@ pub fn kill() {
 
     run();
     threads::yield_now(); // let the last exited thread be reaped
-    let frames = mm::with_memory(|_, f| f.free_frames());
+    let frames = mm::unused_frames();
     run();
     threads::yield_now();
-    assert_eq!(mm::with_memory(|_, f| f.free_frames()), frames, "killed processes leaked frames");
+    assert_eq!(mm::unused_frames(), frames, "killed processes leaked frames");
     assert_eq!(ipc::live_channels(), 0, "killed processes leaked channels");
     kprintln!("[selftest] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked");
 }

@@ -34,6 +34,11 @@ impl<T> IrqLock<T> {
         IrqLockGuard { guard: ManuallyDrop::new(self.inner.lock()), were_enabled }
     }
 
+    /// Whether someone holds the lock at this moment.
+    pub fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+
     /// See `SpinLock::force_unlock`.
     pub unsafe fn force_unlock(&self) {
         self.inner.force_unlock();

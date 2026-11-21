@@ -37,13 +37,31 @@ FINISHED="\[kernel\] idle|KERNEL PANIC|CPU EXCEPTION|THE SYSTEM HAS STOPPED"
 FINISHED=${FINISHED_ONLY:-$FINISHED}
 MONITOR="$LOG.monitor"
 
-rm -f "$LOG" "$LOG.ppm" "$LOG.hang.ppm" "$LOG.qemu" "$MONITOR"
-: > "$LOG"
-qemu-system-x86_64 -m 512M -cdrom "$ISO" -boot d \
-    -smp "${SMP:-4}" -display none -no-reboot -serial "file:$LOG" \
-    -monitor "unix:$MONITOR,server,nowait" \
-    -d cpu_reset -D "$LOG.qemu" $DISK_ARGS ${QEMU_ARGS:-} &
-qemu=$!
+start_qemu() {
+    rm -f "$LOG" "$LOG.ppm" "$LOG.hang.ppm" "$LOG.qemu" "$MONITOR"
+    : > "$LOG"
+    qemu-system-x86_64 -m 512M -cdrom "$ISO" -boot d \
+        -smp "${SMP:-4}" -display none -no-reboot -serial "file:$LOG" \
+        -monitor "unix:$MONITOR,server,nowait" \
+        -d cpu_reset -D "$LOG.qemu" $DISK_ARGS ${QEMU_ARGS:-} &
+    qemu=$!
+}
+
+# True if QEMU has gone and the kernel never ran: not a byte on the
+# serial line, and the boot CPU reset only the two times every start
+# has (power-on, and the firmware's own reset). With several CPUs QEMU
+# now and then ends like this while the firmware is starting them -
+# before the loader, let alone the kernel. That is not a result about
+# the kernel, so such a start is done again. A kernel that resets the
+# machine before its first word resets the boot CPU a third time, and
+# is NOT retried.
+died_in_firmware() {
+    kill -0 $qemu 2>/dev/null && return 1
+    [ -s "$LOG" ] && return 1
+    [ "$(grep -c "CPU Reset (CPU 0)" "$LOG.qemu" 2>/dev/null)" -le 2 ]
+}
+
+start_qemu
 
 # Polls (ten times a second) until PATTERN appears in the log or the
 # time runs out; true if it appeared.
@@ -59,7 +77,19 @@ wait_for() {
     return 1
 }
 
-if wait_for "$FINISHED" $((LIMIT * 10)); then
+wait_for "$FINISHED" $((LIMIT * 10))
+finished=$?
+attempt=1
+while [ $finished -ne 0 ] && [ $attempt -lt 3 ] && died_in_firmware; do
+    echo "qemu-boot: QEMU ended in the firmware, before the kernel ran - starting it again" >&2
+    wait $qemu 2>/dev/null
+    attempt=$((attempt + 1))
+    start_qemu
+    wait_for "$FINISHED" $((LIMIT * 10))
+    finished=$?
+done
+
+if [ $finished -eq 0 ]; then
     # The driver is a process that starts after the kernel goes idle, and
     # it flushes the controller as it sets it up: type only once it is
     # ready, or the first keys are lost.

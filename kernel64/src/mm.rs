@@ -451,19 +451,32 @@ impl PhysicalMemory for DirectMap {
 /// Overflowing the stack touches the guard page and faults at once,
 /// instead of silently overwriting the slot below - another thread's
 /// stack.
+///
+/// A stack, once mapped, stays mapped: a thread that ends gives its
+/// stack back whole, and the next thread to start takes it as it is.
+/// The reason is the other CPUs. Each CPU remembers the translations it
+/// has used (its TLB), and `invlpg` makes only the CPU that executes it
+/// forget. Unmap a stack here and map other frames at the same address
+/// later, and a CPU that once ran the old thread could still write
+/// through its memory of the old frames - into memory that by then
+/// belongs to someone else. Never unmapping means there is nothing to
+/// forget. The price is that the memory for the most threads there
+/// have ever been at once stays stacks.
 const STACK_SLOT: u64 = 64 * 1024;
 const STACK_SLOTS: u64 = 16 * 1024; // 1 GiB of address space
+const STACK_PAGES: u64 = STACK_SLOT / PAGE_SIZE - 1;
 
 struct Slots {
     next: u64,
+    /// Slots whose thread has ended: still mapped, ready to be reused.
     free: alloc::vec::Vec<u64>,
 }
 
 /// Taken before TABLES.
 static SLOTS: IrqLock<Slots> = IrqLock::new(Slots { next: 0, free: alloc::vec::Vec::new() });
 
-/// A mapped kernel stack. Dropping it unmaps the pages and frees the
-/// frames.
+/// A mapped kernel stack. Dropping it puts it aside for the next
+/// thread.
 pub struct KernelStack {
     slot: u64,
 }
@@ -481,15 +494,14 @@ impl KernelStack {
 
 pub fn allocate_stack() -> Option<KernelStack> {
     let mut slots = SLOTS.lock();
-    let slot = match slots.free.pop() {
-        Some(slot) => slot,
-        None if slots.next < STACK_SLOTS => {
-            slots.next += 1;
-            slots.next - 1
-        }
-        None => return None,
-    };
-    let stack = KernelStack { slot };
+    if let Some(slot) = slots.free.pop() {
+        return Some(KernelStack { slot }); // mapped already
+    }
+    if slots.next == STACK_SLOTS {
+        return None;
+    }
+    slots.next += 1;
+    let stack = KernelStack { slot: slots.next - 1 };
     let flags = Flags::WRITABLE | Flags::GLOBAL | no_execute();
     let mapped = with_memory(|tables, frames| {
         for page in (stack.base() + PAGE_SIZE..stack.top()).step_by(PAGE_SIZE as usize) {
@@ -500,24 +512,37 @@ pub fn allocate_stack() -> Option<KernelStack> {
         }
         true
     });
-    drop(slots);
-    // On failure, dropping `stack` unmaps whatever was mapped.
-    mapped.then_some(stack)
+    if mapped {
+        return Some(stack);
+    }
+    // Out of memory part-way. This slot has never been used as a stack,
+    // so no CPU remembers anything about it: what was mapped can go
+    // back, and so can the slot's number (it was the last one given).
+    with_memory(|tables, frames| {
+        for page in (stack.base() + PAGE_SIZE..stack.top()).step_by(PAGE_SIZE as usize) {
+            if let Some(frame) = tables.unmap(VirtAddr::new(page)) {
+                mmu::flush(page);
+                frames.free(frame);
+            }
+        }
+    });
+    slots.next -= 1;
+    core::mem::forget(stack);
+    None
 }
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let mut slots = SLOTS.lock();
-        with_memory(|tables, frames| {
-            for page in (self.base() + PAGE_SIZE..self.top()).step_by(PAGE_SIZE as usize) {
-                if let Some(frame) = tables.unmap(VirtAddr::new(page)) {
-                    mmu::flush(page);
-                    frames.free(frame);
-                }
-            }
-        });
-        slots.free.push(self.slot);
+        SLOTS.lock().free.push(self.slot);
     }
+}
+
+/// Frames nothing is using: the free ones, and those of stacks waiting
+/// for a thread. What "nothing leaked" must compare - how many stacks
+/// are waiting depends on how many threads have just ended.
+pub fn unused_frames() -> usize {
+    let waiting = SLOTS.lock().free.len();
+    with_memory(|_, frames| frames.free_frames()) + waiting * STACK_PAGES as usize
 }
 
 /// Whether `address` is in the guard page of some thread's stack.

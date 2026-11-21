@@ -45,6 +45,9 @@ pub struct Report {
 
 static IO_APICS: IrqLock<Vec<apic::IoApic>> = IrqLock::new(Vec::new());
 static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How fast the local APIC's timer counts, measured once on the boot
+/// CPU: the CPUs of one machine share the clock it counts.
+static BUS_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn tsc_hz() -> u64 {
     TSC_HZ.load(core::sync::atomic::Ordering::Relaxed)
@@ -96,8 +99,15 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
     report.bus_hz = bus_hz;
     report.tsc_hz = tsc_hz;
     TSC_HZ.store(tsc_hz, core::sync::atomic::Ordering::Relaxed);
+    BUS_HZ.store(bus_hz, core::sync::atomic::Ordering::Relaxed);
     apic::start_timer(TIMER_VECTOR, bus_hz, hz);
     report
+}
+
+/// Starts the timer of the CPU this runs on, at the boot CPU's rate.
+/// For every CPU after the first, once it is ready to be interrupted.
+pub fn start_timer_here() {
+    apic::start_timer(TIMER_VECTOR, BUS_HZ.load(core::sync::atomic::Ordering::Relaxed), interrupts::HZ);
 }
 
 /// Called by the IDT stub for every vector from 32 up, with interrupts
