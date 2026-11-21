@@ -97,6 +97,26 @@ impl FrameAllocator {
         None
     }
 
+    /// The highest free frame, now marked in use - or None if none is
+    /// left. Nothing needs the top of memory in particular; this is for
+    /// checking that the top of memory is really there and reachable,
+    /// which handing out the lowest frame first would never show.
+    pub fn allocate_highest(&mut self) -> Option<PhysAddr> {
+        for word in (0..self.bitmap.len()).rev() {
+            // The bits past the last frame are always 1, so a 0 bit is
+            // a free frame; the highest 0 is the highest 1 of the inverse.
+            let free = !self.bitmap[word];
+            if free == 0 {
+                continue;
+            }
+            let index = word * 64 + 63 - free.leading_zeros() as usize;
+            self.set_used(index);
+            self.free -= 1;
+            return Some(PhysAddr::new(index as u64 * PAGE_SIZE));
+        }
+        None
+    }
+
     /// `count` frames side by side, lowest first - for a device that
     /// reads memory itself (DMA) and needs one unbroken physical range.
     /// Returns the first; None if there is no run that long.
@@ -149,6 +169,13 @@ impl FrameAllocator {
     pub unsafe fn relocate(&mut self, bitmap: &'static mut [u64]) {
         assert_eq!(bitmap.len(), self.bitmap.len());
         self.bitmap = bitmap;
+    }
+
+    /// Whether the frame holding `address` is free. Memory past the
+    /// end is not.
+    pub fn is_free(&self, address: PhysAddr) -> bool {
+        let index = (address.as_u64() / PAGE_SIZE) as usize;
+        index < self.frames && !self.is_used(index)
     }
 
     pub fn free_frames(&self) -> usize {
@@ -217,6 +244,46 @@ mod tests {
             assert_eq!(a.allocate(), Some(frame(n)));
         }
         assert_eq!(a.allocate(), None);
+    }
+
+    #[test]
+    fn the_highest_free_frame_can_be_asked_for() {
+        // 100 frames: the bitmap's second word has 28 bits past the end.
+        let mut frames = allocator(100);
+        assert_eq!(frames.allocate_highest(), None);
+        frames.free_range(frame(3), frame(100));
+        frames.reserve_range(frame(90), frame(100));
+        assert_eq!(frames.allocate_highest(), Some(frame(89)));
+        assert_eq!(frames.allocate_highest(), Some(frame(88)));
+        assert_eq!(frames.free_frames(), 85);
+        // The lowest is still handed out first, and a frame taken from
+        // the top comes back like any other.
+        assert_eq!(frames.allocate(), Some(frame(3)));
+        frames.free(frame(89));
+        assert_eq!(frames.allocate_highest(), Some(frame(89)));
+        // Down across a word boundary, until nothing is left.
+        frames.reserve_range(frame(4), frame(63));
+        frames.reserve_range(frame(65), frame(88));
+        assert_eq!(frames.allocate_highest(), Some(frame(64)));
+        assert_eq!(frames.allocate_highest(), Some(frame(63)));
+        assert_eq!(frames.allocate_highest(), None);
+        assert_eq!(frames.free_frames(), 0);
+    }
+
+    #[test]
+    fn a_frame_can_be_asked_about() {
+        let mut frames = allocator(100);
+        frames.free_range(frame(10), frame(20));
+        assert!(!frames.is_free(frame(9)));
+        assert!(frames.is_free(frame(10)));
+        // Any address inside the frame is an answer about the frame.
+        assert!(frames.is_free(PhysAddr::new(19 * PAGE_SIZE + 0xFFF)));
+        assert!(!frames.is_free(frame(20)));
+        assert_eq!(frames.allocate(), Some(frame(10)));
+        assert!(!frames.is_free(frame(10)));
+        // Past the end, and in the bitmap's unused last bits.
+        assert!(!frames.is_free(frame(100)));
+        assert!(!frames.is_free(frame(1 << 30)));
     }
 
     #[test]

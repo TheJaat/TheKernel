@@ -87,6 +87,42 @@ pub unsafe fn set_control(control: Control) {
     asm!("mov cr0, {}", in(reg) control.cr0, options(nostack, preserves_flags));
 }
 
+// ---- what the memory manager asks of any CPU ---------------------------
+
+/// Where the byte the kernel sees at `virt`, an address inside its own
+/// image, really is. On a PC the loader always puts the image at the
+/// same place: the kernel's window is physical memory from 0.
+pub fn kernel_physical(virt: u64) -> u64 {
+    virt - crate::mm::KERNEL_WINDOW
+}
+
+/// The physical memory that can be read and written, at its physical
+/// address, before the kernel has page tables of its own: the loader
+/// maps the first 4 GiB to themselves.
+pub fn early_reach() -> core::ops::Range<u64> {
+    0..4 << 30
+}
+
+/// Makes the tree at physical `root` the kernel's page tables, with
+/// the protections they rely on.
+///
+/// # Safety
+/// As for `enable_protection` and `activate`.
+pub unsafe fn install_kernel_tables(root: u64, no_execute: bool) {
+    enable_protection(no_execute);
+    activate(root);
+}
+
+/// Carries over devices mapped before there was a memory manager. On
+/// a PC there are none: the early console is an I/O port, which no
+/// page table has a say in.
+pub fn map_early_devices(_tables: &mut kernel64::paging::PageTables, _frames: &mut kernel64::memory::frame::FrameAllocator) {}
+
+/// Called after mappings are added, before they are used. Nothing to
+/// do on x86: a CPU that finds no mapping looks in the tables again
+/// before it faults, so a new one is seen at once.
+pub fn commit_mappings() {}
+
 /// Switches to the address space whose PML4 is at physical `root`.
 /// Loading CR3 also flushes every non-global TLB entry.
 ///

@@ -45,16 +45,22 @@
 //!                               tree is in
 //! ```
 //!
-//! The low mapping is there for one instruction - the one after the
-//! MMU comes on, which is still at a physical address - and, for now,
-//! so that the kernel can read the device tree.
+//! The low mapping is there for the instruction after the MMU comes
+//! on, which is still at a physical address; so that the kernel can
+//! read the device tree and write its first real page tables, at
+//! their physical addresses; and for the few instructions that put
+//! those tables in place of these (mmu.rs). Then it is turned off.
 
 use core::arch::global_asm;
 
 use kernel64::aarch64::{descriptor, translation_control, CONTROL_MMU_OFF, CONTROL_MMU_ON, MEMORY_KINDS, TEXT_OFFSET};
 
-/// The boot stack: 64 KiB. There is no guard page below it yet - the
-/// boot tables map 2 MiB at a time.
+/// The boot stack: 64 KiB, with a page below it (`__boot_stack_guard`)
+/// that is there to be missing. The boot tables map 2 MiB at a time,
+/// so at first the guard is mapped like everything else; the kernel's
+/// own tables (mm.rs) leave it out, and from then on running off the
+/// end of the stack is a fault instead of a quiet overwrite of
+/// whatever lies below.
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 
 global_asm!(
@@ -227,7 +233,10 @@ boot_l2_kernel: .skip 4096
 boot_l2_device: .skip 4096
 
     .section .bss.boot_stack, "aw", %nobits
-    .balign 16
+    .balign 4096
+    .global __boot_stack_guard
+__boot_stack_guard:
+    .skip 4096
     .skip {stack_size}
 boot_stack_top:
 "#,

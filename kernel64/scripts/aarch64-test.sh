@@ -15,9 +15,11 @@
 #   dirty      random bytes in the memory the kernel must zero itself
 #   unnamed    a device tree that does not say which serial port to use
 #   clockless  a device tree that does not give the serial port's clock
-#   fault-*    kernels built to read unmapped memory, to write to a
-#              read-only page, and to execute data: each exception must
-#              be caught and named
+#   reserved   device trees that keep some of the memory back: at the
+#              very start and the top of 512 MiB, and at the top of 6 GiB
+#   fault-*    kernels built to read through a null pointer, to read
+#              unmapped memory, to write to a constant, and to execute
+#              data: each exception must be caught and named
 
 set -eu
 
@@ -42,7 +44,7 @@ need() {
 # ---- build ------------------------------------------------------------
 (cd "$HERE" && cargo build --release --quiet --target $TARGET)
 "$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image"
-for fault in page rodata nx; do
+for fault in null page rodata nx; do
     (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
     "$OBJCOPY" -O binary "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" "$OUT/Image-fault-$fault"
 done
@@ -67,6 +69,11 @@ echo "  $file bytes in the file, $size in memory"
 # device tree, which must be what this machine was made with: MEMORY in
 # MiB, how many CPUS, which version of interrupt controller, and the
 # instruction that calls the firmware.
+#
+# The memory manager must then account for all of that memory: all but
+# a megabyte or two free (the kernel, the tree and the page tables take
+# the rest), and the highest free frame the last one there is. KEPT is
+# how many MiB at the top a test's tree reserves.
 boot() {
     name=$1
     level=$2
@@ -100,21 +107,36 @@ boot() {
     if [ -z "${CLOCK:-}" ] && grep -aq "as a guess" "$log"; then
         fail "the serial port was guessed though the tree describes it"
     fi
-    need "$log" "\[paging\] the tables the CPU is using, read by the kernel: 5 lookups, all as the CPU does them"
-    need "$log" "\[paging\] a page at 0x4[0-9a-f]+ mapped twice: .* where the CPU refuses a write"
-    need "$log" "\[paging\] a third address unmapped, then mapped to the page at 0x4[0-9a-f]+: the CPU reads the new page there"
+    free=$((mib - ${KEPT:-0}))
+    top=$(printf '%x' $((0x40000000 + free * 1048576 - 4096)))
+    need "$log" "\[memory\] [0-9]+ frames free of $((mib * 256 + 262144)) \(($((free - 3))|$((free - 2))|$((free - 1))) MiB\), bitmap [0-9]+ KiB at 0x4"
+    need "$log" "\[memory\] own page tables at 0x4[0-9a-f]+: direct map 0xffff800000000000, NX on"
+    need "$log" "\[memory\] heap at 0xffffc00000000000, 1024 KiB to start"
+    need "$log" "\[tree\] read again through the direct map: the same [0-9]+ nodes, in memory kept out of the allocator"
+    need "$log" "\[selftest\] frames: allocate, free, reuse; the kernel's own are not free"
+    need "$log" "\[selftest\] top of memory: the highest free frame, at 0x$top, written and read back"
+    need "$log" "\[selftest\] paging: map, alias through the direct map, unmap"
+    need "$log" "\[selftest\] protections: code RX, rodata R, data RW\+NX, null and stack guard unmapped"
+    need "$log" "\[selftest\] heap: Box, Vec, String; grew from 1024 KiB to [0-9]+ KiB"
+    need "$log" "\[selftest\] memory: all passed"
+    need "$log" "\[paging\] the kernel's own tables, read by the kernel and by the CPU: 8 lookups, all the same"
+    need "$log" "\[paging\] the CPU refuses a write to code and to constants, and allows one to variables and the heap"
+    need "$log" "\[paging\] the low half is off: address 0 and 0x4[0-9a-f]+, where this code really is, translate to nothing"
+    need "$log" "\[paging\] one address mapped to the page at 0x4[0-9a-f]+, then to the one at 0x4[0-9a-f]+: the CPU reads the new page there"
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
     [ "$(grep -ac 'breakpoint at' "$log")" -eq 1 ] || fail "the breakpoint was taken more than once"
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
         fail "the log has a panic, an exception or a failed check"
     fi
-    grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts" "$log" | sed 's/^/  /' | cut -c1-110
+    grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts\|frames free\|top of memory" "$log" | sed 's/^/  /' | cut -c1-110
 }
 
 boot plain 1 512 1 2 hvc
 MACHINE=,virtualization=on boot el2 2 512 1 2 smc
 # 6 GiB: the end of memory is above 4 GiB, a number that needs both of
-# the two cells the tree gives it.
+# the two cells the tree gives it. And five of the six are out of the
+# kernel's reach while it builds its page tables: this is the boot that
+# has memory handed over in the second go.
 CPU=cortex-a53 MEMORY=6G boot a53 1 6144 1 2 hvc
 CPU=max MEMORY=128M MACHINE=,gic-version=3 boot max 1 128 1 3 hvc
 QEMU_ARGS="-smp 4" boot smp4 1 512 4 2 hvc
@@ -139,6 +161,21 @@ SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" boot unnamed 1 51
 "$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/clockless.dtb" pl011@9000000 clocks
 CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" boot clockless 1 512 1 2 hvc
 need "$OUT/clockless.log" "\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess"
+# The loader keeps memory for itself: the top 16 MiB, and the first
+# 64 KiB - which is exactly where the kernel would otherwise put its
+# frame bitmap. The kernel must say so, have that much less, find its
+# highest free frame below the 16 MiB, and put the bitmap elsewhere.
+"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-top.dtb" 0x5f000000 0x1000000
+"$HERE/scripts/dtb-reserve.py" "$OUT/reserved-top.dtb" "$OUT/reserved.dtb" 0x40000000 0x10000
+KEPT=16 QEMU_ARGS="-dtb $OUT/reserved.dtb" boot reserved 1 512 1 2 hvc
+need "$OUT/reserved.log" "\[tree\] reserved    0x40000000 - 0x40010000"
+need "$OUT/reserved.log" "\[tree\] reserved    0x5f000000 - 0x60000000"
+need "$OUT/reserved.log" "bitmap 48 KiB at 0x40010000"
+# The same at the top of 6 GiB: memory the kernel is only given in the
+# second go, where what is reserved has to be taken out a second time.
+"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-high.dtb" 0x1bf000000 0x1000000
+KEPT=16 CPU=cortex-a53 MEMORY=6G QEMU_ARGS="-dtb $OUT/reserved-high.dtb" boot reserved-high 1 6144 1 2 hvc
+need "$OUT/reserved-high.log" "\[tree\] reserved    0x1bf000000 - 0x1c0000000"
 
 # ---- the faults -------------------------------------------------------
 # One build and one boot per fault. Each must be caught, named, and
@@ -162,15 +199,16 @@ fault() {
     grep -aE "$what" "$log" | cut -c1-110
 }
 
+fault null "reading through a null pointer" "0x25: data abort" \
+    "kernel read at 0x0: not mapped \(the level 0 table has no entry\)"
 fault page "forcing a page fault" "0x25: data abort" \
     "kernel read at 0xffffffff00000000: not mapped \(the level 1 table has no entry\)"
-# The two below break a rule on a page the kernel mapped with its own
-# page-table code: they check that what that code writes means to the
-# CPU what was asked for.
+# The two below break the rules of the kernel's own image, as its own
+# page tables state them: a constant is written to, a variable is run.
 fault rodata "writing to read-only data" "0x25: data abort" \
-    "kernel write at 0xffffffffffe01000: protection violation \(at level 3\)"
+    "kernel write at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
 fault nx "executing data" "0x21: instruction abort" \
-    "kernel instruction fetch at 0xffffffffffe00000: protection violation \(at level 3\)"
+    "kernel instruction fetch at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
 
 if [ $failed -ne 0 ]; then
     echo "aarch64-test: FAILED (logs in $OUT)"

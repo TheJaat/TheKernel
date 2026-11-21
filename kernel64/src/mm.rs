@@ -1,10 +1,14 @@
 //! Memory management, wired to the machine.
 //!
 //! `kernel64::memory` and `kernel64::paging` are the algorithms; this is
-//! where they meet real RAM. At boot it:
+//! where they meet real RAM. It is the same on every CPU. What differs
+//! (how a table is made the one in use, where the kernel's bytes
+//! really are, how much memory can be reached before the kernel has
+//! tables of its own) it asks `arch::mmu` for. At boot it:
 //!
 //!   1. places the frame bitmap, using the memory map
-//!   2. builds the kernel's own page tables, replacing the loader's:
+//!   2. builds the kernel's own page tables, replacing the ones it was
+//!      started on (the loader's, or its own first rough ones):
 //!
 //! ```text
 //!        0x0000_0000_0000_0000  lower half: nothing (for user space).
@@ -20,26 +24,32 @@
 //!                               boot stack
 //! ```
 //!
-//!   3. turns on NX and write protection, and switches to the new tables
+//!   3. turns on the protections and switches to the new tables
 //!   4. starts the heap, so `alloc` (Box, Vec, String) works
+//!
+//! Before the switch only part of memory can be reached (`early_reach`:
+//! the first 4 GiB on a PC, the one GiB the kernel is in on AArch64),
+//! and the bitmap and every page table have to be written. So memory
+//! is handed to the frame allocator in two goes: what is in reach
+//! first - the tables are built from that - and the rest once they are
+//! built.
 //!
 //! Lock order, whenever more than one is held: HEAP, then TABLES, then
 //! FRAMES. Taking them in one fixed order is what makes deadlock between
 //! them impossible.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::mem::size_of;
 use core::ops::Range;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel64::bootinfo::{BootInfo, MEMORY_ACPI_NVS, MEMORY_ACPI_RECLAIMABLE};
+use kernel64::bootinfo::{MemoryRegion, MEMORY_ACPI_NVS, MEMORY_ACPI_RECLAIMABLE};
 use kernel64::memory::addr::{
     align_down, align_up, phys_to_virt, set_physical_offset, PhysAddr, VirtAddr, PAGE_SIZE,
 };
 use kernel64::memory::frame::FrameAllocator;
 use heap::Heap;
-use kernel64::memory::layout::find_free_space;
+use kernel64::memory::layout::{find_free_space, find_free_space_avoiding, inside, outside};
 use kernel64::paging::{Flags, MapError, PageSize, PageTables};
 use kernel64::acpi::PhysicalMemory;
 
@@ -49,7 +59,7 @@ use crate::irqlock::IrqLock;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// Where the bootloader's kernel window and linker.ld put the kernel.
+/// Where the kernel is linked to run (linker.ld, linker-aarch64.ld).
 pub const KERNEL_WINDOW: u64 = 0xFFFF_FFFF_8000_0000;
 pub const DIRECT_MAP: u64 = 0xFFFF_8000_0000_0000;
 pub const HEAP_START: u64 = 0xFFFF_C000_0000_0000;
@@ -93,7 +103,7 @@ pub fn with_frames<R>(f: impl FnOnce(&mut FrameAllocator) -> R) -> R {
 }
 
 extern "C" {
-    // linker.ld. Only their addresses mean anything.
+    // The linker scripts. Only their addresses mean anything.
     static __kernel_start: u8;
     static __text_end: u8;
     static __rodata_end: u8;
@@ -167,21 +177,62 @@ fn map_kernel(tables: &mut PageTables, frames: &mut FrameAllocator, range: Range
         if virt == guard {
             continue;
         }
-        let physical = PhysAddr::new(virt - KERNEL_WINDOW);
+        let physical = PhysAddr::new(mmu::kernel_physical(virt));
         tables
             .map(VirtAddr::new(virt), physical, PageSize::Size4K, flags | Flags::GLOBAL, frames)
             .unwrap_or_else(|error| panic!("mapping the kernel at {virt:#x} failed: {error:?}"));
     }
 }
 
+/// What the kernel is told about memory when it starts - by the
+/// loader's boot info on a PC, by the device tree on AArch64.
+pub struct BootMemory<'a> {
+    /// What memory there is, and of what kind. Regions may overlap;
+    /// where they do, anything not usable wins.
+    pub regions: &'a [MemoryRegion],
+    /// Physical ranges that hold something already, whatever the
+    /// regions say: the boot info, the ramdisk, the device tree. The
+    /// kernel's own image need not be listed. Unused places are `0..0`.
+    pub taken: [Range<u64>; BootMemory::TAKEN],
+    /// Physical ranges to put in the direct map besides the memory
+    /// itself: the screen, where firmware keeps its tables.
+    pub also_mapped: [Range<u64>; BootMemory::ALSO_MAPPED],
+}
+
+impl BootMemory<'_> {
+    pub const TAKEN: usize = 4;
+    pub const ALSO_MAPPED: usize = 2;
+}
+
+/// Looks for a page of ordinary memory below 1 MiB that nothing uses,
+/// for `low_page` - on a PC, where another CPU is started; they begin
+/// in real mode and can run nowhere else. `still_read` is what down
+/// there the kernel goes on reading; of everything else the loader is
+/// done.
+pub fn pick_low_page(regions: &[MemoryRegion], still_read: &[Range<u64>]) {
+    let usable = regions.iter().filter(|r| r.is_usable()).map(|r| r.base..r.base + r.length);
+    if let Some(page) = find_free_space(usable, still_read, PAGE_SIZE, PAGE_SIZE, MIB) {
+        // Firmware maps can overlap, and anything not usable wins: a
+        // page that is also in a region of another kind is not free.
+        let disputed = regions.iter().any(|r| !r.is_usable() && r.base < page + PAGE_SIZE && page < r.base + r.length);
+        if !disputed {
+            LOW_PAGE.store(page, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Sets up physical memory, the kernel's page tables and the heap.
 ///
-/// `info` must be the boot info as read through the loader's identity
-/// map, at physical `info_address`. Returns it re-read through the
-/// direct map: the old reference is invalid once this returns.
-pub fn init(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
-    let regions = info.memory_map();
+/// Everything in `memory` must be readable now and is not used after
+/// the switch: on return, physical memory is reached through the
+/// direct map and no other way.
+pub fn init(memory: &BootMemory) {
+    let regions = memory.regions;
     let usable = || regions.iter().filter(|r| r.is_usable()).map(|r| r.base..r.base + r.length);
+    let unusable = || regions.iter().filter(|r| !r.is_usable()).map(|r| r.base..r.base + r.length);
+    // What can be read and written before the switch, at its physical
+    // address.
+    let reach = mmu::early_reach();
 
     // ---- 1. physical frames ---------------------------------------------
 
@@ -191,54 +242,77 @@ pub fn init(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
     let bitmap_bytes = (words * 8) as u64;
 
     let layout = kernel_layout();
-    let kernel = layout.text.start - KERNEL_WINDOW..layout.data.end - KERNEL_WINDOW;
-    let map_start = regions.as_ptr() as u64; // identity map: virtual == physical
-    let reserved = [
-        0..MIB, // real-mode IVT, BIOS data, the loader, its page tables
-        kernel.clone(),
-        info.ramdisk_address..info.ramdisk_address + info.ramdisk_size,
-        info_address..info_address + size_of::<BootInfo>() as u64,
-        map_start..map_start + size_of_val(regions) as u64,
-    ];
+    let kernel = mmu::kernel_physical(layout.text.start)..mmu::kernel_physical(layout.data.end);
+    // Everything that is not free, whatever kind of region it is in:
+    // what the caller listed, the kernel, and whatever the map calls
+    // by any name but "usable".
+    let occupied = || memory.taken.iter().cloned().chain(core::iter::once(kernel.clone())).chain(unusable());
 
-    // The first megabyte is kept out of the allocator whole; one page
-    // of it is put aside for starting the other CPUs, which begin in
-    // real mode and can run nowhere else. Not page 0 (the firmware's
-    // tables), and not the two things of the loader's the kernel goes
-    // on reading - of everything else down there the loader is done.
-    let still_read = [
-        0..PAGE_SIZE,
-        info_address..info_address + size_of::<BootInfo>() as u64,
-        map_start..map_start + size_of_val(regions) as u64,
-    ];
-    if let Some(page) = find_free_space(usable(), &still_read, PAGE_SIZE, PAGE_SIZE, MIB) {
-        // Firmware maps can overlap, and anything not usable wins: a
-        // page that is also in a region of another kind is not free.
-        let disputed = regions.iter().any(|r| !r.is_usable() && r.base < page + PAGE_SIZE && page < r.base + r.length);
-        if !disputed {
-            LOW_PAGE.store(page, Ordering::Relaxed);
-        }
-    }
-
-    // Below 4 GiB: until the switch, only the loader's identity map can
-    // reach it.
-    let bitmap_address = find_free_space(usable(), &reserved, bitmap_bytes, PAGE_SIZE, 4 * GIB)
-        .expect("no room for the frame bitmap");
+    let bitmap_address =
+        find_free_space_avoiding(usable().filter_map(|r| inside(&r, &reach)), occupied, bitmap_bytes, PAGE_SIZE, u64::MAX)
+            .expect("no room for the frame bitmap");
+    let bitmap_range = bitmap_address..bitmap_address + bitmap_bytes;
 
     // SAFETY: the range is usable RAM that nothing else occupies (that is
-    // what find_free_space checked), identity-mapped right now.
+    // what the search checked), inside the reach: readable and writable
+    // at its physical address right now.
     let bitmap = unsafe { core::slice::from_raw_parts_mut(bitmap_address as *mut u64, words) };
     let mut frames = FrameAllocator::new(bitmap, frame_count);
-    for range in usable() {
+    let reserve_occupied = |frames: &mut FrameAllocator| {
+        for range in occupied().chain(core::iter::once(bitmap_range.clone())) {
+            frames.reserve_range(PhysAddr::new(range.start), PhysAddr::new(range.end));
+        }
+    };
+    // The first go: only the memory in reach.
+    for range in usable().filter_map(|r| inside(&r, &reach)) {
         frames.free_range(PhysAddr::new(range.start), PhysAddr::new(range.end));
     }
-    // Firmware maps can overlap; anything not usable wins.
-    for region in regions.iter().filter(|r| !r.is_usable()) {
-        frames.reserve_range(PhysAddr::new(region.base), PhysAddr::new(region.base + region.length));
+    reserve_occupied(&mut frames);
+
+    // ---- 2. the kernel's page tables -------------------------------------
+
+    let nx = mmu::supports_no_execute();
+    NO_EXECUTE.store(nx, Ordering::Relaxed);
+
+    // SAFETY: every frame the allocator has so far is in the reach, so
+    // each new table can be written at its physical address (offset 0).
+    let mut tables = unsafe { PageTables::new(&mut frames, 0) }.expect("no frame for the top table");
+
+    for region in regions {
+        let interesting = region.is_usable()
+            || region.kind == MEMORY_ACPI_RECLAIMABLE
+            || region.kind == MEMORY_ACPI_NVS;
+        if interesting {
+            map_direct(&mut tables, &mut frames, region.base..region.base + region.length);
+        }
     }
-    for range in reserved.iter().cloned().chain(core::iter::once(bitmap_address..bitmap_address + bitmap_bytes)) {
-        frames.reserve_range(PhysAddr::new(range.start), PhysAddr::new(range.end));
+    for range in memory.also_mapped.iter().chain(&memory.taken).filter(|range| !range.is_empty()) {
+        map_direct(&mut tables, &mut frames, range.clone());
     }
+
+    map_kernel(&mut tables, &mut frames, layout.text.clone(), Flags::NONE);
+    map_kernel(&mut tables, &mut frames, layout.rodata.clone(), no_execute());
+    map_kernel(&mut tables, &mut frames, layout.data.clone(), Flags::WRITABLE | no_execute());
+
+    // Devices the kernel is already using (its console, where that is
+    // a device with registers) stay where they are.
+    mmu::map_early_devices(&mut tables, &mut frames);
+
+    // Every process shares the kernel half by copying these top-level
+    // slots once, so they must never change: give each one its table
+    // now. (Only where the two halves share a top table: x86.)
+    tables.fill_kernel_slots(&mut frames).expect("no frames for the kernel's top-level slots");
+
+    // The second go: the tables are built, so the memory out of reach
+    // can join. Then everything occupied is marked again - a region
+    // that is not usable may lie over memory just freed. (Frames taken
+    // for tables are not touched by either: they are in the reach,
+    // which this go leaves alone, and marking a used frame used
+    // changes nothing.)
+    for range in usable().flat_map(|r| outside(&r, &reach)) {
+        frames.free_range(PhysAddr::new(range.start), PhysAddr::new(range.end));
+    }
+    reserve_occupied(&mut frames);
     kprintln!(
         "[memory] {} frames free of {} ({} MiB), bitmap {} KiB at {:#x}",
         frames.free_frames(),
@@ -248,47 +322,16 @@ pub fn init(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
         bitmap_address
     );
 
-    // ---- 2. the kernel's page tables -------------------------------------
-
-    let nx = mmu::supports_no_execute();
-    NO_EXECUTE.store(nx, Ordering::Relaxed);
-
-    // SAFETY: frames come lowest-first, from RAM below 4 GiB, which the
-    // identity map (offset 0) reaches.
-    let mut tables = unsafe { PageTables::new(&mut frames, 0) }.expect("no frame for the PML4");
-
-    map_direct(&mut tables, &mut frames, 0..4 * GIB);
-    for region in regions {
-        let interesting = region.is_usable()
-            || region.kind == MEMORY_ACPI_RECLAIMABLE
-            || region.kind == MEMORY_ACPI_NVS;
-        if interesting {
-            map_direct(&mut tables, &mut frames, region.base..region.base + region.length);
-        }
-    }
-    if let Some(fb) = info.framebuffer() {
-        let size = u64::from(fb.pitch) * u64::from(fb.height);
-        map_direct(&mut tables, &mut frames, fb.address..fb.address + size);
-    }
-
-    map_kernel(&mut tables, &mut frames, layout.text.clone(), Flags::NONE);
-    map_kernel(&mut tables, &mut frames, layout.rodata.clone(), no_execute());
-    map_kernel(&mut tables, &mut frames, layout.data.clone(), Flags::WRITABLE | no_execute());
-
-    // Every process shares the kernel half by copying these PML4 slots
-    // once, so they must never change: give each one its PDPT now.
-    tables.fill_kernel_slots(&mut frames).expect("no frames for the kernel's PDPTs");
-
     // ---- 3. switch -------------------------------------------------------
 
     let root = tables.root();
     KERNEL_ROOT.store(root.as_u64(), Ordering::Relaxed);
     // SAFETY: the new tables map the kernel's code, data and stack (the
-    // boot stack is in .bss) and the direct map; nothing after the switch
-    // uses an identity-mapped address - `regions` and `info` are dead.
+    // boot stack is in .bss), its console and the direct map; nothing
+    // after the switch uses a physical address as it stands - `memory`
+    // and `regions` are dead.
     unsafe {
-        mmu::enable_protection(nx);
-        mmu::activate(root.as_u64());
+        mmu::install_kernel_tables(root.as_u64(), nx);
         set_physical_offset(DIRECT_MAP);
         tables.set_offset(DIRECT_MAP);
         let bitmap = phys_to_virt(PhysAddr::new(bitmap_address)).as_mut_ptr::<u64>();
@@ -308,9 +351,6 @@ pub fn init(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
 
     assert!(HEAP.state.lock().grow(HEAP_INITIAL), "no memory for the initial heap");
     kprintln!("[memory] heap at {HEAP_START:#x}, {} KiB to start", HEAP_INITIAL / 1024);
-
-    // SAFETY: the boot info is below 1 MiB, now reached via the direct map.
-    unsafe { BootInfo::from_physical(info_address) }.expect("boot info vanished")
 }
 
 // ---- the heap ---------------------------------------------------------
@@ -346,6 +386,7 @@ impl HeapState {
         if mapped == 0 {
             return false;
         }
+        mmu::commit_mappings();
         // SAFETY: just mapped, writable, and used by nothing else.
         unsafe { self.heap.add_region(self.end as usize, mapped as usize) };
         self.end += mapped;
@@ -415,6 +456,7 @@ pub fn map_mmio(physical: u64, size: u64) -> u64 {
                 .unwrap_or_else(|error| panic!("MMIO mapping of {physical:#x} failed: {error:?}"));
         }
     });
+    mmu::commit_mappings();
     *next += end - start;
     virt + (physical - start)
 }
@@ -513,6 +555,7 @@ pub fn allocate_stack() -> Option<KernelStack> {
         true
     });
     if mapped {
+        mmu::commit_mappings();
         return Some(stack);
     }
     // Out of memory part-way. This slot has never been used as a stack,

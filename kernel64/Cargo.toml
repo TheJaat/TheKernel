@@ -17,12 +17,12 @@ bench = false
 # Only our own: the system call interface, shared with user programs.
 # Every line of the kernel is ours to read.
 abi = { path = "../abi" }
+# The allocator, shared with user programs.
+heap = { path = "../../heap" }
 
 # What the AArch64 kernel does not use yet (see the note at the top of
 # main.rs): these move up beside `abi` as the port reaches them.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-# The allocator, shared with user programs.
-heap = { path = "../../heap" }
 # virtio constants: which PCI devices the kernel sets up for drivers.
 virtio = { path = "../../virtio" }
 # The font - for the kernel's last words, on the screen (lastwords.rs).
@@ -40,6 +40,7 @@ fault-nx = ["fault-tests"]          # execute data
 fault-stack = ["fault-tests"]       # overflow the boot stack
 fault-thread-stack = ["fault-tests"] # overflow a kernel thread's stack
 fault-init = ["fault-tests"]         # init is a program that ends
+fault-null = ["fault-tests"]         # read through a null pointer (AArch64 so far)
 
 # A kernel made deliberately large, so that it ends well above 2 MiB:
 # checks that the bootloaders load all of a big kernel, and correctly.

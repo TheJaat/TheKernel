@@ -1,10 +1,10 @@
 //! AArch64.
 //!
-//! The port is at its beginning: the kernel starts, turns on the MMU,
-//! writes to the serial port and catches exceptions. What the rest of
-//! the kernel asks of an architecture - memory management, interrupts,
-//! a timer, context switches, system calls, other CPUs - is still to
-//! come, a piece at a time.
+//! The port is under way: the kernel starts, turns on the MMU, writes
+//! to the serial port, catches exceptions, and manages memory with the
+//! same code as on a PC. What else the kernel asks of an architecture
+//! (interrupts, a timer, context switches, system calls, other CPUs)
+//! is still to come, a piece at a time.
 
 mod entry;
 pub mod mmu;
@@ -132,11 +132,15 @@ pub fn report() -> Report {
 /// if that cannot be the address of one, or the bytes there do not
 /// begin as one does.
 ///
-/// Read through the low mapping entry.rs made for the purpose: the one
-/// GiB the address is in. A tree that runs over the end of that GiB is
-/// refused rather than read into memory that is not mapped.
+/// Read wherever physical memory is to be found at the moment. Before
+/// the kernel has its own tables that is the low mapping entry.rs
+/// made: the one GiB the address is in - so a tree that runs over the
+/// end of that GiB is refused rather than read into memory that is not
+/// mapped. Afterwards it is the direct map, and the caller must have
+/// had the tree's memory put in it (`BootMemory::taken`).
 pub fn device_tree(physical: u64) -> Option<&'static [u8]> {
     use kernel64::devicetree::{Header, HEADER_SIZE};
+    use kernel64::memory::addr::{phys_to_virt, physical_offset, PhysAddr};
     const GIB: u64 = 1 << 30;
 
     // The loader's contract: 8-byte aligned. Zero means "none". And
@@ -144,42 +148,55 @@ pub fn device_tree(physical: u64) -> Option<&'static [u8]> {
     if physical == 0 || !physical.is_multiple_of(8) || physical >> 39 != 0 {
         return None;
     }
-    let room = GIB - physical % GIB;
+    let early = physical_offset() == 0;
+    let room = if early { GIB - physical % GIB } else { u64::MAX };
     if room < HEADER_SIZE as u64 {
         return None;
     }
-    // SAFETY: entry.rs mapped the GiB this address is in to itself, as
-    // readable memory, and the forty bytes are inside it. Nothing
-    // writes there: the loader put the tree in memory the kernel has
-    // not touched.
-    let header = unsafe { &*(physical as *const [u8; HEADER_SIZE]) };
+    let address = phys_to_virt(PhysAddr::new(physical));
+    // SAFETY: the forty bytes are mapped, readable - by entry.rs, which
+    // mapped the GiB this address is in to itself, or by the direct
+    // map. Nothing writes there: the loader put the tree in memory the
+    // kernel has kept out of its allocator.
+    let header = unsafe { &*address.as_ptr::<[u8; HEADER_SIZE]>() };
     let size = u64::from(Header::parse(header).ok()?.total_size);
     if size > room {
         return None;
     }
     // SAFETY: as above, for the whole of the blob - which the header,
     // now known to be a device tree's, says is `size` bytes.
-    Some(unsafe { core::slice::from_raw_parts(physical as *const u8, size as usize) })
+    Some(unsafe { core::slice::from_raw_parts(address.as_ptr::<u8>(), size as usize) })
 }
 
 /// Deliberately faults, for checking the handlers and the page-table
 /// protections. Only built with one of the `fault-*` features.
 #[cfg(feature = "fault-tests")]
 pub mod fault_tests {
-    use super::mmu::{TEST_READ_ONLY, TEST_WRITABLE};
+    /// An immutable static: the linker puts it in .rodata, which the
+    /// kernel maps read-only.
+    static READ_ONLY: u64 = 0x1234;
 
-    /// Writes to the page `mmu::selftest` mapped read-only.
+    /// Writes to read-only data.
     pub fn write_rodata() {
+        let address = &raw const READ_ONLY as *mut u64;
         // SAFETY: none - this is meant to fault.
-        unsafe { (TEST_READ_ONLY as *mut u64).write_volatile(0xBAD) };
+        unsafe { address.write_volatile(0xBAD) };
     }
 
-    /// Jumps to the page `mmu::selftest` mapped writable, and so not
-    /// executable. It holds a number, not code; the CPU must refuse
-    /// before it looks.
+    /// One `ret` instruction, stored as data in .data, which is mapped
+    /// no-execute. `#[used]` keeps it even though nothing reads it as
+    /// data.
+    #[used]
+    static mut DATA: [u32; 1] = [0xD65F_03C0];
+
+    /// Calls into data. Code injected into a buffer is exactly this -
+    /// and the no-execute bit is what stops it running.
     pub fn execute_data() {
+        // black_box hides where the pointer came from, so the compiler
+        // cannot reason about a call to a data object.
+        let address = core::hint::black_box(&raw const DATA as *const ());
         // SAFETY: none - this is meant to fault.
-        let code: extern "C" fn() = unsafe { core::mem::transmute(TEST_WRITABLE as *const ()) };
+        let code: extern "C" fn() = unsafe { core::mem::transmute(address) };
         code();
     }
 
@@ -188,6 +205,15 @@ pub mod fault_tests {
         // In the kernel's half, 2 GiB below its window: the level 1
         // table has no entry there.
         let address = 0xFFFF_FFFF_0000_0000u64 as *const u64;
+        // SAFETY: none - this is meant to fault.
+        unsafe { address.read_volatile() }
+    }
+
+    /// Reads through a null pointer - the commonest mistake there is.
+    /// The low half of the address space is off, so there is nothing
+    /// at address 0 to read.
+    pub fn null_read() -> u64 {
+        let address = core::hint::black_box(core::ptr::null::<u64>());
         // SAFETY: none - this is meant to fault.
         unsafe { address.read_volatile() }
     }

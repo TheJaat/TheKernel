@@ -42,6 +42,13 @@ pub struct MemoryRegion {
 }
 
 impl MemoryRegion {
+    /// A region made by the kernel itself - on machines whose loader
+    /// describes memory some other way (a device tree), so that the
+    /// memory manager is given the same thing everywhere.
+    pub const fn new(base: u64, length: u64, kind: u32) -> MemoryRegion {
+        MemoryRegion { base, length, kind, reserved: 0 }
+    }
+
     pub fn is_usable(&self) -> bool {
         self.kind == MEMORY_USABLE
     }

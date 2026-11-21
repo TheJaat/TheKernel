@@ -46,13 +46,11 @@ mod lastwords;
 mod ipc;
 #[cfg(target_arch = "x86_64")]
 mod memory_object;
-#[cfg(target_arch = "x86_64")]
 mod mm;
 #[cfg(target_arch = "x86_64")]
 mod process;
 #[cfg(target_arch = "x86_64")]
 mod programs;
-#[cfg(target_arch = "x86_64")]
 mod selftest;
 #[cfg(target_arch = "x86_64")]
 mod syscall;
@@ -100,7 +98,7 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     // Off the loader's page tables and onto the kernel's own. `info` is
     // re-read through the direct map; the old reference is gone.
     kprintln!();
-    let info = mm::init(info, boot_info_address);
+    let info = start_memory(info, boot_info_address);
 
     // The screen, mapped now for the one time the kernel will draw on
     // it: to say why it stopped. Later may be too late to map anything.
@@ -166,28 +164,46 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     idle()
 }
 
-/// On AArch64 there is no heap yet, but there must be an allocator: the
-/// kernel's library uses `Vec`, and Rust will not link a program that
-/// could ask for memory with nothing to ask. This one always says no -
-/// which, if anything ever did ask, ends in a panic that says so.
-#[cfg(target_arch = "aarch64")]
-mod no_heap {
-    use core::alloc::{GlobalAlloc, Layout};
+/// Starts memory management on a PC, from what the loader said.
+///
+/// `info` must be the boot info as read through the loader's identity
+/// map, at physical `info_address`. Returns it re-read through the
+/// direct map: the old reference is invalid once this returns.
+#[cfg(target_arch = "x86_64")]
+fn start_memory(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
 
-    struct NoHeap;
+    let regions = info.memory_map();
+    let info_range = info_address..info_address + size_of::<BootInfo>() as u64;
+    let map_start = regions.as_ptr() as u64; // identity map: virtual == physical
+    let map_range = map_start..map_start + size_of_val(regions) as u64;
 
-    // SAFETY: `alloc` may return null, meaning "no memory"; that is all
-    // this one does, so there is never anything to free.
-    unsafe impl GlobalAlloc for NoHeap {
-        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-            core::ptr::null_mut()
-        }
+    // The first megabyte is kept out of the allocator whole; one page
+    // of it is put aside for starting the other CPUs. Not page 0 (the
+    // firmware's tables), and not the two things of the loader's the
+    // kernel goes on reading.
+    mm::pick_low_page(regions, &[0..4096, info_range.clone(), map_range.clone()]);
 
-        unsafe fn dealloc(&self, _pointer: *mut u8, _layout: Layout) {}
-    }
+    let screen = info.framebuffer().map_or(0..0, |fb| {
+        let size = u64::from(fb.pitch) * u64::from(fb.height);
+        fb.address..fb.address + size
+    });
+    mm::init(&mm::BootMemory {
+        regions,
+        taken: [
+            0..MIB, // real-mode IVT, BIOS data, the loader, its page tables
+            info.ramdisk_address..info.ramdisk_address + info.ramdisk_size,
+            info_range,
+            map_range,
+        ],
+        // The first 4 GiB whatever is there: firmware tables and
+        // devices live between the pieces of memory.
+        also_mapped: [0..4 * GIB, screen],
+    });
 
-    #[global_allocator]
-    static HEAP: NoHeap = NoHeap;
+    // SAFETY: the boot info is below 1 MiB, now reached via the direct map.
+    unsafe { BootInfo::from_physical(info_address) }.expect("boot info vanished")
 }
 
 /// The first Rust code to run on AArch64, called by `_start`
@@ -195,13 +211,15 @@ mod no_heap {
 /// physical address of the device tree, the exception level the loader
 /// entered at, and the physical address the image was loaded at.
 ///
-/// It does much less than the x86_64 one above, and stops: this is how
-/// far the port has come.
+/// It does less than the x86_64 one above, and stops: this is how far
+/// the port has come.
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
 extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> ! {
     use kernel64::aarch64::{cpu_name, physical_bits, KERNEL_WINDOW, TEXT_OFFSET};
+    use kernel64::bootinfo::{MemoryRegion, MEMORY_RESERVED, MEMORY_USABLE};
     use kernel64::devicetree::{Machine, Tree};
+    use kernel64::memory::addr::PhysAddr;
 
     arch::mmu::set_load_address(loaded_at);
 
@@ -247,9 +265,58 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
         kprintln!("[tree] no serial port with a clock described: using the one QEMU's virt machine has, as a guess");
     }
 
+    // Memory: the tree's description, turned into the list of regions
+    // the memory manager is given on every machine. Reserved ranges
+    // come after the memory they lie in; where regions overlap, the
+    // one that is not usable wins.
     kprintln!();
+    let mut regions = [MemoryRegion::new(0, 0, MEMORY_RESERVED); Machine::MEMORY_MAX + Machine::RESERVED_MAX];
+    let mut count = 0;
+    let usable = machine.memory().iter().map(|range| MemoryRegion::new(range.start, range.size, MEMORY_USABLE));
+    let reserved = machine.reserved().iter().map(|range| MemoryRegion::new(range.start, range.size, MEMORY_RESERVED));
+    for region in usable.chain(reserved) {
+        regions[count] = region;
+        count += 1;
+    }
+    // The tree itself is in memory the tree calls free.
+    let tree_range = match &tree {
+        Some(Ok(tree)) => device_tree..device_tree + u64::from(tree.header.total_size),
+        _ => 0..0,
+    };
+    let nodes = machine.nodes;
+    mm::init(&mm::BootMemory {
+        regions: &regions[..count],
+        taken: [tree_range, 0..0, 0..0, 0..0],
+        also_mapped: [0..0, 0..0],
+    });
+
+    // The low addresses are gone, and the tree was read through them:
+    // `tree` and `machine` point at nothing now. Read it again, where
+    // it is to be found from here on.
+    let tree = arch::device_tree(device_tree).map(Tree::new);
+    let machine = match &tree {
+        Some(Ok(tree)) => Machine::read(tree),
+        _ => Machine::default(),
+    };
+    assert_eq!(machine.nodes, nodes, "the device tree reads differently through the direct map");
+    // And it must stay as it is: its memory is not free memory.
+    if let Some(Ok(tree)) = &tree {
+        let last = device_tree + u64::from(tree.header.total_size) - 1;
+        let kept = mm::with_frames(|frames| ![device_tree, last].iter().any(|&byte| frames.is_free(PhysAddr::new(byte))));
+        assert!(kept, "the device tree is in memory the frame allocator will hand out");
+    }
+    kprintln!("[tree] read again through the direct map: the same {} nodes, in memory kept out of the allocator", machine.nodes);
+
+    selftest::run();
     arch::mmu::selftest();
 
+    #[cfg(feature = "fault-null")]
+    {
+        kprintln!();
+        kprintln!("[test] reading through a null pointer...");
+        let value = arch::fault_tests::null_read();
+        kprintln!("[test] FAILED: read {value:#x} from address 0");
+    }
     #[cfg(feature = "fault-page")]
     {
         kprintln!();

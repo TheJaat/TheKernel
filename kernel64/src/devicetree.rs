@@ -490,6 +490,11 @@ pub struct Machine<'a> {
     /// were found and not kept.
     pub memory: [Range; Machine::MEMORY_MAX],
     pub memory_count: usize,
+    /// Memory that is there but is not the kernel's to use: the
+    /// blob's own reserved list, and what the `/reserved-memory` node
+    /// gives an address to. Counted past the array like `memory`.
+    pub reserved: [Range; Machine::RESERVED_MAX],
+    pub reserved_count: usize,
     /// Each CPU's identifier (what its `MPIDR_EL1` register reads).
     pub cpus: [u64; Machine::CPUS_MAX],
     pub cpu_count: usize,
@@ -538,6 +543,7 @@ pub enum FirmwareCall {
 
 impl<'a> Machine<'a> {
     pub const MEMORY_MAX: usize = 8;
+    pub const RESERVED_MAX: usize = 16;
     pub const CPUS_MAX: usize = 16;
 
     pub fn read(tree: &Tree<'a>) -> Machine<'a> {
@@ -608,6 +614,26 @@ impl<'a> Machine<'a> {
             }
         }
 
+        // Reserved memory is described twice over. The blob has a
+        // list of its own, outside the tree (the old way); and the
+        // tree may have a `/reserved-memory` node whose children each
+        // say what one range is for (the new way). A child with no
+        // `reg` asks for memory to be found for it, which is not a
+        // range to stay out of. A disabled child reserves nothing.
+        let listed = tree.reserved();
+        let described = tree
+            .find("/reserved-memory")
+            .into_iter()
+            .flat_map(|node| node.children())
+            .filter(|child| child.enabled() && child.direct)
+            .flat_map(|child| child.reg());
+        for range in listed.chain(described).filter(|range| range.size > 0) {
+            if let Some(slot) = machine.reserved.get_mut(machine.reserved_count) {
+                *slot = range;
+            }
+            machine.reserved_count += 1;
+        }
+
         machine.serial = Machine::find_serial(tree);
         machine
     }
@@ -638,6 +664,11 @@ impl<'a> Machine<'a> {
     /// The memory ranges kept.
     pub fn memory(&self) -> &[Range] {
         &self.memory[..self.memory_count.min(Machine::MEMORY_MAX)]
+    }
+
+    /// The reserved ranges kept.
+    pub fn reserved(&self) -> &[Range] {
+        &self.reserved[..self.reserved_count.min(Machine::RESERVED_MAX)]
     }
 
     /// The CPU identifiers kept.
@@ -730,11 +761,13 @@ mod tests {
     struct Builder {
         structure: Vec<u8>,
         strings: Vec<u8>,
+        /// The blob's reserved list: (start, size) pairs.
+        reserved: Vec<(u64, u64)>,
     }
 
     impl Builder {
         fn new() -> Builder {
-            Builder { structure: Vec::new(), strings: Vec::new() }
+            Builder { structure: Vec::new(), strings: Vec::new(), reserved: Vec::new() }
         }
 
         fn pad(&mut self) {
@@ -778,17 +811,23 @@ mod tests {
             self.bytes(name, &value)
         }
 
+        fn reserve(mut self, start: u64, size: u64) -> Builder {
+            self.reserved.push((start, size));
+            self
+        }
+
         fn nothing(mut self) -> Builder {
             self.structure.extend(NOTHING.to_be_bytes());
             self
         }
 
-        /// The finished blob: header, an empty reserved list, the
-        /// structure (with its END token), the strings.
+        /// The finished blob: header, the reserved list (which ends
+        /// with a pair of zeroes), the structure (with its END token),
+        /// the strings.
         fn blob(mut self) -> Vec<u8> {
             self.structure.extend(9u32.to_be_bytes());
             let reserved_offset = HEADER_SIZE as u32;
-            let structure_offset = reserved_offset + 16;
+            let structure_offset = reserved_offset + 16 * (self.reserved.len() as u32 + 1);
             let strings_offset = structure_offset + self.structure.len() as u32;
             let total = strings_offset + self.strings.len() as u32;
             let words = [
@@ -804,6 +843,10 @@ mod tests {
                 self.structure.len() as u32,
             ];
             let mut blob: Vec<u8> = header(words).to_vec();
+            for (start, size) in &self.reserved {
+                blob.extend(start.to_be_bytes());
+                blob.extend(size.to_be_bytes());
+            }
             blob.extend([0u8; 16]);
             blob.extend(&self.structure);
             blob.extend(&self.strings);
@@ -1018,6 +1061,66 @@ mod tests {
         assert_eq!(machine.firmware_call, None);
         assert_eq!(machine.nodes, 13);
         assert_eq!(machine.deepest, 2);
+    }
+
+    #[test]
+    fn reserved_memory_is_gathered_from_both_places() {
+        let blob = Builder::new()
+            .reserve(0x8000_0000, 0x1_0000)
+            .reserve(0x9000_0000, 0) // an empty one reserves nothing
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("reserved-memory")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .bytes("ranges", &[])
+            .begin("firmware@88000000")
+            .cells("reg", &[0, 0x8800_0000, 0, 0x20_0000])
+            .bytes("no-map", &[])
+            .end()
+            // Wants 64 MiB found for it, anywhere: no address, so
+            // nothing to stay out of.
+            .begin("pool")
+            .cells("size", &[0, 0x400_0000])
+            .end()
+            .begin("unused@a0000000")
+            .text("status", &["disabled"])
+            .cells("reg", &[0, 0xA000_0000, 0, 0x1000])
+            .end()
+            .begin("two@b0000000")
+            .cells("reg", &[0, 0xB000_0000, 0, 0x1000, 1, 0, 0, 0x2000])
+            .end()
+            .end()
+            // Not under /reserved-memory: an ordinary device.
+            .begin("device@c0000000")
+            .cells("reg", &[0, 0xC000_0000, 0, 0x1000])
+            .end()
+            .end()
+            .blob();
+        let machine = Machine::read(&Tree::new(&blob).unwrap());
+        assert_eq!(
+            machine.reserved(),
+            [
+                Range { start: 0x8000_0000, size: 0x1_0000 },
+                Range { start: 0x8800_0000, size: 0x20_0000 },
+                Range { start: 0xB000_0000, size: 0x1000 },
+                Range { start: 0x1_0000_0000, size: 0x2000 },
+            ]
+        );
+    }
+
+    #[test]
+    fn more_reserved_ranges_than_there_is_room_for_are_counted() {
+        let mut builder = Builder::new();
+        for n in 0..20u64 {
+            builder = builder.reserve(n << 20, 0x1000);
+        }
+        let blob = builder.begin("").end().blob();
+        let machine = Machine::read(&Tree::new(&blob).unwrap());
+        assert_eq!(machine.reserved_count, 20);
+        assert_eq!(machine.reserved().len(), Machine::RESERVED_MAX);
+        assert_eq!(machine.reserved()[15], Range { start: 15 << 20, size: 0x1000 });
     }
 
     #[test]

@@ -1,5 +1,8 @@
-//! Translation tables - for now, only the one thing the kernel needs
-//! before it has a memory manager: a way to reach a device.
+//! The MMU: what the memory manager (mm.rs) asks of this CPU, and the
+//! one thing the kernel needs before there is a memory manager - a way
+//! to reach a device.
+//!
+//! # Before the memory manager
 //!
 //! entry.rs left one table empty: `boot_l2_device`, 512 entries of
 //! 2 MiB each, covering the top 1 GiB of the address space
@@ -11,11 +14,42 @@
 //! and is only there to get through the first instructions; a device
 //! needs the "device" kind (each access really happens, in order), and
 //! the low half of the address space belongs to programs.
+//!
+//! # The change of tables
+//!
+//! mm.rs builds the kernel's real tables - 4 KiB pages, each with the
+//! permissions its contents need - and calls `install_kernel_tables`.
+//! The devices mapped early are mapped again in the new tables, at the
+//! same addresses (`map_early_devices`), so the console never notices.
+//!
+//! Changing the tables under running code has a rule on this CPU,
+//! "break before make": an address must not go from one valid
+//! translation straight to a different one. The CPU remembers
+//! translations (in its TLB), and if it ever held the old and the new
+//! for one address at once - a 2 MiB one from the boot tables and a
+//! 4 KiB one from the new - it may do anything. So between old and new
+//! there must be a moment with *no* translation, and everything
+//! remembered forgotten. For the kernel's own code that moment is a
+//! problem: the code doing it would vanish from under itself.
+//!
+//! The way out is the low mapping entry.rs made: the image is still
+//! reachable at its physical addresses, through the *other* root
+//! register. `replace_kernel_tables` is called there, turns the
+//! kernel's half off altogether, forgets, installs the new root, turns
+//! it on, and returns - to a high address, now translated by the new
+//! tables. After that the low mapping has done its last job and is
+//! turned off: address 0, and every other low address, faults.
 
-use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::arch::{asm, global_asm};
+use core::ops::Range;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use kernel64::aarch64::{descriptor, BLOCK_SIZE, DEVICE_WINDOW};
+use kernel64::aarch64::{descriptor, BLOCK_SIZE, DEVICE_WINDOW, KERNEL_WINDOW, TEXT_OFFSET};
+use kernel64::memory::addr::{phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE};
+use kernel64::memory::frame::FrameAllocator;
+use kernel64::paging::{Flags, PageSize, PageTables};
+
+use crate::mm;
 
 extern "C" {
     /// The table, in entry.rs.
@@ -24,13 +58,18 @@ extern "C" {
 
 /// The next entry of the table not yet used.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Set when the kernel's own tables take over: the boot table is then
+/// no longer part of what the CPU uses, and writing to it maps nothing.
+static EARLY_OVER: AtomicBool = AtomicBool::new(false);
 
 /// Maps the 2 MiB step that holds `physical` as device memory, and
 /// returns the address at which `physical` itself can now be used.
 ///
 /// Never undone, and at most 512 times: this is for the handful of
-/// devices needed before memory management starts.
+/// devices needed before memory management starts. After it has
+/// started, `mm::map_mmio` is the way.
 pub fn map_early_device(physical: u64) -> *mut u8 {
+    assert!(!EARLY_OVER.load(Ordering::Relaxed), "map_early_device after the memory manager started");
     let slot = NEXT.fetch_add(1, Ordering::Relaxed);
     assert!(slot < 512, "no room left in the early device window");
     let step = physical & !(BLOCK_SIZE - 1);
@@ -47,68 +86,139 @@ pub fn map_early_device(physical: u64) -> *mut u8 {
     (DEVICE_WINDOW + slot as u64 * BLOCK_SIZE + (physical - step)) as *mut u8
 }
 
-// ---- the kernel's tables, through the shared page-table code ---------
-
-use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicU64;
-
-use kernel64::aarch64::{KERNEL_WINDOW, TEXT_OFFSET};
-use kernel64::memory::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
-use kernel64::paging::{Flags, Format, FrameSource, PageSize, PageTables};
+// ---- what the memory manager asks of any CPU ---------------------------
 
 /// How far the kernel's addresses are from where its bytes really are:
 /// `virtual - physical`, for anything in the image. Unknown until the
 /// kernel is told where it was loaded.
 static IMAGE_DELTA: AtomicU64 = AtomicU64::new(0);
+/// Where the image was loaded.
+static LOADED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Records where the image was loaded. Call once, first.
 pub fn set_load_address(loaded_at: u64) {
+    LOADED_AT.store(loaded_at, Ordering::Relaxed);
     IMAGE_DELTA.store((KERNEL_WINDOW + TEXT_OFFSET).wrapping_sub(loaded_at), Ordering::Relaxed);
 }
 
-#[repr(C, align(4096))]
-struct Page(UnsafeCell<[u8; 4096]>);
-
-// SAFETY: the pages are handed out one at a time, each once (`Pool`),
-// and from then on belong to whoever was given them.
-unsafe impl Sync for Page {}
-
-/// A few pages inside the kernel image, for page tables made before
-/// there is a frame allocator. In `.bss`: zeroed, and already mapped.
-const POOL_PAGES: usize = 8;
-static POOL: [Page; POOL_PAGES] = [const { Page(UnsafeCell::new([0; 4096])) }; POOL_PAGES];
-static POOL_NEXT: AtomicUsize = AtomicUsize::new(0);
-
-/// Hands out the pool's pages, by physical address. Nothing given back
-/// is reused: there are eight, for a handful of early mappings.
-pub struct Pool;
-
-impl FrameSource for Pool {
-    fn allocate_frame(&mut self) -> Option<PhysAddr> {
-        let page = POOL.get(POOL_NEXT.fetch_add(1, Ordering::Relaxed))?;
-        Some(PhysAddr::new((page as *const Page as u64).wrapping_sub(IMAGE_DELTA.load(Ordering::Relaxed))))
-    }
-
-    fn free_frame(&mut self, _frame: PhysAddr) {}
+/// Where the byte the kernel sees at `virt`, an address inside its own
+/// image, really is. Not a constant as on a PC: an AArch64 machine has
+/// its memory wherever it likes, and the loader puts the image where
+/// it likes in that.
+pub fn kernel_physical(virt: u64) -> u64 {
+    virt.wrapping_sub(IMAGE_DELTA.load(Ordering::Relaxed))
 }
 
-/// The tree the CPU is using for the kernel's half right now - the one
-/// entry.rs built by hand - as a `PageTables`, so that the ordinary
-/// mapping code can add to it.
+/// The physical memory that can be read and written, at its physical
+/// address, before the kernel has page tables of its own: the one GiB
+/// the image is in, which entry.rs mapped to itself. (It mapped the
+/// GiB of the device tree too, but that need not be memory.)
+pub fn early_reach() -> Range<u64> {
+    const GIB: u64 = 1 << 30;
+    let start = LOADED_AT.load(Ordering::Relaxed) & !(GIB - 1);
+    start..start + GIB
+}
+
+/// Every AArch64 CPU can forbid execution page by page.
+pub fn supports_no_execute() -> bool {
+    true
+}
+
+/// Maps the devices `map_early_device` mapped again, in `tables`, at
+/// the same addresses - so that whoever was given a pointer to one can
+/// go on using it when `tables` take over. From here on
+/// `map_early_device` refuses.
+pub fn map_early_devices(tables: &mut PageTables, frames: &mut FrameAllocator) {
+    EARLY_OVER.store(true, Ordering::Relaxed);
+    let flags = Flags::WRITABLE | Flags::NO_CACHE | Flags::WRITE_THROUGH | Flags::GLOBAL | Flags::NO_EXECUTE;
+    for slot in 0..NEXT.load(Ordering::Relaxed).min(512) {
+        // SAFETY: the table is in the kernel's .bss and `slot` is
+        // inside it; nothing writes to it any more.
+        let entry = unsafe { (&raw const boot_l2_device).cast::<u64>().add(slot).read_volatile() };
+        // Bits 21-47 of a 2 MiB entry are where it points.
+        let physical = PhysAddr::new(entry & 0x0000_FFFF_FFE0_0000);
+        let virt = VirtAddr::new(DEVICE_WINDOW + slot as u64 * BLOCK_SIZE);
+        tables
+            .map(virt, physical, PageSize::Size2M, flags, frames)
+            .unwrap_or_else(|error| panic!("mapping the early device at {physical:#x} again failed: {error:?}"));
+    }
+}
+
+global_asm!(
+    r#"
+    .section .text
+    .balign 4
+    .global replace_kernel_tables
+    // x0: the physical address of the new top table for the kernel's
+    // half. Must be called at this code's PHYSICAL address (through
+    // the low mapping), with interrupts off. Touches no memory: while
+    // the kernel's half is off there is no stack to touch. Every
+    // instruction is position-independent - there is not one address
+    // in it.
+replace_kernel_tables:
+    mrs     x9, tcr_el1
+    orr     x10, x9, #(1 << 23)     // EPD1: look nothing up through TTBR1
+    msr     tcr_el1, x10
+    isb                             // the kernel's half no longer exists
+    tlbi    vmalle1                 // forget every translation remembered
+    dsb     nsh                     // ...and wait until that is done
+    isb
+    msr     ttbr1_el1, x0           // the new tables
+    msr     tcr_el1, x9             // the kernel's half exists again
+    isb
+    ret                             // to a high address: the new tables' first use
+"#
+);
+
+extern "C" {
+    fn replace_kernel_tables(root: u64);
+}
+
+/// Makes the tree at physical `root` the kernel's page tables, and
+/// turns the low half of the address space off.
 ///
 /// # Safety
-/// One at a time: two of these alive together could change the same
-/// table at once. And the frames given to it must come from the image
-/// (`Pool`), since it reaches tables at `physical + IMAGE_DELTA`.
-pub unsafe fn kernel_tables() -> PageTables {
-    let root: u64;
-    // SAFETY: reading the register changes nothing.
-    unsafe { asm!("mrs {}, ttbr1_el1", out(reg) root, options(nomem, nostack, preserves_flags)) };
-    // SAFETY: the root register holds a tree in this CPU's own format,
-    // whose tables are all in the image; the rest is the caller's.
+/// The tree must map everything the kernel uses from here on, where it
+/// is now: its code, its data, the stack this runs on, the console.
+/// Nothing may be using a low (physical) address any more. One CPU,
+/// interrupts off.
+pub unsafe fn install_kernel_tables(root: u64, _no_execute: bool) {
+    // The routine's low address: where its bytes really are.
+    let low = kernel_physical(replace_kernel_tables as *const () as u64);
+    assert!(early_reach().contains(&low), "the kernel image runs over the end of the one GiB mapped low");
+    // SAFETY: `low` is the routine's own code, seen through the low
+    // mapping, which is executable; it takes one number and follows
+    // the C convention as far as it uses anything (x0, x9, x10, x30).
+    let replace: extern "C" fn(u64) = unsafe { core::mem::transmute(low as *const ()) };
+    replace(root);
+
+    // The low mapping has done its last job. Turn that half off too
+    // (EPD0, bit 7) and forget what was remembered of it; it comes
+    // back when there is a program to run in it.
+    // SAFETY: the caller promised nothing uses a low address.
     unsafe {
-        PageTables::adopt(PhysAddr::new(root & 0x0000_FFFF_FFFF_F000), IMAGE_DELTA.load(Ordering::Relaxed), Format::AArch64)
+        asm!(
+            "mrs {t}, tcr_el1",
+            "orr {t}, {t}, #(1 << 7)",
+            "msr tcr_el1, {t}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            t = out(reg) _,
+            options(nostack, preserves_flags),
+        );
     }
+}
+
+/// Called after mappings are added, before they are used. This CPU
+/// may go on for a while not seeing a write to a table (the write can
+/// sit in a buffer, and instructions already under way looked before
+/// it): `dsb` waits until the write has happened, `isb` makes
+/// everything after it start afresh.
+pub fn commit_mappings() {
+    // SAFETY: both only wait.
+    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
 }
 
 /// Asks the CPU itself what `virt` translates to, for a read or for a
@@ -145,89 +255,101 @@ pub fn flush(virt: u64) {
     }
 }
 
-/// Two addresses for the checks below, in the last 2 MiB of the
-/// address space - the last entry of the device table, never used for
-/// a device (`map_early_device` counts up from the first).
-pub const TEST_WRITABLE: u64 = 0xFFFF_FFFF_FFE0_0000;
-pub const TEST_READ_ONLY: u64 = TEST_WRITABLE + PAGE_SIZE;
+// ---- checked against the CPU -------------------------------------------
 
-/// Checks the shared page-table code against the CPU: that it reads
-/// the live tables as the CPU does, and that what it writes means to
-/// the CPU what was asked for.
-///
-/// Leaves one page mapped twice - writable and not executable at
-/// `TEST_WRITABLE`, read-only at `TEST_READ_ONLY` - for the fault
-/// tests to break the rules on.
+/// An address nothing else uses (2 MiB above the one selftest.rs has).
+const TEST_PAGE: u64 = 0xFFFF_D000_0020_0000;
+
+/// An immutable static, so it lands in .rodata.
+static READ_ONLY: u64 = 0x0063_6F6E_7374;
+
+/// What selftest.rs checks, it checks by reading the tables with the
+/// kernel's own code. This asks the CPU: that it reads the kernel's
+/// tables as that code does, that it would refuse what they forbid,
+/// that the low half is gone, and that a changed mapping is forgotten
+/// when it is told to forget.
 pub fn selftest() {
-    // SAFETY: the only one; the CPU is alone and interrupts are off.
-    let mut tables = unsafe { kernel_tables() };
-    let mut pool = Pool;
+    let boxed = alloc::boxed::Box::new(0x6865_6170u64);
+    let code = selftest as *const () as u64;
+    let constant = &raw const READ_ONLY as u64;
+    let variable = &raw const IMAGE_DELTA as u64;
+    let heap = &raw const *boxed as u64;
+    let direct = mm::DIRECT_MAP + kernel_physical(constant);
+    let device = DEVICE_WINDOW + 0x123;
+    let guard = mm::kernel_layout().stack_guard;
 
-    // 1. Reading. Addresses of every kind the boot tables hold - code,
-    // a variable, a device - and two that are not mapped. The CPU's
-    // answer and the code's must be the same.
-    let variable = &IMAGE_DELTA as *const AtomicU64 as u64;
-    let device = map_early_device(0x0900_0000) as u64; // any device will do: it is not touched
-    let addresses = [selftest as *const () as u64, variable, device + 0x123, TEST_WRITABLE, KERNEL_WINDOW - PAGE_SIZE];
-    for address in addresses {
-        let ours = tables.translate(VirtAddr::new(address)).map(|found| found.physical.as_u64());
-        let cpus = cpu_translate(address, false);
-        assert_eq!(ours, cpus, "the tables read differently from the CPU at {address:#x}");
-    }
-    assert!(cpu_translate(variable, false).is_some() && cpu_translate(TEST_WRITABLE, false).is_none());
-    kprintln!("[paging] the tables the CPU is using, read by the kernel: {} lookups, all as the CPU does them", addresses.len());
+    // 1. Reading: every kind of mapping the kernel has, and two
+    // addresses that have none.
+    let addresses = [code, constant, variable, heap, direct, device, guard, KERNEL_WINDOW - PAGE_SIZE];
+    mm::with_memory(|tables, _| {
+        for address in addresses {
+            let ours = tables.translate(VirtAddr::new(address)).map(|found| found.physical.as_u64());
+            let cpus = cpu_translate(address, false);
+            assert_eq!(ours, cpus, "the tables read differently from the CPU at {address:#x}");
+        }
+    });
+    assert_eq!(cpu_translate(constant, false), Some(kernel_physical(constant)));
+    assert_eq!(cpu_translate(direct, false), Some(kernel_physical(constant)), "the direct map is not direct");
+    assert_eq!(cpu_translate(guard, false), None, "the page under the boot stack is mapped");
+    // SAFETY: the direct map shows all memory, the kernel's image
+    // included; this reads the constant through it.
+    assert_eq!(unsafe { (direct as *const u64).read_volatile() }, READ_ONLY);
+    kprintln!("[paging] the kernel's own tables, read by the kernel and by the CPU: {} lookups, all the same", addresses.len());
 
-    // 2. Writing. One page of the pool, mapped twice.
-    let frame = pool.allocate_frame().expect("the pool has a page");
-    let data = Flags::WRITABLE | Flags::NO_EXECUTE | Flags::GLOBAL;
-    let constant = Flags::NO_EXECUTE | Flags::GLOBAL;
-    tables
-        .map(VirtAddr::new(TEST_WRITABLE), frame, PageSize::Size4K, data, &mut pool)
-        .and_then(|()| tables.map(VirtAddr::new(TEST_READ_ONLY), frame, PageSize::Size4K, constant, &mut pool))
-        .expect("mapping the test page");
-    // SAFETY: both addresses were mapped a moment ago to a page of the
-    // pool that nothing else has; `dsb`/`isb` as in map_early_device.
-    let read_back = unsafe {
-        asm!("dsb ishst", "isb", options(nostack, preserves_flags));
-        (TEST_WRITABLE as *mut u64).write_volatile(0x5441_414A_2D36_3421);
-        (TEST_READ_ONLY as *const u64).read_volatile()
-    };
-    assert_eq!(read_back, 0x5441_414A_2D36_3421, "the two mappings are not of the same page");
-    assert_eq!(cpu_translate(TEST_WRITABLE, true), Some(frame.as_u64()), "the CPU would not allow a write to the writable page");
-    assert_eq!(cpu_translate(TEST_READ_ONLY, false), Some(frame.as_u64()));
-    assert_eq!(cpu_translate(TEST_READ_ONLY, true), None, "the CPU would allow a write to the read-only page");
+    // 2. Permissions, as the CPU would apply them to a write.
+    assert_eq!(cpu_translate(code, true), None, "the CPU would let the kernel write to its code");
+    assert_eq!(cpu_translate(constant, true), None, "the CPU would let the kernel write to its constants");
+    assert!(cpu_translate(variable, true).is_some(), "the CPU would not let the kernel write to its variables");
+    assert!(cpu_translate(heap, true).is_some(), "the CPU would not let the kernel write to its heap");
+    kprintln!("[paging] the CPU refuses a write to code and to constants, and allows one to variables and the heap");
+
+    // 3. The low half. The kernel's own bytes were readable at their
+    // physical address until a moment ago.
+    let low = kernel_physical(code);
+    assert_eq!(cpu_translate(0, false), None, "address 0 is mapped");
+    assert_eq!(cpu_translate(low, false), None, "the low mapping the kernel started on is still there");
+    kprintln!("[paging] the low half is off: address 0 and {low:#x}, where this code really is, translate to nothing");
+
+    // 4. Removing, and changing. An address mapped to one page and
+    // read through - so the CPU now remembers that translation - then
+    // unmapped, and mapped to a different page. What is read there
+    // next must come from the new page: if the CPU were not made to
+    // forget (`flush`), it would go on reading the old one.
+    let (first, second) = mm::with_memory(|tables, frames| {
+        let first = frames.allocate().expect("no free frame");
+        let second = frames.allocate().expect("no free frame");
+        let flags = Flags::GLOBAL | Flags::NO_EXECUTE;
+        // SAFETY: both frames were allocated a moment ago, so nothing
+        // else uses them; they are written through the direct map and
+        // read at TEST_PAGE, which is mapped to one of them each time
+        // it is read.
+        unsafe {
+            phys_to_virt(first).as_mut_ptr::<u64>().write_volatile(0x0066_6972_7374);
+            phys_to_virt(second).as_mut_ptr::<u64>().write_volatile(0x7365_636F_6E64);
+            tables.map(VirtAddr::new(TEST_PAGE), first, PageSize::Size4K, flags, frames).expect("mapping the test page");
+            commit_mappings();
+            assert_eq!((TEST_PAGE as *const u64).read_volatile(), 0x0066_6972_7374);
+            assert_eq!(cpu_translate(TEST_PAGE, true), None, "the CPU would allow a write to a read-only page");
+
+            assert_eq!(tables.unmap(VirtAddr::new(TEST_PAGE)), Some(first));
+            flush(TEST_PAGE);
+            assert_eq!(cpu_translate(TEST_PAGE, false), None, "the CPU still translates an address that was unmapped");
+
+            tables.map(VirtAddr::new(TEST_PAGE), second, PageSize::Size4K, flags, frames).expect("mapping the test page");
+            commit_mappings();
+            let read = (TEST_PAGE as *const u64).read_volatile();
+            assert_eq!(read, 0x7365_636F_6E64, "after being mapped to another page, the address still reads the old one");
+
+            assert_eq!(tables.unmap(VirtAddr::new(TEST_PAGE)), Some(second));
+            flush(TEST_PAGE);
+        }
+        frames.free(first);
+        frames.free(second);
+        (first, second)
+    });
     kprintln!(
-        "[paging] a page at {:#x} mapped twice: written at {TEST_WRITABLE:#x}, read at {TEST_READ_ONLY:#x}, where the CPU refuses a write",
-        frame.as_u64()
-    );
-
-    // 3. Removing, and changing. A third address, mapped to the page
-    // and read through - so the CPU now remembers that translation -
-    // then unmapped, and mapped to a different page. What is read
-    // there next must come from the new page: if the CPU were not
-    // made to forget (`flush`), it would go on reading the old one.
-    let moved = TEST_READ_ONLY + PAGE_SIZE;
-    let other = pool.allocate_frame().expect("the pool has a second page");
-    tables.map(VirtAddr::new(moved), frame, PageSize::Size4K, constant, &mut pool).expect("mapping the test page");
-    // SAFETY: `moved` is mapped, each time it is read, to a page of
-    // the pool; `other`'s page is in the image, so it can be written at
-    // its ordinary address, which is the physical one plus the delta.
-    let (before, between, after) = unsafe {
-        asm!("dsb ishst", "isb", options(nostack, preserves_flags));
-        let before = (moved as *const u64).read_volatile();
-        assert_eq!(tables.unmap(VirtAddr::new(moved)), Some(frame));
-        flush(moved);
-        let between = cpu_translate(moved, false);
-        (other.as_u64().wrapping_add(IMAGE_DELTA.load(Ordering::Relaxed)) as *mut u64).write_volatile(0x6F74_6865_7221);
-        tables.map(VirtAddr::new(moved), other, PageSize::Size4K, constant, &mut pool).expect("mapping the test page");
-        asm!("dsb ishst", "isb", options(nostack, preserves_flags));
-        (before, between, (moved as *const u64).read_volatile())
-    };
-    assert_eq!(before, 0x5441_414A_2D36_3421);
-    assert_eq!(between, None, "the CPU still translates an address that was unmapped");
-    assert_eq!(after, 0x6F74_6865_7221, "after being mapped to another page, the address still reads the old one");
-    kprintln!(
-        "[paging] a third address unmapped, then mapped to the page at {:#x}: the CPU reads the new page there",
-        other.as_u64()
+        "[paging] one address mapped to the page at {:#x}, then to the one at {:#x}: the CPU reads the new page there",
+        first.as_u64(),
+        second.as_u64()
     );
 }
