@@ -316,6 +316,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     // own timer.
     kprintln!();
     let mut disk = None;
+    let mut network = None;
     // SAFETY: once, on the only CPU running, interrupts still masked.
     let threads_run = match unsafe { arch::init_interrupts(&machine) } {
         Some(interrupts) => {
@@ -367,6 +368,10 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
             kprintln!();
             disk = mmio_devices::first_disk(&devices);
             selftest::disk(disk.as_ref());
+            // A network card is only made ready here: its driver needs
+            // someone on the wire to be tested against, which is a
+            // test of the whole system's.
+            network = mmio_devices::first_network(&devices);
             true
         }
         None => {
@@ -423,7 +428,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 
     // The rest is programs: init, and what init starts. They need
     // threads, and a terminal to be of any use.
-    if threads_run && start_init(&machine, disk) {
+    if threads_run && start_init(&machine, disk.into_iter().chain(network)) {
         idle()
     }
     kprintln!();
@@ -439,7 +444,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 ///   3  the memory the serial port's registers are in
 ///   4  a channel from the kernel, carrying one message per device it
 ///      made ready: "mmio", an `MmioDeviceInfo`, and the device's
-///      handles (so far: a disk)
+///      handles (a disk, a network card)
 ///   5  the system handle: the right to look at memory and processes
 ///
 /// The serial port is this machine's keyboard and its screen at once,
@@ -451,7 +456,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 /// False - and nothing started - if the device tree describes no
 /// serial port with an interrupt.
 #[cfg(target_arch = "aarch64")]
-fn start_init(machine: &kernel64::devicetree::Machine, disk: Option<mmio_devices::Ready>) -> bool {
+fn start_init(machine: &kernel64::devicetree::Machine, devices: impl IntoIterator<Item = mmio_devices::Ready>) -> bool {
     use ipc::Object;
     use kernel64::cap::Rights;
     use kernel64::paging::Flags;
@@ -472,13 +477,14 @@ fn start_init(machine: &kernel64::devicetree::Machine, disk: Option<mmio_devices
         if edge { "edge" } else { "level" }
     );
 
-    let (devices, to_init) = ipc::channel();
-    if let Some(disk) = disk {
+    let (from_kernel, to_init) = ipc::channel();
+    for device in devices {
+        let what = if device.info.device == virtio::mmio::DEVICE_NETWORK { "network card" } else { "block device" };
         let mut message = b"mmio".to_vec();
-        message.extend_from_slice(&disk.info.to_bytes());
-        match ipc::kernel_send(&to_init, &message, disk.handles) {
-            Ok(()) => kprintln!("[virtio] {:#x} block device: handed to init", disk.info.registers),
-            Err(error) => kprintln!("[virtio] {:#x} block device: could not hand it to init: {error:?}", disk.info.registers),
+        message.extend_from_slice(&device.info.to_bytes());
+        match ipc::kernel_send(&to_init, &message, device.handles) {
+            Ok(()) => kprintln!("[virtio] {:#x} {what}: handed to init", device.info.registers),
+            Err(error) => kprintln!("[virtio] {:#x} {what}: could not hand it to init: {error:?}", device.info.registers),
         }
     }
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
@@ -487,7 +493,7 @@ fn start_init(machine: &kernel64::devicetree::Machine, disk: Option<mmio_devices
         (Object::Launcher, Rights(0)),
         (Object::Interrupt(line), Rights::ALL),
         (Object::Memory(alloc::sync::Arc::new(registers)), Rights::ALL),
-        (devices, Rights(abi::rights::RECEIVE)),
+        (from_kernel, Rights(abi::rights::RECEIVE)),
         (Object::System, Rights::ALL),
     ];
     let (init, _) = process::spawn("init", programs::INIT, handles).expect("starting init");

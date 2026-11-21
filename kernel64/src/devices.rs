@@ -21,7 +21,8 @@
 //! is protected from by the CPU (it cannot touch anything else directly)
 //! but not by the bus.
 //!
-//! Only virtio block devices are offered so far.
+//! Offered so far: virtio block devices (disks) and virtio network
+//! cards, both of the kind that speaks the legacy interface.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -37,6 +38,22 @@ use crate::{interrupts, mm};
 
 /// DMA memory for a block driver: its virtqueue and request buffers.
 const BLOCK_DMA_PAGES: u64 = 16;
+/// And for a network card's: two queues, and forty buffers of a frame
+/// each (`user/src/bin/nic.rs` says where each lies).
+const NETWORK_DMA_PAGES: u64 = 40;
+
+/// What a virtio device this kernel can hand on is called, and how
+/// much DMA memory its driver gets. None: no driver for it.
+fn offered(device: &Device) -> Option<(&'static str, u64)> {
+    if device.vendor != virtio::PCI_VENDOR {
+        return None;
+    }
+    match device.device {
+        virtio::PCI_DEVICE_BLOCK => Some(("virtio block device", BLOCK_DMA_PAGES)),
+        virtio::PCI_DEVICE_NETWORK => Some(("virtio network card", NETWORK_DMA_PAGES)),
+        _ => None,
+    }
+}
 
 /// Scans the bus and sends init a message for each device it can drive.
 pub fn offer(to_init: &Object) {
@@ -48,14 +65,14 @@ pub fn offer(to_init: &Object) {
             d.address, d.vendor, d.device, d.class, d.subclass, d.kind()
         );
     }
-    for device in devices.iter().filter(|d| d.vendor == virtio::PCI_VENDOR && d.device == virtio::PCI_DEVICE_BLOCK) {
-        match prepare(&mut config, device) {
+    for (device, (what, dma_pages)) in devices.iter().filter_map(|device| Some((device, offered(device)?))) {
+        match prepare(&mut config, device, dma_pages) {
             Ok((info, handles)) => {
                 let mut message = b"pci".to_vec();
                 message.extend_from_slice(&info.to_bytes());
                 match ipc::kernel_send(to_init, &message, handles) {
                     Ok(()) => kprintln!(
-                        "[pci] {} virtio block device: ports {:#x}+{:#x}, {} KiB DMA at {:#x}, {} - handed to init",
+                        "[pci] {} {what}: ports {:#x}+{:#x}, {} KiB DMA at {:#x}, {} - handed to init",
                         device.address,
                         info.io_base,
                         info.io_size,
@@ -66,14 +83,14 @@ pub fn offer(to_init: &Object) {
                     Err(error) => kprintln!("[pci] {}: could not hand it to init: {error:?}", device.address),
                 }
             }
-            Err(why) => kprintln!("[pci] {} virtio block device not usable: {why}", device.address),
+            Err(why) => kprintln!("[pci] {} {what} not usable: {why}", device.address),
         }
     }
 }
 
 type Handles = Vec<(Object, Rights)>;
 
-fn prepare(config: &mut Ports, device: &Device) -> Result<(PciDeviceInfo, Handles), &'static str> {
+fn prepare(config: &mut Ports, device: &Device, dma_pages: u64) -> Result<(PciDeviceInfo, Handles), &'static str> {
     let address = device.address;
     let Some(Bar::Io { base, size }) = pci::bar(config, address, 0) else {
         return Err("BAR 0 is not I/O ports (not a legacy-capable device)");
@@ -90,7 +107,7 @@ fn prepare(config: &mut Ports, device: &Device) -> Result<(PciDeviceInfo, Handle
         command | pci::COMMAND_IO | pci::COMMAND_MEMORY | pci::COMMAND_BUS_MASTER | pci::COMMAND_INTX_DISABLE,
     );
 
-    let (dma, dma_physical) = MemoryObject::contiguous(BLOCK_DMA_PAGES).ok_or("no contiguous memory for DMA")?;
+    let (dma, dma_physical) = MemoryObject::contiguous(dma_pages).ok_or("no contiguous memory for DMA")?;
     let dma_size = dma.size();
     let mut handles: Handles = alloc::vec![
         (Object::IoPorts(base..base + size), Rights::ALL),

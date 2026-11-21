@@ -41,6 +41,8 @@ pub static FOREVER: &[u8] = program!("forever");
 /// The disk driver: the same program for a disk on a PCI bus and one
 /// at a place in memory.
 pub static BLK: &[u8] = program!("blk");
+/// The network card's driver: likewise one program for both.
+pub static NIC: &[u8] = program!("nic");
 
 /// The system's own programs: the first process, and what it starts.
 pub static INIT: &[u8] = program!("init");
@@ -103,6 +105,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("display", DISPLAY),
     ("fs", FS),
     ("blk", BLK),
+    ("nic", NIC),
     ("registry", REGISTRY),
     ("echod", ECHOD),
     ("echoc", ECHOC),
@@ -118,6 +121,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("shell", SHELL),
     ("fs", FS),
     ("blk", BLK),
+    ("nic", NIC),
     ("registry", REGISTRY),
     ("echod", ECHOD),
     ("echoc", ECHOC),

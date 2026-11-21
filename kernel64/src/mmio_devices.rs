@@ -50,6 +50,9 @@ use crate::{arch, mm};
 
 /// DMA memory for a block driver: its virtqueue and request buffers.
 const BLOCK_DMA_PAGES: u64 = 16;
+/// And for a network card's: two queues, and forty buffers of a frame
+/// each (`user/src/bin/nic.rs` says where each lies).
+const NETWORK_DMA_PAGES: u64 = 40;
 
 /// A device made ready: its description, and the handles a driver is
 /// started with - registers, DMA memory, then the interrupt if there
@@ -62,15 +65,17 @@ pub struct Ready {
 /// Makes `found` ready for a driver. After the interrupt controller is
 /// set up: the device's interrupt is one of its lines.
 pub fn prepare(found: &Found) -> Result<Ready, &'static str> {
-    if found.identity.device != mmio::DEVICE_BLOCK {
-        return Err("no driver for this kind of device yet");
-    }
+    let dma_pages = match found.identity.device {
+        mmio::DEVICE_BLOCK => BLOCK_DMA_PAGES,
+        mmio::DEVICE_NETWORK => NETWORK_DMA_PAGES,
+        _ => return Err("no driver for this kind of device yet"),
+    };
     if found.identity.version != 1 {
         return Err("the modern interface - no driver speaks it yet");
     }
     let slot = &found.slot;
     let registers = MemoryObject::device(slot.registers.start, slot.registers.size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
-    let (dma, dma_physical) = MemoryObject::contiguous(BLOCK_DMA_PAGES).ok_or("no contiguous memory for DMA")?;
+    let (dma, dma_physical) = MemoryObject::contiguous(dma_pages).ok_or("no contiguous memory for DMA")?;
     let dma_size = dma.size();
     let mut handles = alloc::vec![
         (Object::Memory(Arc::new(registers)), Rights::ALL),
@@ -109,7 +114,16 @@ pub fn prepare(found: &Found) -> Result<Ready, &'static str> {
 /// The first block device among `found` that a driver exists for, made
 /// ready; what stands in the way of the others is said.
 pub fn first_disk(found: &[Found]) -> Option<Ready> {
-    for device in found.iter().filter(|device| device.identity.device == mmio::DEVICE_BLOCK) {
+    first(found, mmio::DEVICE_BLOCK)
+}
+
+/// The same for the first network card.
+pub fn first_network(found: &[Found]) -> Option<Ready> {
+    first(found, mmio::DEVICE_NETWORK)
+}
+
+fn first(found: &[Found], kind: u32) -> Option<Ready> {
+    for device in found.iter().filter(|device| device.identity.device == kind) {
         match prepare(device) {
             Ok(ready) => return Some(ready),
             Err(why) => kprintln!("[virtio] {:#x} {}: {why}", device.slot.registers.start, device.identity.kind()),

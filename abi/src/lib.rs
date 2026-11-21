@@ -813,6 +813,322 @@ pub mod block {
     }
 }
 
+/// The network card service's protocol: whole Ethernet frames, in and
+/// out. Nothing here knows what is in a frame beyond its first six
+/// bytes (who it is for): that is the business of whoever uses the
+/// card.
+///
+/// A frame is up to 1514 bytes (FRAME_MAX: two addresses, a type, and
+/// 1500 bytes of payload; the checksum at the end is the card's) and a
+/// message carries 1024. So a frame travels in pieces, each a message:
+/// zero or more `PART`s and then one `LAST`, each `[op] [bytes]`. Both
+/// directions use the same two messages; `split` cuts a frame up and
+/// `Assembler` puts one together.
+///
+/// Requests to the driver, on its request channel:
+///
+///   INFO, STATS, STALL   as with the disk: one handle, the end of a
+///                        fresh channel, and the reply `[status]
+///                        [payload]` comes back on it
+///   LISTEN               one handle: a channel the driver is to send
+///                        every frame it receives on, from now on (in
+///                        place of whoever listened before). No reply
+///   PART, LAST           a frame to send. No handle and no reply: a
+///                        network may lose a frame anyway, and a reply
+///                        per frame would double the cost of each. What
+///                        was refused is counted (STATS)
+///   DROP                 forget the PARTs sent so far: for a sender
+///                        that could not finish a frame (the queue was
+///                        full for its LAST), before it begins another
+///
+/// One sender at a time: pieces of two frames on one channel would be
+/// put together as one.
+///
+/// A frame the listener has no room for is dropped, and counted: the
+/// driver never waits for a client.
+pub mod nic {
+    /// The longest frame, without its checksum.
+    pub const FRAME_MAX: usize = 1514;
+    /// The shortest that says anything: two addresses and a type.
+    pub const FRAME_MIN: usize = 14;
+    /// The shortest a card may put on the wire, again without the
+    /// checksum; the driver pads a shorter one with zeroes.
+    pub const WIRE_MIN: usize = 60;
+    /// An address on an Ethernet: six bytes.
+    pub const ADDRESS: usize = 6;
+    pub const BROADCAST: [u8; ADDRESS] = [0xFF; ADDRESS];
+
+    /// Reply payload: the card's address (6 bytes), then 1 if the link
+    /// is up.
+    pub const INFO: u8 = 1;
+    pub const INFO_SIZE: usize = ADDRESS + 1;
+    /// Bytes of a frame, with more to come.
+    pub const PART: u8 = 2;
+    /// The last bytes of a frame - or all of it.
+    pub const LAST: u8 = 3;
+    pub const LISTEN: u8 = 4;
+    /// Reply payload: the counters, each u64 LE, in `Stats`' order.
+    pub const STATS: u8 = 5;
+    /// Payload: a number of ticks (u64 LE, at most STALL_MAX). A test:
+    /// answered, and then the driver does nothing for that long.
+    pub const STALL: u8 = 6;
+    /// The pieces so far are of a frame that will not be finished.
+    pub const DROP: u8 = 7;
+
+    pub const OK: u8 = 0;
+    pub const BAD_REQUEST: u8 = 1;
+
+    /// Most bytes of a frame in one message.
+    pub const PIECE_MAX: usize = super::MESSAGE_MAX as usize - 1;
+
+    /// What the driver has counted since it started.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Stats {
+        /// Frames the card handed over.
+        pub received: u64,
+        /// Of those: passed on to the listener.
+        pub delivered: u64,
+        /// Addressed to another card, and not to everyone.
+        pub not_ours: u64,
+        /// Nobody was listening, or the listener had no room.
+        pub dropped: u64,
+        /// Frames given to the card to send.
+        pub sent: u64,
+        /// Frames a client asked to send that were not: too short, too
+        /// long, or the card had no room.
+        pub refused: u64,
+    }
+
+    impl Stats {
+        pub const SIZE: usize = 6 * 8;
+
+        pub fn to_bytes(&self) -> [u8; Stats::SIZE] {
+            let mut bytes = [0u8; Stats::SIZE];
+            let fields = [self.received, self.delivered, self.not_ours, self.dropped, self.sent, self.refused];
+            for (chunk, field) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
+                *chunk = field.to_le_bytes();
+            }
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Option<Stats> {
+            if bytes.len() != Stats::SIZE {
+                return None;
+            }
+            let mut fields = bytes.as_chunks::<8>().0.iter().map(|&chunk| u64::from_le_bytes(chunk));
+            let mut next = || fields.next().unwrap_or(0);
+            Some(Stats { received: next(), delivered: next(), not_ours: next(), dropped: next(), sent: next(), refused: next() })
+        }
+    }
+
+    /// Is a frame that begins `frame` for the card whose address is
+    /// `ours`? For it alone, or for everyone. (Not: for a group. No
+    /// one here has joined one yet.)
+    pub fn for_us(frame: &[u8], ours: &[u8; ADDRESS]) -> bool {
+        frame.get(..ADDRESS).is_some_and(|to| to == ours || to == BROADCAST)
+    }
+
+    /// `frame` as the messages it travels in: (op, bytes) pairs, the
+    /// last one LAST. An empty frame is one empty LAST.
+    pub fn split(frame: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+        let pieces = frame.len().div_ceil(PIECE_MAX).max(1);
+        (0..pieces).map(move |n| {
+            let piece = &frame[n * PIECE_MAX..frame.len().min((n + 1) * PIECE_MAX)];
+            (if n + 1 == pieces { LAST } else { PART }, piece)
+        })
+    }
+
+    /// Puts a frame together from its messages.
+    pub struct Assembler {
+        frame: [u8; FRAME_MAX],
+        length: usize,
+        /// The frame so far is longer than a frame may be: what is left
+        /// of it is thrown away, up to and with its LAST.
+        too_long: bool,
+    }
+
+    /// What one message did.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Fed<'a> {
+        /// A piece; the frame is not whole yet.
+        More,
+        /// The frame, whole.
+        Frame(&'a [u8]),
+        /// The frame this message ended was longer than FRAME_MAX.
+        TooLong,
+        /// Not a PART, a LAST or a DROP.
+        NotAFrame,
+    }
+
+    impl Assembler {
+        pub const fn new() -> Assembler {
+            Assembler { frame: [0; FRAME_MAX], length: 0, too_long: false }
+        }
+
+        /// One message, as it was received (the op first).
+        pub fn feed(&mut self, message: &[u8]) -> Fed<'_> {
+            let Some((&op, piece)) = message.split_first() else { return Fed::NotAFrame };
+            if op == DROP {
+                self.length = 0;
+                self.too_long = false;
+                return Fed::More;
+            }
+            if op != PART && op != LAST {
+                return Fed::NotAFrame;
+            }
+            match self.frame.get_mut(self.length..self.length + piece.len()) {
+                Some(room) if !self.too_long => {
+                    room.copy_from_slice(piece);
+                    self.length += piece.len();
+                }
+                _ => self.too_long = true,
+            }
+            if op == PART {
+                return Fed::More;
+            }
+            let (length, too_long) = (self.length, self.too_long);
+            self.length = 0;
+            self.too_long = false;
+            if too_long {
+                Fed::TooLong
+            } else {
+                Fed::Frame(&self.frame[..length])
+            }
+        }
+    }
+
+    impl Default for Assembler {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        extern crate std;
+        use std::vec::Vec;
+
+        fn pattern(length: usize) -> Vec<u8> {
+            (0..length).map(|i| (i * 7 + (i >> 8)) as u8).collect()
+        }
+
+        /// A frame through `split` and back through an `Assembler`.
+        fn round_trip(assembler: &mut Assembler, frame: &[u8]) -> Vec<u8> {
+            let mut messages: Vec<Vec<u8>> = Vec::new();
+            for (op, piece) in split(frame) {
+                let mut message = std::vec![op];
+                message.extend_from_slice(piece);
+                assert!(message.len() <= crate::MESSAGE_MAX as usize);
+                messages.push(message);
+            }
+            let (last, parts) = messages.split_last().unwrap();
+            for part in parts {
+                assert_eq!(assembler.feed(part), Fed::More);
+            }
+            match assembler.feed(last) {
+                Fed::Frame(whole) => whole.to_vec(),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_frame_of_any_length_survives_being_cut_into_messages() {
+            let mut assembler = Assembler::new();
+            // Around every place a cut falls, and both ends.
+            for length in [0, 1, FRAME_MIN, 60, PIECE_MAX - 1, PIECE_MAX, PIECE_MAX + 1, 1500, FRAME_MAX - 1, FRAME_MAX] {
+                let frame = pattern(length);
+                assert_eq!(round_trip(&mut assembler, &frame), frame, "{length} bytes");
+            }
+        }
+
+        #[test]
+        fn how_many_messages_a_frame_takes() {
+            let count = |length: usize| split(&pattern(length)).count();
+            assert_eq!(count(0), 1);
+            assert_eq!(count(PIECE_MAX), 1);
+            assert_eq!(count(PIECE_MAX + 1), 2);
+            assert_eq!(count(FRAME_MAX), 2);
+            // Only the last is LAST.
+            let ops: Vec<u8> = split(&pattern(FRAME_MAX)).map(|(op, _)| op).collect();
+            assert_eq!(ops, [PART, LAST]);
+        }
+
+        #[test]
+        fn a_frame_too_long_is_refused_whole_and_the_next_one_is_not() {
+            let mut assembler = Assembler::new();
+            let mut part = std::vec![PART];
+            part.extend_from_slice(&pattern(PIECE_MAX));
+            assert_eq!(assembler.feed(&part), Fed::More);
+            assert_eq!(assembler.feed(&part), Fed::More); // 2046 bytes by now
+            assert_eq!(assembler.feed(&[LAST, 1, 2, 3]), Fed::TooLong);
+            // Nothing of it is left over.
+            assert_eq!(assembler.feed(&[LAST, 9, 8]), Fed::Frame(&[9, 8]));
+        }
+
+        #[test]
+        fn one_byte_over_is_too_long() {
+            let mut assembler = Assembler::new();
+            let frame = pattern(FRAME_MAX + 1);
+            let mut result = None;
+            for (op, piece) in split(&frame) {
+                let mut message = std::vec![op];
+                message.extend_from_slice(piece);
+                result = Some(matches!(assembler.feed(&message), Fed::TooLong));
+            }
+            assert_eq!(result, Some(true));
+        }
+
+        #[test]
+        fn what_is_not_a_piece_of_a_frame_changes_nothing() {
+            let mut assembler = Assembler::new();
+            assert_eq!(assembler.feed(&[PART, 1, 2]), Fed::More);
+            assert_eq!(assembler.feed(&[]), Fed::NotAFrame);
+            assert_eq!(assembler.feed(&[INFO]), Fed::NotAFrame);
+            assert_eq!(assembler.feed(&[LAST, 3]), Fed::Frame(&[1, 2, 3]));
+        }
+
+        #[test]
+        fn pieces_of_a_frame_given_up_are_forgotten() {
+            let mut assembler = Assembler::new();
+            assert_eq!(assembler.feed(&[PART, 0xEE, 0xEE]), Fed::More);
+            assert_eq!(assembler.feed(&[DROP]), Fed::More);
+            assert_eq!(assembler.feed(&[LAST, 1]), Fed::Frame(&[1]));
+            // Also after too much: the next frame starts clean.
+            let mut part = std::vec![PART];
+            part.extend_from_slice(&pattern(PIECE_MAX));
+            assembler.feed(&part);
+            assembler.feed(&part);
+            assert_eq!(assembler.feed(&[DROP]), Fed::More);
+            assert_eq!(assembler.feed(&[LAST, 2]), Fed::Frame(&[2]));
+        }
+
+        #[test]
+        fn who_a_frame_is_for() {
+            let ours = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+            let mut frame = pattern(FRAME_MIN);
+            frame[..6].copy_from_slice(&ours);
+            assert!(for_us(&frame, &ours));
+            frame[..6].copy_from_slice(&BROADCAST);
+            assert!(for_us(&frame, &ours));
+            frame[..6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x57]);
+            assert!(!for_us(&frame, &ours));
+            // A group address (the lowest bit of the first byte).
+            frame[..6].copy_from_slice(&[0x01, 0x00, 0x5E, 0, 0, 1]);
+            assert!(!for_us(&frame, &ours));
+            // Too short to say.
+            assert!(!for_us(&ours[..5], &ours));
+        }
+
+        #[test]
+        fn the_counters_survive_the_trip_through_bytes() {
+            let stats = Stats { received: 1 << 40, delivered: 2, not_ours: 3, dropped: 4, sent: 5, refused: 6 };
+            assert_eq!(Stats::from_bytes(&stats.to_bytes()), Some(stats));
+            assert_eq!(Stats::from_bytes(&stats.to_bytes()[1..]), None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
