@@ -39,7 +39,7 @@
 //! the scheduler gives it (threads.rs).
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -216,6 +216,23 @@ const AWAKE: usize = 1;
 const ABANDONED: usize = 2;
 
 /// How many CPUs besides the boot CPU are awake.
+/// Where to send a message for each CPU, by the kernel's number for
+/// it: its local APIC id. Filled in as the CPUs answer.
+static APIC_IDS: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+
+/// Interrupts each CPU whose bit is set in `cpus`, so that it chooses
+/// again which thread to run. May be called with interrupts off and
+/// locks held: it waits only for each message to leave this CPU's
+/// APIC, never for the other CPU to take it.
+pub fn poke(cpus: u64) {
+    let message = smp::interrupt_message(platform::RESCHEDULE_VECTOR);
+    for (cpu, id) in APIC_IDS.iter().enumerate() {
+        if cpus & (1 << cpu) != 0 {
+            apic::send(id.load(Ordering::Relaxed), message);
+        }
+    }
+}
+
 static OTHERS: AtomicUsize = AtomicUsize::new(0);
 /// Set by `release`: the scheduler is ready for them.
 static RELEASED: AtomicBool = AtomicBool::new(false);
@@ -241,6 +258,7 @@ unsafe fn set_field(page: u64, field: *const u8, value: u64) {
 /// the TSC's speed are needed) and before any process exists.
 pub unsafe fn start(madt: &Madt) {
     let plan = smp::plan(&madt.processors, apic::local_id(), MAX_CPUS);
+    APIC_IDS[0].store(apic::local_id(), Ordering::Relaxed);
     if plan.left_asleep > 0 {
         kprintln!("[smp] {} more CPU(s) than the {MAX_CPUS} this kernel uses: left asleep", plan.left_asleep);
     }
@@ -337,6 +355,7 @@ pub unsafe fn start(madt: &Madt) {
         // Giving up is a compare-and-exchange: it fails if the CPU
         // answered in this very moment, and then it did answer.
         if start.state.compare_exchange(STARTING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            APIC_IDS[cpu.index].store(cpu.apic_id, Ordering::Relaxed);
             awake.push(cpu.index);
         } else {
             kprintln!("[smp] the CPU with APIC id {} did not answer: left out", cpu.apic_id);

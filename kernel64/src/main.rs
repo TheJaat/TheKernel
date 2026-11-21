@@ -117,6 +117,7 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     // free.
     arch::smp::release();
     selftest::smp();
+    selftest::wakeups();
 
     // User mode: programs in their own address spaces, in ring 3.
     selftest::user();

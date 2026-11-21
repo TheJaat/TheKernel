@@ -7,6 +7,7 @@
 //!   0x21       keyboard (ISA IRQ 1, through the I/O APIC)
 //!   0x30-0x3F  PCI devices' MSI-X messages, one vector per device line
 //!   0xE0-0xEF  the disabled 8259 PICs - only ever spurious
+//!   0xF0       "choose again": sent by one CPU to another (smp.rs)
 //!   0xFF       local APIC spurious interrupt
 //!
 //! An interrupt's vector is also its priority (vector / 16): the timer
@@ -24,6 +25,11 @@ use crate::mm;
 pub const TIMER_VECTOR: u8 = 0x20;
 pub const KEYBOARD_VECTOR: u8 = 0x21;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+/// Raised on a CPU by another CPU, to say: there is a thread in the
+/// queue for you. The interrupt carries nothing; arriving is all it
+/// does, because every interrupt ends by asking the scheduler whether
+/// to switch.
+pub const RESCHEDULE_VECTOR: u8 = 0xF0;
 const DEVICE_VECTOR_BASE: u8 = 0x30;
 
 /// The vector device line `n` (interrupts::allocate_device_line) is
@@ -132,6 +138,11 @@ pub fn handle_interrupt(vector: u8) {
         }
         v if (DEVICE_VECTOR_BASE..DEVICE_VECTOR_BASE + interrupts::DEVICE_LINES as u8).contains(&v) => {
             interrupts::device_fired(usize::from(v - DEVICE_VECTOR_BASE));
+            apic::end_of_interrupt();
+            interrupts::interrupt_done();
+        }
+        RESCHEDULE_VECTOR => {
+            interrupts::poked();
             apic::end_of_interrupt();
             interrupts::interrupt_done();
         }

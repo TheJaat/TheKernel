@@ -43,12 +43,17 @@ fi
 grep -q "\[selftest\] threads: sleep" "$LOG"      || fail "threads self-test"
 if [ "$CPUS" -eq 1 ]; then
     grep -q "\[selftest\] smp: 1 CPU; 40000 hand-offs" "$LOG" || fail "SMP self-test (one CPU)"
+    grep -q "\[selftest\] wake-ups: 1 CPU" "$LOG" || fail "wake-up self-test (one CPU)"
 else
     # The started CPUs must join the scheduler, and threads must then
     # really be seen running on every one of them.
     grep -q "\[smp\] $CPUS CPUs run threads" "$LOG"  || fail "the started CPUs did not join the scheduler"
     grep -q "\[selftest\] smp: threads ran on all $CPUS CPUs at once; 40000 hand-offs between two threads, none lost; nothing leaked" "$LOG" \
         || fail "SMP self-test"
+    # A thread woken by a busy CPU must start on an idle one because
+    # that CPU was interrupted, not because its timer happened to tick.
+    grep -q "\[selftest\] wake-ups: a thread woken by a busy CPU ran on an idle one" "$LOG" \
+        || fail "an idle CPU was not told of a woken thread"
 fi
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
 # The program that reads through GS must fault at its own offset from

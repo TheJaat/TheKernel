@@ -27,6 +27,19 @@ pub fn timer_tick() {
     }
 }
 
+/// How many times a CPU was interrupted by another to choose again.
+static POKES: AtomicU64 = AtomicU64::new(0);
+
+/// A "choose again" interrupt arrived on this CPU. Nothing to do but
+/// count it: `interrupt_done` does the choosing.
+pub fn poked() {
+    POKES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn pokes() -> u64 {
+    POKES.load(Ordering::Relaxed)
+}
+
 /// The last thing every interrupt does, after acknowledging it: if the
 /// interrupt made a thread ready that should run now - a sleeper's time
 /// came, a slice ran out, a driver has work - switch.

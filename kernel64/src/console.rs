@@ -29,8 +29,13 @@ use kernel64::logring::LogRing;
 
 use crate::irqlock::IrqLock;
 
-/// Room for a few screens of text between two idle moments.
-const QUEUE_SIZE: usize = 64 * 1024;
+/// Room for a few screens of text between two idle moments. It was
+/// twice this until the kernel image reached the 2 MiB the bootloader
+/// allows (see linker.ld): the queue is the largest thing in the image
+/// that can shrink without anything being lost - what does not fit is
+/// counted and said, and with several CPUs one of them is nearly always
+/// idle and emptying it.
+const QUEUE_SIZE: usize = 32 * 1024;
 /// Bytes written per turn of the idle loop, with interrupts off: about
 /// 1.4 ms at 115200 baud.
 const CHUNK: usize = 16;

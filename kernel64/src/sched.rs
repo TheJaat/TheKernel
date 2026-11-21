@@ -61,7 +61,9 @@ struct Cpu {
     idle: ThreadId,
     slice_left: u64,
     /// Set when this CPU should choose again as soon as possible - a
-    /// wakeup while it idles, or the end of a slice.
+    /// wakeup while it idles, or the end of a slice. On an idling CPU
+    /// it is also a promise: a thread in the queue has been offered to
+    /// this CPU, so the next one is offered to somebody else.
     reschedule: bool,
 }
 
@@ -69,6 +71,11 @@ pub struct Scheduler {
     states: BTreeMap<ThreadId, State>,
     ready: VecDeque<ThreadId>,
     cpus: Vec<Cpu>,
+    /// The CPUs that must be interrupted, one bit each: idling CPUs
+    /// that were offered a thread by another CPU and cannot know it.
+    /// The policy cannot interrupt anyone; the caller collects this
+    /// with `take_pokes` and does.
+    pokes: u64,
 }
 
 /// A switch the caller must carry out.
@@ -93,7 +100,7 @@ impl Scheduler {
         states.insert(idle, State::Ready); // ready, but never queued
         states.insert(running, State::Running);
         let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false };
-        Scheduler { states, ready: VecDeque::new(), cpus: alloc::vec![cpu] }
+        Scheduler { states, ready: VecDeque::new(), cpus: alloc::vec![cpu], pokes: 0 }
     }
 
     /// One more CPU, running its idle thread `idle`. Returns its number:
@@ -186,14 +193,38 @@ impl Scheduler {
         core::mem::take(&mut self.cpus[cpu].reschedule)
     }
 
+    /// The CPUs to interrupt because of what was done since the last
+    /// call, one bit each; clears the set. Never the CPU that did it.
+    pub fn take_pokes(&mut self) -> u64 {
+        core::mem::take(&mut self.pokes)
+    }
+
     /// Into the queue - for a thread that is on no CPU.
     fn enqueue(&mut self, id: ThreadId, cpu: usize) {
         debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
         self.states.insert(id, State::Ready);
         self.ready.push_back(id);
-        let this = &mut self.cpus[cpu];
-        if this.current == this.idle {
-            this.reschedule = true;
+        self.offer(cpu);
+    }
+
+    /// One thread has just joined the queue, put there by `cpu`: finds
+    /// an idling CPU to take it. This CPU if it idles - it needs no
+    /// telling. Otherwise another, which does: it sits halted, and
+    /// without an interrupt would look at the queue only at its next
+    /// timer tick.
+    ///
+    /// A CPU already offered a thread is passed over, so that two
+    /// threads made ready one after the other get two CPUs, not the
+    /// same one twice. If every CPU is busy nothing is done: the
+    /// thread waits for a slice to end, as it always did.
+    fn offer(&mut self, cpu: usize) {
+        let free = |c: &Cpu| c.current == c.idle && !c.reschedule;
+        let chosen = if free(&self.cpus[cpu]) { Some(cpu) } else { self.cpus.iter().position(free) };
+        if let Some(chosen) = chosen {
+            self.cpus[chosen].reschedule = true;
+            if chosen != cpu {
+                self.pokes |= 1 << chosen;
+            }
         }
     }
 
@@ -251,6 +282,10 @@ impl Scheduler {
     pub fn pick_next(&mut self, cpu: usize) -> Option<Switch> {
         let from = self.cpus[cpu].current;
         let idle = self.cpus[cpu].idle;
+        // Choosing is what a request to choose asks for. Left set, it
+        // would follow the CPU into idling and read there as an offer
+        // nobody made.
+        self.cpus[cpu].reschedule = false;
         let still_running = self.states.get(&from) == Some(&State::Running);
 
         let Some(to) = self.ready.pop_front() else {
@@ -269,6 +304,8 @@ impl Scheduler {
             } else {
                 self.states.insert(from, State::Ready);
                 self.ready.push_back(from);
+                // It gave way on this CPU; another may be idling.
+                self.offer(cpu);
             }
         }
         switch
@@ -589,12 +626,14 @@ mod tests {
         s.add(1, 0);
         s.pick_next(0);
         s.take_reschedule(0);
-        // Thread 2 is made on CPU 0, which is busy; CPU 1 idles and does
-        // not know yet.
+        // Thread 2 is made on CPU 0, which is busy; CPU 1 idles, and is
+        // to be interrupted. Suppose that interrupt never comes:
         s.add(2, 0);
+        assert_eq!(s.take_pokes(), 0b10);
+        assert!(s.take_reschedule(1));
         assert!(!s.take_reschedule(1));
         s.tick_slice(1);
-        assert!(s.take_reschedule(1), "the idle CPU's tick finds the work");
+        assert!(s.take_reschedule(1), "the idle CPU's tick still finds the work");
         s.pick_next(1);
         assert_eq!(s.current(1), 2);
         // With both busy and nobody waiting, slices never end.
@@ -629,15 +668,140 @@ mod tests {
     /// CPU is in the queue, nothing is queued twice, no idle thread is
     /// queued or on another CPU, and what is on a CPU is Running or
     /// about to leave. And nobody starves.
+    /// Two CPUs, CPU 0 running thread 1 and CPU 1 idling.
+    fn one_busy_one_idle() -> Scheduler {
+        let mut s = Scheduler::new(IDLE);
+        s.add(1, 0);
+        s.pick_next(0);
+        s.add_cpu(100);
+        assert_eq!(s.take_pokes(), 0);
+        s
+    }
+
+    #[test]
+    fn a_thread_made_ready_on_a_busy_cpu_is_offered_to_an_idling_one() {
+        let mut s = one_busy_one_idle();
+        s.add(2, 0);
+        assert_eq!(s.take_pokes(), 0b10, "CPU 1 idles and was not told");
+        assert_eq!(s.take_pokes(), 0, "told twice");
+        // Told, it chooses again, and finds the thread.
+        assert!(s.take_reschedule(1));
+        assert_eq!(s.pick_next(1), Some(Switch { from: 100, to: 2 }));
+        // The same for a thread that wakes.
+        s.suspend_current(1, State::Blocked);
+        s.pick_next(1);
+        assert!(s.wake(2, 0));
+        assert_eq!(s.take_pokes(), 0b10);
+    }
+
+    #[test]
+    fn an_idling_cpu_that_makes_a_thread_ready_takes_it_itself_and_tells_nobody() {
+        let mut s = one_busy_one_idle();
+        s.add(2, 1);
+        assert_eq!(s.take_pokes(), 0);
+        assert!(s.take_reschedule(1));
+    }
+
+    #[test]
+    fn nobody_is_told_when_every_cpu_is_busy() {
+        let mut s = one_busy_one_idle();
+        s.add(2, 0);
+        s.take_pokes();
+        s.take_reschedule(1);
+        s.pick_next(1);
+        s.add(3, 0);
+        assert_eq!(s.take_pokes(), 0);
+        assert!(!s.take_reschedule(0), "a busy CPU does not drop its thread for a new one");
+    }
+
+    #[test]
+    fn two_threads_made_ready_at_once_go_to_two_cpus() {
+        let mut s = one_busy_one_idle();
+        s.add_cpu(200);
+        s.add_cpu(300);
+        s.add(2, 0);
+        s.add(3, 0);
+        assert_eq!(s.take_pokes(), 0b0110, "CPUs 1 and 2, one thread each");
+        // A third thread gets the third CPU; a fourth has nobody left.
+        s.add(4, 0);
+        assert_eq!(s.take_pokes(), 0b1000);
+        s.add(5, 0);
+        assert_eq!(s.take_pokes(), 0);
+    }
+
+    #[test]
+    fn a_thread_that_gives_way_is_offered_to_an_idling_cpu() {
+        // CPU 0 runs 1 with 2 waiting; CPU 1 arrives idling only now.
+        let mut s = Scheduler::new(IDLE);
+        s.add(1, 0);
+        s.pick_next(0);
+        s.add(2, 0);
+        s.add_cpu(100);
+        s.take_reschedule(1);
+        s.take_pokes();
+        // Thread 1 yields to 2 and joins the queue - where CPU 1 could
+        // run it at once.
+        assert_eq!(s.pick_next(0), Some(Switch { from: 1, to: 2 }));
+        assert_eq!(s.take_pokes(), 0b10);
+    }
+
+    #[test]
+    fn a_cpu_told_for_nothing_just_goes_on_idling() {
+        let mut s = one_busy_one_idle();
+        s.add(2, 0);
+        assert_eq!(s.take_pokes(), 0b10);
+        // CPU 0 gets there first: its thread blocks and it takes 2.
+        s.suspend_current(0, State::Blocked);
+        assert_eq!(s.pick_next(0), Some(Switch { from: 1, to: 2 }));
+        // CPU 1's interrupt arrives; there is nothing left.
+        assert!(s.take_reschedule(1));
+        assert_eq!(s.pick_next(1), None);
+        assert_eq!(s.current(1), 100);
+        // And it can be offered the next one.
+        s.wake(1, 0);
+        assert_eq!(s.take_pokes(), 0b10);
+    }
+
     #[test]
     fn randomized_on_four_cpus() {
+        // Far more threads than CPUs: nobody starves, and threads move.
+        let (moved, _) = randomized(30);
+        assert!(moved > 100, "threads did not move between CPUs");
+    }
+
+    #[test]
+    fn randomized_with_cpus_to_spare() {
+        // Fewer threads than CPUs: there is nearly always a CPU idling
+        // when a thread wakes, and it must be told.
+        let (_, poked) = randomized(3);
+        assert!(poked > 100, "idling CPUs were hardly ever told of work: {poked} times");
+    }
+
+    /// Four CPUs and `threads` threads doing random things in a random
+    /// order, with everything that must always be true checked after
+    /// every step. Returns how often a thread changed CPU, and how
+    /// often an idling CPU was to be interrupted.
+    fn randomized(threads: u64) -> (u32, u32) {
         const CPUS: usize = 4;
-        const THREADS: u64 = 30;
         let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };
         let mut s = Scheduler::new(IDLE);
         for cpu in 1..CPUS {
             assert_eq!(s.add_cpu(idle_of(cpu)), cpu);
         }
+        // After each thing CPU `by` does: whoever is to be interrupted
+        // for it idles, was offered a thread, and is not `by` itself.
+        let interrupted = |s: &mut Scheduler, by: usize| {
+            let pokes = s.take_pokes();
+            for other in 0..CPUS {
+                if pokes & (1 << other) != 0 {
+                    assert_eq!(s.current(other), idle_of(other), "busy CPU {other} was interrupted");
+                    assert!(s.cpus[other].reschedule, "CPU {other} interrupted without an offer");
+                    assert_ne!(other, by, "CPU {other} told itself");
+                }
+            }
+            assert_eq!(pokes >> CPUS, 0, "a CPU that does not exist was interrupted");
+            pokes.count_ones()
+        };
         let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
         let mut random = move || {
             seed ^= seed << 13;
@@ -645,12 +809,13 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for id in 1..=THREADS {
+        for id in 1..=threads {
             s.add(id, 0);
         }
         let mut now = 0;
         let mut ran = BTreeMap::new();
         let mut moved = 0u32;
+        let mut poked = 0u32;
         let mut last_cpu: BTreeMap<ThreadId, usize> = BTreeMap::new();
         for step in 0..40_000 {
             let cpu = (random() % CPUS as u64) as usize;
@@ -660,6 +825,7 @@ mod tests {
             } else {
                 s.tick_slice(cpu);
             }
+            poked += interrupted(&mut s, 0);
             let on_idle = s.current(cpu) == idle_of(cpu);
             match random() % 12 {
                 0 if !on_idle => s.suspend_current(cpu, State::Sleeping(now + random() % 5)),
@@ -670,15 +836,28 @@ mod tests {
                     s.resume_current(cpu);
                 }
                 3 | 4 => {
-                    s.wake(1 + random() % THREADS, cpu);
+                    s.wake(1 + random() % threads, cpu);
                 }
                 _ => {}
             }
             // Sometimes the switch does not follow at once: another CPU
             // gets in first, which is the whole difficulty.
+            poked += interrupted(&mut s, cpu);
             if random() % 3 != 0 {
                 s.pick_next(cpu);
             }
+            poked += interrupted(&mut s, cpu);
+
+            // No thread waits while a CPU idles unasked: if the queue
+            // has threads, every idling CPU has been offered one - or
+            // there are at least as many offers as threads.
+            let offered = (0..CPUS).filter(|&c| s.current(c) == idle_of(c) && s.cpus[c].reschedule).count();
+            let idling = (0..CPUS).filter(|&c| s.current(c) == idle_of(c)).count();
+            assert!(
+                offered >= s.ready.len().min(idling),
+                "step {step}: {} threads wait, {idling} CPUs idle, only {offered} were offered one",
+                s.ready.len()
+            );
 
             for a in 0..CPUS {
                 let current = s.current(a);
@@ -701,9 +880,9 @@ mod tests {
                 assert_eq!(s.state(*id), Some(State::Ready));
             }
         }
-        for id in 1..=THREADS {
+        for id in 1..=threads {
             assert!(ran.get(&id).copied().unwrap_or(0) > 50, "thread {id} starved");
         }
-        assert!(moved > 100, "threads did not move between CPUs");
+        (moved, poked)
     }
 }

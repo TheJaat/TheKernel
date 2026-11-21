@@ -318,6 +318,77 @@ pub fn smp() {
     }
 }
 
+/// A thread made ready by a busy CPU starts on an idling one at once,
+/// not at that CPU's next timer tick: the time from the wake-up to the
+/// woken thread's answer, measured many times.
+pub fn wakeups() {
+    use crate::threads::WaitQueue;
+    use core::sync::atomic::AtomicUsize;
+
+    if threads::cpus() == 1 {
+        kprintln!("[selftest] wake-ups: 1 CPU, so nobody to tell");
+        return;
+    }
+    const ROUNDS: usize = 40;
+    struct Shared {
+        asked: AtomicUsize,
+        answered: AtomicUsize,
+        queue: WaitQueue,
+    }
+    let shared = Arc::new(Shared { asked: AtomicUsize::new(0), answered: AtomicUsize::new(0), queue: WaitQueue::new() });
+    let sleeper = {
+        let shared = Arc::clone(&shared);
+        threads::spawn("sleeper", move || {
+            for round in 1..=ROUNDS {
+                let asked = shared.queue.wait_while(|| shared.asked.load(Ordering::Acquire) < round);
+                assert!(asked, "a kernel thread's wait was cut short");
+                shared.answered.store(round, Ordering::Release);
+            }
+        })
+    };
+
+    let per_microsecond = arch::platform::tsc_hz() / 1_000_000;
+    let spin_until = |tsc: u64| {
+        while arch::tsc() < tsc {
+            core::hint::spin_loop();
+        }
+    };
+    let pokes = interrupts::pokes();
+    let mut times: Vec<u64> = Vec::with_capacity(ROUNDS);
+    for round in 1..=ROUNDS {
+        // Long enough for the sleeper to be asleep and off its CPU.
+        threads::sleep(2);
+        // The sleep ends on a tick. Every CPU's timer keeps its own
+        // fixed distance from that tick, so without this wait - a
+        // different part of the 10 ms each round - one lucky distance
+        // would make every round look quick.
+        spin_until(arch::tsc() + (round as u64 * 37 % 10) * 1000 * per_microsecond);
+        let start = arch::tsc();
+        shared.asked.store(round, Ordering::Release);
+        shared.queue.wake_all();
+        // Spinning, not sleeping: this CPU must stay busy, so that the
+        // sleeper can only run on another.
+        while shared.answered.load(Ordering::Acquire) < round {
+            core::hint::spin_loop();
+        }
+        times.push((arch::tsc() - start) / per_microsecond.max(1));
+    }
+    threads::join(sleeper);
+
+    times.sort_unstable();
+    let (median, slowest) = (times[ROUNDS / 2], times[ROUNDS - 1]);
+    let told = interrupts::pokes() - pokes;
+    // What is required is that the interrupts were sent and taken,
+    // about one for each wake-up. The time is reported and not judged:
+    // a tick is 10 000 microseconds and the median here is usually a
+    // few hundred, but on an emulator sharing a busy host it has been
+    // three thousand, and no limit tells that from a lucky run of ticks.
+    assert!(told >= ROUNDS as u64 / 2, "only {told} CPUs were interrupted in {ROUNDS} wake-ups");
+    kprintln!(
+        "[selftest] wake-ups: a thread woken by a busy CPU ran on an idle one {median} us later (median of {ROUNDS}; slowest {slowest} us; {told} interrupts between CPUs)"
+    );
+}
+
 /// User mode: four programs, run at once. Two follow the rules and must
 /// finish with their exit codes; two break them and must be killed -
 /// without the kernel noticing anything but a log line. Then everything

@@ -49,12 +49,17 @@ for test in $TESTS; do
     xorriso -as mkisofs -R -J -b stage1.bin -iso-level 3 -no-emul-boot \
         -boot-load-size 4 -o "$iso" "$iso_dir" 2>/dev/null
 
+    # The same limit as an ordinary boot. It was 15 seconds while that
+    # was plenty; the firmware and the loader take most of ten before
+    # the kernel says a word, and a limit only matters to a boot that
+    # hangs - a short one fails boots that are merely slow.
+    LIMIT=40
     # In the init test the kernel goes idle first, and init ends after:
     # the boot is over at the stop itself, not at "idle".
     if [ "$test" = init ]; then
-        FINISHED_ONLY="THE SYSTEM HAS STOPPED" "$HERE/scripts/qemu-boot.sh" "$iso" "$log" 15
+        FINISHED_ONLY="THE SYSTEM HAS STOPPED" "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     else
-        "$HERE/scripts/qemu-boot.sh" "$iso" "$log" 15
+        "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     fi
     # Every one of these ends with the kernel stopped - and it must have
     # said so on the screen too, where a real machine's user would look.

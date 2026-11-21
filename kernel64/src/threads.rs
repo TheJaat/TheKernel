@@ -169,7 +169,22 @@ pub fn run_idle() -> ! {
 }
 
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
-    f(THREADS.lock().as_mut().expect("threads not initialised"))
+    let mut guard = THREADS.lock();
+    let t = guard.as_mut().expect("threads not initialised");
+    let result = f(t);
+    tell_idle_cpus(t);
+    result
+}
+
+/// Interrupts the idling CPUs the policy has just offered a thread to.
+/// Called before the lock is let go, after anything that can put a
+/// thread in the queue. The interrupted CPU will want this same lock,
+/// and waits for it - a few instructions.
+fn tell_idle_cpus(t: &mut Threads) {
+    let cpus = t.policy.take_pokes();
+    if cpus != 0 {
+        arch::smp::poke(cpus);
+    }
 }
 
 /// Starts `f` on a new kernel thread.
@@ -304,7 +319,10 @@ fn schedule() {
     let mut guard = THREADS.lock();
     let t = guard.as_mut().expect("threads not initialised");
     let cpu = arch::cpu();
-    match t.policy.pick_next(cpu) {
+    let switch = t.policy.pick_next(cpu);
+    // The thread that gives way here may be one an idling CPU can run.
+    tell_idle_cpus(t);
+    match switch {
         None => drop(guard),
         Some(Switch { from, to }) => {
             let save = &raw mut t.table.get_mut(&from).expect("current thread missing").rsp;
@@ -371,6 +389,9 @@ fn reap() {
 pub fn on_tick(now: u64) {
     if let Some(t) = THREADS.lock().as_mut() {
         t.policy.tick(now, arch::cpu());
+        // Sleepers whose time came: this CPU keeps the time for all,
+        // but need not run them all.
+        tell_idle_cpus(t);
     }
 }
 

@@ -99,6 +99,13 @@ pub const fn nmi_to_all_others() -> u32 {
     KIND_NMI | ASSERT | ALL_BUT_SELF
 }
 
+/// An ordinary interrupt, raised on another CPU as `vector`: delivery
+/// kind 000, "fixed". Unlike the NMI it waits until that CPU has
+/// interrupts on, and its handler returns.
+pub const fn interrupt_message(vector: u8) -> u32 {
+    ASSERT | vector as u32
+}
+
 /// What goes in the high half of the command register: who the message
 /// is for.
 pub const fn destination(apic_id: u8) -> u32 {
@@ -188,6 +195,9 @@ mod tests {
         assert_eq!(destination(255), 0xFF00_0000);
         // Delivery mode 100 (NMI), level assert, shorthand 11.
         assert_eq!(nmi_to_all_others(), 0x000C_4400);
+        // Delivery mode 000 (fixed): only the vector and the level.
+        assert_eq!(interrupt_message(0xF0), 0x40F0);
+        assert_eq!(interrupt_message(0x20), 0x4020);
     }
 
     #[test]
