@@ -28,8 +28,6 @@ pub use system::{smp, wakeups};
 pub use user::{files, ipc, kill, user};
 #[cfg(target_arch = "aarch64")]
 pub use user::disk;
-#[cfg(feature = "c-programs")]
-pub use user::c;
 
 pub fn run() {
     frames();

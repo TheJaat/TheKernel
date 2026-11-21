@@ -797,6 +797,11 @@ pub mod block {
 
     pub const REQUEST_SIZE: usize = 1 + 8;
 
+    /// Not part of the protocol: the exit code of the driver's test
+    /// (`blkcheck`) when the disk it was given is not the one made for
+    /// it - so that whoever started it knows the disk was left alone.
+    pub const NOT_THE_TEST_DISK: i64 = 77;
+
     pub fn describe(status: u8) -> &'static str {
         match status {
             OK => "ok",

@@ -314,8 +314,9 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
     // Interrupts: the controller the tree describes, and the CPU's
     // own timer.
     kprintln!();
+    let mut disk = None;
     // SAFETY: once, on the only CPU running, interrupts still masked.
-    match unsafe { arch::init_interrupts(&machine) } {
+    let threads_run = match unsafe { arch::init_interrupts(&machine) } {
         Some(interrupts) => {
             kprintln!(
                 "[irq] GIC version {}: {} interrupt lines, all off but the timer's",
@@ -345,16 +346,18 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
             selftest::ipc();
             selftest::files();
             selftest::kill();
-            // The same, written in C.
-            #[cfg(feature = "c-programs")]
-            selftest::c();
 
             // A device, driven by a program.
             kprintln!();
-            selftest::disk(mmio_devices::first_disk(&devices));
+            disk = mmio_devices::first_disk(&devices);
+            selftest::disk(disk.as_ref());
+            true
         }
-        None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"),
-    }
+        None => {
+            kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads");
+            false
+        }
+    };
 
     #[cfg(feature = "fault-stack")]
     {
@@ -402,9 +405,78 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
         kprintln!("[test] FAILED: the fault did not happen");
     }
 
+    // The rest is programs: init, and what init starts. They need
+    // threads, and a terminal to be of any use.
+    if threads_run && start_init(&machine, disk) {
+        idle()
+    }
     kprintln!();
-    kprintln!("[kernel] this is as far as the AArch64 port goes - halting");
+    kprintln!("[kernel] no programs can run on this machine - halting");
     arch::halt_forever()
+}
+
+/// Starts `init`, the first process, on AArch64, with five startup
+/// handles:
+///
+///   1  the launcher: the right to start programs
+///   2  the serial port's interrupt line
+///   3  the memory the serial port's registers are in
+///   4  a channel from the kernel, carrying one message per device it
+///      made ready: "mmio", an `MmioDeviceInfo`, and the device's
+///      handles (so far: a disk)
+///   5  the system handle: the right to look at memory and processes
+///
+/// The serial port is this machine's keyboard and its screen at once,
+/// so where the PC's init gets a keyboard's interrupt and ports here,
+/// this one gets the port's interrupt and registers - for a driver
+/// that is a program, like the disk's. The kernel goes on writing its
+/// own log to the same port, and never reads from it.
+///
+/// False - and nothing started - if the device tree describes no
+/// serial port with an interrupt.
+#[cfg(target_arch = "aarch64")]
+fn start_init(machine: &kernel64::devicetree::Machine, disk: Option<mmio_devices::Ready>) -> bool {
+    use ipc::Object;
+    use kernel64::cap::Rights;
+    use kernel64::paging::Flags;
+    use memory_object::MemoryObject;
+
+    let Some((serial, (interrupt, edge))) = machine.serial.and_then(|serial| Some((serial, serial.interrupt?))) else {
+        kprintln!("[kernel] the device tree gives the serial port no interrupt: no terminal, and so no init");
+        return false;
+    };
+    let Some(line) = arch::device_interrupt(interrupt, edge) else {
+        kprintln!("[kernel] the serial port's interrupt {interrupt} is not one the controller has: no terminal, and so no init");
+        return false;
+    };
+    let registers = MemoryObject::device(serial.registers.start, serial.registers.size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
+    kprintln!(
+        "[kernel] serial port at {:#x}, interrupt {interrupt} ({}): handed to init, for a driver",
+        serial.registers.start,
+        if edge { "edge" } else { "level" }
+    );
+
+    let (devices, to_init) = ipc::channel();
+    if let Some(disk) = disk {
+        let mut message = b"mmio".to_vec();
+        message.extend_from_slice(&disk.info.to_bytes());
+        match ipc::kernel_send(&to_init, &message, disk.handles) {
+            Ok(()) => kprintln!("[virtio] {:#x} block device: handed to init", disk.info.registers),
+            Err(error) => kprintln!("[virtio] {:#x} block device: could not hand it to init: {error:?}", disk.info.registers),
+        }
+    }
+    drop(to_init); // what was sent stays readable; the kernel keeps nothing
+
+    let handles = alloc::vec![
+        (Object::Launcher, Rights(0)),
+        (Object::Interrupt(line), Rights::ALL),
+        (Object::Memory(alloc::sync::Arc::new(registers)), Rights::ALL),
+        (devices, Rights(abi::rights::RECEIVE)),
+        (Object::System, Rights::ALL),
+    ];
+    let (init, _) = process::spawn("init", programs::INIT, handles).expect("starting init");
+    process::set_essential(&init);
+    true
 }
 
 /// Prints what the device tree said about the machine.
@@ -550,7 +622,6 @@ fn report_platform(p: &arch::platform::Report) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// The end of booting: the boot thread's work is done, so it exits and
 /// leaves the CPU to the threads it started - and to the idle thread.
 fn idle() -> ! {

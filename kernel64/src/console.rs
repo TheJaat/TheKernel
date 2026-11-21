@@ -19,6 +19,14 @@
 //!     line can carry - a flood - messages are dropped, and the log says
 //!     how much is missing.
 //!
+//!     "When the CPU is idle" alone is not enough. A machine whose
+//!     every CPU is busy computing is never idle, and its queue would
+//!     sit there until the computing ended - on a machine whose serial
+//!     line is also its screen (AArch64, so far) that is a terminal
+//!     that stops answering while a program runs in the background.
+//!     So the timer writes a little too, every tick, busy or not
+//!     (`write_on_tick`).
+//!
 //! Order is kept: before the kernel writes a message of its own it
 //! writes out everything queued before it.
 
@@ -33,6 +41,13 @@ const QUEUE_SIZE: usize = 64 * 1024;
 /// Bytes written per turn of the idle loop, with interrupts off: about
 /// 1.4 ms at 115200 baud.
 const CHUNK: usize = 16;
+
+/// Bytes written per timer tick, with interrupts off. A tick is 10 ms,
+/// in which the line carries 115 bytes at 115200 baud: this is a
+/// quarter of that, so at worst - a queue that never empties, a line
+/// that really is that slow - a quarter of one CPU goes on writing. It
+/// is still some 3000 characters a second: a screenful in under one.
+const TICK_CHUNK: usize = 32;
 
 /// The lock for the serial line, and what it guards: the queue.
 static QUEUE: IrqLock<LogRing<QUEUE_SIZE>> = IrqLock::new(LogRing::new());
@@ -96,6 +111,12 @@ pub fn write_later(bytes: &[u8]) {
 /// the idle loop, which calls it until then.
 pub fn write_queued() -> bool {
     flush(&mut QUEUE.lock(), CHUNK)
+}
+
+/// Writes a little of what is queued, from the timer interrupt: what
+/// keeps programs' output moving on a machine that is never idle.
+pub fn write_on_tick() {
+    flush(&mut QUEUE.lock(), TICK_CHUNK);
 }
 
 /// Frees the console lock, for a panic or fatal exception that must be

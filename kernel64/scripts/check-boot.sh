@@ -12,6 +12,38 @@
 LOG=$1
 METHOD=${2:-}
 TYPED=${TYPED:-}
+# ARCH=aarch64: the log is the AArch64 kernel's. What programs do is
+# checked as on the PC - it is the same user space, and the point of
+# checking it here is that it behaves the same. What differs is the
+# machine underneath: its own boot checks are aarch64-test.sh's, the
+# keys come from a serial port's driver, and the disk is not on a bus.
+ARCH=${ARCH:-pc}
+if [ "$ARCH" = aarch64 ]; then
+    INPUT_DRIVER=serial
+    INPUT_READY="\[serial\] serial port ready"
+    DISK_OFFERED="\[virtio\] .* block device: handed to init"
+    # What is expected of the commands typed is the PC's list. A few
+    # lines of it name the PC's drivers: there the serial port's one
+    # driver is keyboard and screen both, and the disk's interrupt is
+    # not a message. One line has no counterpart - a new display shows
+    # again the text the old one had; a terminal still has it. And the
+    # shell's note of a line it read does not begin a line of this log:
+    # here the log is the screen, and the typed line is in front of it.
+    # The kernel runs on one CPU there so far, and `time` says so.
+    EXPECT=$(printf '%s' "${EXPECT:-}" | sed \
+        -e 's/\\\[display\\\] asked to stall/\\[serial\\] asked to stall/' \
+        -e 's/\\\[init\\\] display /\\[init\\] serial /g' \
+        -e 's/\\\[display\\\] the text on the screen was kept: [^;]*/\\[serial\\] serial port ready/' \
+        -e 's/\^\\\[shell\\\] line:/\\[shell\\] line:/g' \
+        -e 's/ the 4 CPUs worked for/ the one CPU worked for/' \
+        -e 's/\\\[kbd\\\] F11/\\[serial\\] F11/' \
+        -e 's/\\\[init\\\] kbd /\\[init\\] serial /g' \
+        -e 's/\\\[blk\\\] virtio disk\.\*MSI-X/\\[blk\\] virtio disk at 0xa003e00.*interrupts/')
+else
+    INPUT_DRIVER=kbd
+    INPUT_READY="\[kbd\] PS/2 keyboard ready"
+    DISK_OFFERED="\[pci\] .* virtio block device: .* handed to init"
+fi
 
 fail() {
     echo "FAIL: $1"
@@ -23,6 +55,7 @@ grep -q "Hello from TheTaaJ" "$LOG"                || fail "no greeting"
 grep -q "resumed after the breakpoint" "$LOG"      || fail "exception path broken"
 grep -q "\[selftest\] memory: all passed" "$LOG"   || fail "memory self-test"
 grep -q "\[selftest\] timer" "$LOG"               || fail "timer self-test"
+if [ "$ARCH" = pc ]; then
 CPUS=${SMP:-4}
 if [ "$CPUS" -eq 1 ]; then
     grep -q "\[smp\] 1 CPU: no others to start" "$LOG" || fail "one CPU: the kernel did not say there were no others"
@@ -55,16 +88,19 @@ else
     grep -q "\[selftest\] wake-ups: a thread woken by a busy CPU ran on an idle one" "$LOG" \
         || fail "an idle CPU was not told of a woken thread"
 fi
+fi
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
+if [ "$ARCH" = pc ]; then
 # The program that reads through GS must fault at its own offset from
 # address 0 - twice, the self-test runs everything twice - and not in
 # the kernel's memory: every swapgs is in its place.
 [ "$(grep -c "user read at 0x5a5: page not present" "$LOG")" -eq 2 ] || fail "a program's GS is not its own"
+fi
 grep -q "\[selftest\] ipc:" "$LOG"                || fail "IPC self-test"
 grep -q "\[selftest\] files:" "$LOG"              || fail "file service self-test"
 grep -q "\[selftest\] kill:" "$LOG"               || fail "kill self-test"
 grep -q "\[kernel\] idle" "$LOG"                  || fail "did not reach idle"
-grep -q "\[init\] started:.* shell kbd" "$LOG" || fail "init did not start the services"
+grep -q "\[init\] started:.* shell $INPUT_DRIVER" "$LOG" || fail "init did not start the services"
 if grep -q "framebuffer: .*handed to init" "$LOG"; then
     grep -q "\[display\] painted" "$LOG"            || fail "the display service did not paint"
     [ -f "$LOG.ppm" ]                                || fail "no screenshot"
@@ -75,17 +111,32 @@ if [ -n "$METHOD" ]; then
     grep -qE "loader +TheTaaJBoot.*\($METHOD\)" "$LOG" || fail "not booted via $METHOD"
 fi
 if [ -n "$TYPED" ]; then
-    grep -q "\[kbd\] PS/2 keyboard ready" "$LOG"     || fail "keyboard driver did not start"
+    grep -q "$INPUT_READY" "$LOG"                  || fail "keyboard driver did not start"
     grep -qF "[shell] line: \"$TYPED\"" "$LOG"     || fail "keyboard: \"$TYPED\" not echoed by the shell"
-    grep -q "\[init\] kbd ended .* restarting" "$LOG" || fail "init did not restart the crashed driver"
+    grep -q "\[init\] $INPUT_DRIVER ended .* restarting" "$LOG" || fail "init did not restart the crashed driver"
     # The watchdog must end what was stalled on purpose, and only that:
     # fs once (its own stall) - not again while blk, which it waits on,
     # was being replaced - and nothing by mistake.
     [ "$(grep -c "\[init\] fs has not answered" "$LOG")" -le 1 ] || fail "the watchdog stopped fs more than once"
     [ "$(grep -c "\[init\] .* has not answered" "$LOG")" -le 4 ] || fail "the watchdog stopped a service that was not stalled"
+    if [ "$ARCH" = aarch64 ]; then
+        # Keys must arrive by interrupt. A driver whose line never came
+        # back on would still read them - each time init's once-a-second
+        # question woke it - and everything above would pass, slowly.
+        grep -aq "\[serial\] [0-9]* interrupts taken" "$LOG" || fail "the serial driver was not interrupted for the keys"
+        # The log is the screen here, so what the shell shows must be in
+        # it once: a program that wrote to both the screen and the log
+        # would show it twice - every key typed, echoed double.
+        [ "$(grep -ac "Welcome to TheTaaJ" "$LOG")" = "$(grep -ac "\[shell\] ready" "$LOG")" ] \
+            || fail "the shell's greeting is not on the terminal exactly once for each time it started"
+        [ "$(grep -ac "^taaj:/> echo " "$LOG")" -ge 5 ] || fail "what was typed is not on the terminal as it was typed"
+        python3 -I -c 'import re, sys
+sys.exit(1 if re.search(rb"^taaj:/> .*([a-z])\1([a-z])\2([a-z])\3([a-z])\4", open(sys.argv[1], "rb").read(), re.M) else 0)' "$LOG" \
+            || fail "keys typed are on the terminal twice over (a command with four doubled letters in a row)"
+    fi
 fi
 if [ -n "${DISK:-}" ]; then
-    grep -q "\[pci\] .* virtio block device: .* handed to init" "$LOG" || fail "the kernel did not offer the disk"
+    grep -q "$DISK_OFFERED" "$LOG" || fail "the kernel did not offer the disk"
     grep -q "\[blk\] virtio disk" "$LOG"           || fail "the disk driver did not start"
     if [ -n "${TFSTOOL:-}" ]; then
         # Proof that files reached the disk itself, in a form another
@@ -218,7 +269,9 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
                 took=$(echo "$times" | sed 's/^took \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
                 worked=$(echo "$times" | sed 's/.*worked for \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
                 [ "${took:-0}" -gt 100 ] || fail "the four copies of cprimes were over before the shell waited for them: $times"
-                [ $((${worked:-0} * 2)) -ge $((took * 3)) ] \
+                # (The AArch64 kernel runs on one CPU so far: the four
+                # copies must still each be right, taking turns.)
+                [ "$ARCH" != pc ] || [ $((${worked:-0} * 2)) -ge $((took * 3)) ] \
                     || fail "four programs did not run at once: $times"
                 echo "four copies of cprimes at once: $times"
             fi

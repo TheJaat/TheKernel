@@ -547,6 +547,10 @@ pub struct Serial {
     /// Whether the tree named it as the console (`/chosen`,
     /// `stdout-path`), or it was just the first one found.
     pub chosen: bool,
+    /// Its interrupt, in the interrupt controller's own numbering, and
+    /// whether it is signalled by an edge (else by a level) - as for a
+    /// `DeviceSlot`. None if the tree does not give one.
+    pub interrupt: Option<(u32, bool)>,
 }
 
 /// Arm's "generic interrupt controller".
@@ -698,7 +702,12 @@ impl<'a> Machine<'a> {
             .next()
             .and_then(|phandle| tree.by_phandle(phandle))
             .and_then(|clock| clock.number("clock-frequency"));
-        Some(Serial { registers, clock_hz, chosen })
+        let mut numbers = node.numbers("interrupts");
+        let interrupt = match (numbers.next(), numbers.next(), numbers.next()) {
+            (Some(kind), Some(number), Some(flags)) => Some(gic_interrupt(kind, number, flags)),
+            _ => None,
+        };
+        Some(Serial { registers, clock_hz, chosen, interrupt })
     }
 
     /// The memory ranges kept.
@@ -930,6 +939,7 @@ mod tests {
             .text("compatible", &["arm,pl011", "arm,primecell"])
             .cells("reg", &[0x1000, 0x100])
             .cells("clocks", &[7, 7])
+            .cells("interrupts", &[0, 5, 1])
             .end()
             .begin("serial@2000")
             .text("compatible", &["arm,pl011"])
@@ -1099,7 +1109,7 @@ mod tests {
         // its clock found through a phandle.
         assert_eq!(
             machine.serial,
-            Some(Serial { registers: Range { start: 0x1000, size: 0x100 }, clock_hz: Some(48_000_000), chosen: true })
+            Some(Serial { registers: Range { start: 0x1000, size: 0x100 }, clock_hz: Some(48_000_000), chosen: true, interrupt: Some((37, true)) })
         );
         assert_eq!(machine.interrupt_controller, None);
         assert_eq!(machine.firmware_call, None);
@@ -1190,7 +1200,7 @@ mod tests {
         let machine = Machine::read(&Tree::new(&blob).unwrap());
         assert_eq!(
             machine.serial,
-            Some(Serial { registers: Range { start: 0x9000, size: 0x1000 }, clock_hz: None, chosen: false })
+            Some(Serial { registers: Range { start: 0x9000, size: 0x1000 }, clock_hz: None, chosen: false, interrupt: None })
         );
     }
 
@@ -1302,7 +1312,13 @@ mod tests {
         assert_eq!(machine.cpus(), [0]);
         assert_eq!(
             machine.serial,
-            Some(Serial { registers: Range { start: 0x900_0000, size: 0x1000 }, clock_hz: Some(24_000_000), chosen: true })
+            Some(Serial {
+                registers: Range { start: 0x900_0000, size: 0x1000 },
+                clock_hz: Some(24_000_000),
+                chosen: true,
+                // "Shared, number 1, level, high": the controller's 33.
+                interrupt: Some((33, false)),
+            })
         );
         assert_eq!(
             machine.interrupt_controller,

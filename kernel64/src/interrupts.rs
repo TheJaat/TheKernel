@@ -22,6 +22,9 @@ pub fn timer_tick() {
     if crate::arch::cpu() == 0 {
         let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         crate::threads::on_tick(now);
+        // Programs' output waits in a queue for an idle moment; on a
+        // busy machine this is the only moment there is.
+        crate::console::write_on_tick();
     } else {
         crate::threads::on_tick_elsewhere();
     }
@@ -68,8 +71,8 @@ pub fn ticks() -> u64 {
 /// controller's number for the line, or 0. When one is set, the
 /// handler switches the line off at the controller before it counts
 /// (`source_fired`), and the line is switched on again only when its
-/// driver comes back to wait - by which time the driver has dealt with
-/// the device. The interrupt cannot arrive a second time while the
+/// driver comes back to wait with nothing pending - by which time the
+/// driver has dealt with the device. The interrupt cannot arrive a second time while the
 /// first is being handled in a program, whichever way the wire is
 /// read, and the kernel needs to know nothing about the device.
 pub struct InterruptLine {
@@ -83,9 +86,30 @@ impl InterruptLine {
         InterruptLine { pending: AtomicU64::new(0), waiters: WaitQueue::new(), source: AtomicU32::new(0) }
     }
 
-    /// Fired and not yet waited for?
+    /// Fired and not yet waited for? Asked by whoever is about to
+    /// wait for the line, among other things (`object_wait`) - so if
+    /// it has not fired, it is made sure the line can.
     pub fn is_pending(&self) -> bool {
-        self.pending.load(Ordering::Relaxed) > 0
+        let pending = self.pending.load(Ordering::Relaxed) > 0;
+        if !pending {
+            self.rearm();
+        }
+        pending
+    }
+
+    /// Lets a line that was switched off when it fired through again.
+    ///
+    /// Only ever called when nothing is pending: then whatever fired
+    /// last has been taken by its driver, and the driver is back to
+    /// wait - it has dealt with the device, or it would not be asking
+    /// for more. While an interrupt is still pending the line stays
+    /// off: the driver has yet to hear of it, and a line still raised
+    /// would only fire again.
+    fn rearm(&self) {
+        let source = self.source.load(Ordering::Relaxed);
+        if source != 0 {
+            crate::arch::rearm_interrupt(source);
+        }
     }
 
     pub fn waiters(&self) -> &WaitQueue {
@@ -103,12 +127,10 @@ impl InterruptLine {
     /// waiting process is being killed.
     pub fn wait(&self) -> Option<u64> {
         loop {
-            // A line that was switched off when it fired: on again,
-            // now that its driver is ready for the next one. If the
-            // device has been asking meanwhile, it arrives at once.
-            let source = self.source.load(Ordering::Relaxed);
-            if source != 0 {
-                crate::arch::rearm_interrupt(source);
+            // About to sleep until the line fires: it must be able to.
+            // If the device has been asking meanwhile, it fires at once.
+            if self.pending.load(Ordering::Relaxed) == 0 {
+                self.rearm();
             }
             if !self.waiters.wait_while(|| self.pending.load(Ordering::Relaxed) == 0) {
                 return None;

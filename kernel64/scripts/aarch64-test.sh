@@ -2,11 +2,12 @@
 # aarch64-test.sh - builds the AArch64 kernel, boots it in QEMU on
 # several machines, and checks what it says.
 #
-#   usage: aarch64-test.sh BUILD_DIR OBJCOPY [FEATURES]
+#   usage: aarch64-test.sh BUILD_DIR OBJCOPY
 #
-# FEATURES is "c-programs" where the C programs have been built
-# (BUILD_DIR/c-aarch64): the kernel then carries them, and every boot
-# must run them.
+# These boots are about the kernel and the machine under it; each ends
+# when the kernel has started init and gone idle. What the programs
+# then do, with a disk and someone typing, is another test
+# (`make aarch64-keys-test`).
 #
 # OBJCOPY must be LLVM's (llvm-objcopy): the one that comes with a PC's
 # compiler does not know AArch64 files.
@@ -53,7 +54,6 @@ set -eu
 
 BUILD=$1
 OBJCOPY=$2
-FEATURES=${3:-}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TARGET=aarch64-unknown-none-softfloat
 OUT="$BUILD/aarch64"
@@ -88,8 +88,10 @@ need() {
 }
 
 # ---- build ------------------------------------------------------------
-(cd "$HERE" && cargo build --release --quiet --target $TARGET ${FEATURES:+--features $FEATURES})
-"$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image"
+(cd "$HERE" && cargo build --release --quiet --target $TARGET)
+# Put in place in one step: another test may be booting the image that
+# is there now (the same one, unless the sources changed in between).
+"$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image.$$" && mv -f "$OUT/Image.$$" "$OUT/Image"
 for fault in null page rodata nx stack thread-stack; do
     (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
     "$OBJCOPY" -O binary "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" "$OUT/Image-fault-$fault"
@@ -213,21 +215,6 @@ boot() {
             "$HERE/scripts/disk-pattern.py" check "$DISK_IMAGE" 6143 untouched > /dev/null 2>&1 || fail "the disk image changed"
             ;;
         esac
-        # The same from C: arguments, exit codes, arithmetic with
-        # fractions done without the floating-point registers, the
-        # library's strings and memory, printf.
-        if [ "$FEATURES" = c-programs ]; then
-            need "$log" "^argv\[2\] two words"
-            need "$log" "^7.0 / 2 \* 4 = 14"
-            need "$log" "\[process\] [0-9]+ \"chello\" exited with code 3"
-            need "$log" "\[process\] [0-9]+ \"chello\" exited with code 4"
-            need "$log" "^strings: 28 checks, all passed"
-            need "$log" "^memory: 15 checks, all passed"
-            need "$log" "^apple fig pear"
-            need "$log" "^sizes: 18446744073709551615 -9223372036854775808"
-            need "$log" "^cprimes: 25 primes below 100"
-            need "$log" "\[selftest\] c: 8 runs of 4 C programs, twice - each ended with the code its main returned; nothing leaked"
-        fi
     fi
     need "$log" "\[tree\] timer       ${TIMER:-interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)}"
     if grep -aq "unexpected interrupt" "$log"; then fail "an interrupt arrived that nothing asked for"; fi
@@ -257,7 +244,15 @@ boot() {
     devices=${DEVICES:-0}
     need "$log" "\[virtio\] 32 places at 0xa000000 - 0xa004000: $devices with a device, $((32 - devices)) empty"
     [ "$(grep -acE '^\[virtio\] 0x[0-9a-f]+: ' "$log")" -eq "$devices" ] || fail "not exactly $devices virtio devices reported"
-    need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
+    # The end of the kernel's own part: init started, with the serial
+    # port for a terminal - or, with no interrupts, nothing can run.
+    if [ "$gic" = none ]; then
+        need "$log" "\[kernel\] no programs can run on this machine - halting"
+    else
+        need "$log" "\[kernel\] serial port at 0x9000000, interrupt 33 \(level\): handed to init, for a driver"
+        need "$log" "\[kernel\] boot done; running: "
+        need "$log" "\[kernel\] idle - the services take it from here"
+    fi
     # What only this boot must also say: ALSO, a pattern on each line.
     if [ -n "${ALSO:-}" ]; then
         printf '%s\n' "$ALSO" | while IFS= read -r pattern; do
@@ -286,7 +281,7 @@ fault() {
     need "$log" "$what"
     need "$log" "from the kernel \(vector 4\)"
     need "$log" "    pc  0xffffffff"
-    if grep -aEq "FAILED|this is as far as" "$log"; then
+    if grep -aEq "FAILED|\[kernel\] idle|\[kernel\] no programs can run" "$log"; then
         fail "the kernel carried on after the fault"
     fi
     grep -aE "$what" "$log" | cut -c1-110
@@ -305,7 +300,7 @@ overflow() {
     need "$log" "kernel write at $4: the page kept unmapped below the stack"
     need "$log" "    pc  0xffffffff"
     [ "$(grep -ac 'STACK OVERFLOW\|CPU EXCEPTION\|KERNEL PANIC' "$log")" -eq 1 ] || fail "more than one report"
-    if grep -aEq "FAILED|this is as far as" "$log"; then
+    if grep -aEq "FAILED|\[kernel\] idle|\[kernel\] no programs can run" "$log"; then
         fail "the kernel carried on after the overflow"
     fi
     grep -a "STACK OVERFLOW\|kernel write at" "$log" | cut -c1-110

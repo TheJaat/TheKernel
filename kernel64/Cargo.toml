@@ -48,12 +48,6 @@ fault-null = ["fault-tests"]         # read through a null pointer (AArch64 so f
 # Never in a normal build; `make big64-test` builds and boots it.
 big-image = []
 
-# AArch64, until it has a disk to load them from: the C programs, built
-# into the image and run by a self-test. A feature, because building
-# them takes a C compiler, which the kernel itself does not need; the
-# Makefile switches it on when there is one (`make kernel-aarch64`).
-c-programs = []
-
 # No unwinding: there is nothing to unwind into. A panic prints and halts.
 [profile.dev]
 panic = "abort"

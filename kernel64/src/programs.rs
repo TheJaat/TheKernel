@@ -42,6 +42,11 @@ pub static FOREVER: &[u8] = program!("forever");
 /// at a place in memory.
 pub static BLK: &[u8] = program!("blk");
 
+/// The system's own programs: the first process, and what it starts.
+pub static INIT: &[u8] = program!("init");
+pub static SHELL: &[u8] = program!("shell");
+pub static REGISTRY: &[u8] = program!("registry");
+
 /// PC only: they use I/O ports, a segment register, or devices only
 /// the PC kernel knows how to hand out so far.
 #[cfg(target_arch = "x86_64")]
@@ -49,10 +54,7 @@ mod pc {
     pub static GS: &[u8] = program!("gs");
     pub static PORT: &[u8] = program!("port");
     pub static KBD: &[u8] = program!("kbd");
-    pub static SHELL: &[u8] = program!("shell");
-    pub static INIT: &[u8] = program!("init");
     pub static DISPLAY: &[u8] = program!("display");
-    pub static REGISTRY: &[u8] = program!("registry");
 }
 #[cfg(target_arch = "x86_64")]
 pub use pc::*;
@@ -64,36 +66,9 @@ pub static REGS: &[u8] = program!("regs");
 /// the system's files, and is tested by using them.)
 #[cfg(target_arch = "aarch64")]
 pub static BLKCHECK: &[u8] = program!("blkcheck");
-
-/// C programs: compiled by Clang, linked with libc.a, and - on AArch64,
-/// which has no disk to keep them on yet - embedded like the rest.
-/// (On the PC they are files on the disk, run by the boot tests.)
-#[cfg(feature = "c-programs")]
-pub mod c {
-    macro_rules! c_program {
-        ($name:literal) => {
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/c-aarch64/", $name))
-        };
-    }
-
-    static CHELLO: &[u8] = c_program!("chello");
-    static CMEM: &[u8] = c_program!("cmem");
-    static CPRINT: &[u8] = c_program!("cprint");
-    static CPRIMES: &[u8] = c_program!("cprimes");
-
-    /// What the C self-test runs: a program, its arguments, and the
-    /// exit code it must end with.
-    pub static CHECK: &[(&str, &[u8], &[&str], i64)] = &[
-        ("chello", CHELLO, &["one", "two words"], 0),
-        ("chello", CHELLO, &["float"], 0),
-        ("chello", CHELLO, &["fail"], 3),
-        ("chello", CHELLO, &["exit"], 4),
-        ("cmem", CMEM, &[], 0),
-        ("cmem", CMEM, &["sort", "pear", "apple", "fig"], 0),
-        ("cprint", CPRINT, &["one"], 0),
-        ("cprimes", CPRIMES, &["100"], 0),
-    ];
-}
+/// AArch64 only: the serial port's driver - keyboard and screen in one.
+#[cfg(target_arch = "aarch64")]
+pub static SERIAL: &[u8] = program!("serial");
 
 /// The programs the user-mode self-test runs, and how each must end:
 /// with an exit code of its own, or killed for breaking a rule.
@@ -135,10 +110,20 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("peek", PEEK),
 ];
 
-/// On AArch64 there is no launcher yet - no init to hold one - so the
-/// list is only the programs that would make sense to start by hand.
+/// On AArch64 the serial port's driver takes the place of the
+/// keyboard's and the display's.
 #[cfg(target_arch = "aarch64")]
-static PROGRAMS: &[(&str, &[u8])] = &[("fs", FS), ("echod", ECHOD), ("echoc", ECHOC), ("hello", HELLO), ("peek", PEEK)];
+static PROGRAMS: &[(&str, &[u8])] = &[
+    ("serial", SERIAL),
+    ("shell", SHELL),
+    ("fs", FS),
+    ("blk", BLK),
+    ("registry", REGISTRY),
+    ("echod", ECHOD),
+    ("echoc", ECHOC),
+    ("hello", HELLO),
+    ("peek", PEEK),
+];
 
 pub fn find(name: &str) -> Option<(&'static str, &'static [u8])> {
     PROGRAMS.iter().find(|(n, _)| *n == name).copied()
