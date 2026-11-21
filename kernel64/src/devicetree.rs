@@ -506,8 +506,36 @@ pub struct Machine<'a> {
     /// How to ask the firmware to start a CPU or switch the machine
     /// off (the "PSCI" calls).
     pub firmware_call: Option<FirmwareCall>,
+    /// The places a virtio device may be. Counted past the array like
+    /// `memory`.
+    pub virtio: [DeviceSlot; Machine::VIRTIO_MAX],
+    pub virtio_count: usize,
     pub nodes: usize,
     pub deepest: usize,
+}
+
+/// A place where a virtio device may be found ("virtio,mmio"): a few
+/// registers in memory, and an interrupt. The tree only says the place
+/// exists; whether a device is in it, and which kind, the registers
+/// themselves say (the `virtio` crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeviceSlot {
+    pub registers: Range,
+    /// Its interrupt, in the interrupt controller's own numbering.
+    pub interrupt: Option<u32>,
+    /// How the interrupt is signalled: by a change of the line (an
+    /// "edge") or by the line being held (a "level").
+    pub edge: bool,
+}
+
+/// One entry of an `interrupts` property as Arm's interrupt controller
+/// defines it - three numbers: the kind (1 = private to each CPU, 0 =
+/// shared), a number within that kind, and flags. Returns the
+/// controller's own number for it - private interrupts are 16 to 31,
+/// shared ones follow from 32 - and whether it is edge-triggered
+/// (flags 1 and 2; 4 and 8 are levels).
+pub fn gic_interrupt(kind: u32, number: u32, flags: u32) -> (u32, bool) {
+    (number + if kind == 1 { 16 } else { 32 }, flags & 0b11 != 0)
 }
 
 /// A PL011 serial port.
@@ -545,6 +573,7 @@ impl<'a> Machine<'a> {
     pub const MEMORY_MAX: usize = 8;
     pub const RESERVED_MAX: usize = 16;
     pub const CPUS_MAX: usize = 16;
+    pub const VIRTIO_MAX: usize = 32;
 
     pub fn read(tree: &Tree<'a>) -> Machine<'a> {
         let mut machine = Machine { model: tree.root().and_then(|root| root.text("model")), ..Machine::default() };
@@ -590,18 +619,29 @@ impl<'a> Machine<'a> {
             }
 
             if node.is_compatible("arm,armv8-timer") {
-                // Each interrupt is three numbers, as the interrupt
-                // controller defines them: the kind (1 = private to
-                // each CPU, 0 = shared), a number within that kind,
-                // and flags. Private interrupts are numbers 16 to 31
-                // of the controller's own numbering; shared ones
-                // follow from 32.
                 let mut numbers = node.numbers("interrupts");
                 for slot in &mut machine.timer_interrupts {
-                    let (Some(kind), Some(number), Some(_flags)) = (numbers.next(), numbers.next(), numbers.next()) else {
+                    let (Some(kind), Some(number), Some(flags)) = (numbers.next(), numbers.next(), numbers.next()) else {
                         break;
                     };
-                    *slot = Some(number + if kind == 1 { 16 } else { 32 });
+                    *slot = Some(gic_interrupt(kind, number, flags).0);
+                }
+            }
+
+            if node.is_compatible("virtio,mmio") && node.direct {
+                if let Some(registers) = node.reg().next().filter(|range| range.size > 0) {
+                    let mut numbers = node.numbers("interrupts");
+                    let (interrupt, edge) = match (numbers.next(), numbers.next(), numbers.next()) {
+                        (Some(kind), Some(number), Some(flags)) => {
+                            let (interrupt, edge) = gic_interrupt(kind, number, flags);
+                            (Some(interrupt), edge)
+                        }
+                        _ => (None, false),
+                    };
+                    if let Some(slot) = machine.virtio.get_mut(machine.virtio_count) {
+                        *slot = DeviceSlot { registers, interrupt, edge };
+                    }
+                    machine.virtio_count += 1;
                 }
             }
 
@@ -672,6 +712,10 @@ impl<'a> Machine<'a> {
     }
 
     /// The CPU identifiers kept.
+    pub fn virtio(&self) -> &[DeviceSlot] {
+        &self.virtio[..self.virtio_count.min(Machine::VIRTIO_MAX)]
+    }
+
     pub fn cpus(&self) -> &[u64] {
         &self.cpus[..self.cpu_count.min(Machine::CPUS_MAX)]
     }
@@ -1271,6 +1315,62 @@ mod tests {
         assert_eq!(machine.timer_interrupts, [Some(29), Some(30), Some(27), Some(26)]);
         assert_eq!(machine.firmware_call, Some(FirmwareCall::Hvc));
         assert!(machine.nodes > 40, "{} nodes", machine.nodes);
+        // Thirty-two places for virtio devices, 512 bytes each, with
+        // the shared interrupts 16 to 47 - numbers 48 to 79.
+        let slots = machine.virtio();
+        assert_eq!(slots.len(), 32);
+        let mut starts: Vec<u64> = slots.iter().map(|slot| slot.registers.start).collect();
+        starts.sort_unstable();
+        assert_eq!(starts[0], 0xA00_0000);
+        assert_eq!(starts[31], 0xA00_3E00);
+        for slot in slots {
+            assert_eq!(slot.registers.size, 0x200);
+            let n = (slot.registers.start - 0xA00_0000) / 0x200;
+            assert_eq!(slot.interrupt, Some(48 + n as u32), "slot {n}");
+            assert!(slot.edge, "slot {n}");
+        }
+    }
+
+    #[test]
+    fn interrupt_numbers_are_the_controllers_own() {
+        assert_eq!(gic_interrupt(1, 11, 0xF08), (27, false)); // the virtual timer: private, level
+        assert_eq!(gic_interrupt(0, 16, 1), (48, true)); // the first virtio slot: shared, rising edge
+        assert_eq!(gic_interrupt(0, 1, 4), (33, false)); // the serial port: shared, level
+    }
+
+    #[test]
+    fn device_slots_are_found_with_or_without_an_interrupt() {
+        let blob = Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("virtio_mmio@a000000")
+            .text("compatible", &["virtio,mmio"])
+            .cells("reg", &[0, 0xA00_0000, 0, 0x200])
+            .cells("interrupts", &[0, 16, 4])
+            .end()
+            .begin("virtio_mmio@a000200")
+            .text("compatible", &["virtio,mmio"])
+            .cells("reg", &[0, 0xA00_0200, 0, 0x200])
+            .end()
+            .begin("virtio_mmio@a000400")
+            .text("compatible", &["virtio,mmio"])
+            .text("status", &["disabled"])
+            .cells("reg", &[0, 0xA00_0400, 0, 0x200])
+            .end()
+            .begin("virtio_mmio@a000600")
+            .text("compatible", &["virtio,mmio"])
+            .end()
+            .end()
+            .blob();
+        let machine = Machine::read(&Tree::new(&blob).unwrap());
+        assert_eq!(
+            machine.virtio(),
+            [
+                DeviceSlot { registers: Range { start: 0xA00_0000, size: 0x200 }, interrupt: Some(48), edge: false },
+                DeviceSlot { registers: Range { start: 0xA00_0200, size: 0x200 }, interrupt: None, edge: false },
+            ]
+        );
     }
 
     #[test]

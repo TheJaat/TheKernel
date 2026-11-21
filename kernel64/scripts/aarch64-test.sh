@@ -24,6 +24,10 @@
 #   nogic      a device tree whose interrupt controller is unknown: the
 #              kernel must say it has no interrupts, and not wait for one
 #   notimer    a device tree that does not give the timer's interrupt
+#   disk       a virtio disk and a virtio source of random numbers: the
+#              kernel must find both among the thirty-two places the
+#              tree describes, and say what each is
+#   modern     the same disk, speaking the newer virtio interface
 #   reserved   device trees that keep some of the memory back: at the
 #              very start and the top of 512 MiB, and at the top of 6 GiB
 #   fault-*    kernels built to read through a null pointer, to read
@@ -190,6 +194,11 @@ boot() {
     need "$log" "\[paging\] the CPU refuses a write to code and to constants, and allows one to variables and the heap"
     need "$log" "\[paging\] the low half is off: address 0 and 0x4[0-9a-f]+, where this code really is, translate to nothing"
     need "$log" "\[paging\] one address mapped to the page at 0x4[0-9a-f]+, then to the one at 0x4[0-9a-f]+: the CPU reads the new page there"
+    # The places for virtio devices: all thirty-two looked at, and as
+    # many found occupied as this machine was given devices.
+    devices=${DEVICES:-0}
+    need "$log" "\[virtio\] 32 places at 0xa000000 - 0xa004000: $devices with a device, $((32 - devices)) empty"
+    [ "$(grep -ac '^\[virtio\] 0x' "$log")" -eq "$devices" ] || fail "not exactly $devices virtio devices reported"
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
     [ "$(grep -ac 'breakpoint at' "$log")" -eq 1 ] || fail "the breakpoint was taken more than once"
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
@@ -251,6 +260,18 @@ need "$OUT/reserved.log" "bitmap 48 KiB at 0x40010000"
 "$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-high.dtb" 0x1bf000000 0x1000000
 KEPT=16 CPU=cortex-a53 MEMORY=6G QEMU_ARGS="-dtb $OUT/reserved-high.dtb" boot reserved-high 1 6144 1 2 hvc
 need "$OUT/reserved-high.log" "\[tree\] reserved    0x1bf000000 - 0x1c0000000"
+
+# Devices. A disk of 3 MiB less one sector - a size no default would
+# give - and a second device of another kind. QEMU fills the places
+# from the last one down, so the disk, named first, is in the last.
+head -c $((3 * 1048576 - 512)) /dev/zero > "$OUT/disk.img"
+DISK="-drive file=$OUT/disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+DEVICES=2 QEMU_ARGS="$DISK -device virtio-rng-device" boot disk 1 512 1 2 hvc
+need "$OUT/disk.log" "\[virtio\] 0xa003e00: block device \(legacy interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)"
+need "$OUT/disk.log" "\[virtio\] 0xa003c00: source of random numbers \(legacy interface\), interrupt 78 \(edge\)"
+# The same disk on a machine told to offer the newer interface.
+DEVICES=1 QEMU_ARGS="-global virtio-mmio.force-legacy=false $DISK" boot modern 1 512 1 2 hvc
+need "$OUT/modern.log" "\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)"
 
 # ---- the faults -------------------------------------------------------
 # One build and one boot per fault. Each must be caught, named, and

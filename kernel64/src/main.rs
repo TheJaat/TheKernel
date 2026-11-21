@@ -45,6 +45,8 @@ mod ipc;
 mod memory_object;
 mod mm;
 mod process;
+#[cfg(target_arch = "aarch64")]
+mod mmio_devices;
 mod programs;
 mod selftest;
 mod syscall;
@@ -302,6 +304,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
 
     selftest::run();
     arch::mmu::selftest();
+
+    // Devices: what is in the places the tree describes. Only looked
+    // at so far; drivers are programs, and come next.
+    kprintln!();
+    let _devices = mmio_devices::find(&machine);
 
     // Interrupts: the controller the tree describes, and the CPU's
     // own timer.

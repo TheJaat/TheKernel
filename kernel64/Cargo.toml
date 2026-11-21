@@ -19,12 +19,13 @@ bench = false
 abi = { path = "../abi" }
 # The allocator, shared with user programs.
 heap = { path = "../../heap" }
+# virtio constants: which devices the kernel sets up for drivers, on a
+# PCI bus (devices.rs) or at places in memory (mmio_devices.rs).
+virtio = { path = "../../virtio" }
 
 # What the AArch64 kernel does not use yet (see the note at the top of
 # main.rs): these move up beside `abi` as the port reaches them.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-# virtio constants: which PCI devices the kernel sets up for drivers.
-virtio = { path = "../../virtio" }
 # The font - for the kernel's last words, on the screen (lastwords.rs).
 console = { path = "../../console" }
 
