@@ -2,7 +2,11 @@
 # aarch64-test.sh - builds the AArch64 kernel, boots it in QEMU on
 # several machines, and checks what it says.
 #
-#   usage: aarch64-test.sh BUILD_DIR OBJCOPY
+#   usage: aarch64-test.sh BUILD_DIR OBJCOPY [FEATURES]
+#
+# FEATURES is "c-programs" where the C programs have been built
+# (BUILD_DIR/c-aarch64): the kernel then carries them, and every boot
+# must run them.
 #
 # OBJCOPY must be LLVM's (llvm-objcopy): the one that comes with a PC's
 # compiler does not know AArch64 files.
@@ -34,6 +38,7 @@ set -eu
 
 BUILD=$1
 OBJCOPY=$2
+FEATURES=${3:-}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TARGET=aarch64-unknown-none-softfloat
 OUT="$BUILD/aarch64"
@@ -51,7 +56,7 @@ need() {
 }
 
 # ---- build ------------------------------------------------------------
-(cd "$HERE" && cargo build --release --quiet --target $TARGET)
+(cd "$HERE" && cargo build --release --quiet --target $TARGET ${FEATURES:+--features $FEATURES})
 "$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image"
 for fault in null page rodata nx stack thread-stack; do
     (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
@@ -146,6 +151,21 @@ boot() {
         need "$log" "\[selftest\] ipc: echo service and client - rights, transfer, backpressure, crash isolation; 0 channels left"
         need "$log" "\[selftest\] files: fs and fscheck, twice - every check passed, 0 channels and no frames left"
         need "$log" "\[selftest\] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked"
+        # The same from C: arguments, exit codes, arithmetic with
+        # fractions done without the floating-point registers, the
+        # library's strings and memory, printf.
+        if [ "$FEATURES" = c-programs ]; then
+            need "$log" "^argv\[2\] two words"
+            need "$log" "^7.0 / 2 \* 4 = 14"
+            need "$log" "\[process\] [0-9]+ \"chello\" exited with code 3"
+            need "$log" "\[process\] [0-9]+ \"chello\" exited with code 4"
+            need "$log" "^strings: 28 checks, all passed"
+            need "$log" "^memory: 15 checks, all passed"
+            need "$log" "^apple fig pear"
+            need "$log" "^sizes: 18446744073709551615 -9223372036854775808"
+            need "$log" "^cprimes: 25 primes below 100"
+            need "$log" "\[selftest\] c: 8 runs of 4 C programs, twice - each ended with the code its main returned; nothing leaked"
+        fi
     fi
     need "$log" "\[tree\] timer       ${TIMER:-interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)}"
     if grep -aq "unexpected interrupt" "$log"; then fail "an interrupt arrived that nothing asked for"; fi

@@ -337,6 +337,9 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
             selftest::ipc();
             selftest::files();
             selftest::kill();
+            // The same, written in C.
+            #[cfg(feature = "c-programs")]
+            selftest::c();
         }
         None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"),
     }

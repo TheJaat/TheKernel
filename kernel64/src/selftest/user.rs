@@ -181,3 +181,40 @@ pub fn kill() {
     assert_eq!(ipc::live_channels(), 0, "killed processes leaked channels");
     kprintln!("[selftest] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked");
 }
+
+/// C: programs written in C, compiled by a compiler that knows nothing
+/// of this system, and linked with its C library. Each is started as
+/// the shell would start it - its arguments in a channel - and must
+/// end with the code its `main` returned (or gave to `exit`). What
+/// they print goes to the log, where the boot tests read it. One after
+/// another, so that their lines stay in order; twice, and then nothing
+/// may be left.
+#[cfg(feature = "c-programs")]
+pub fn c() {
+    use crate::{ipc, process, programs};
+    use kernel64::cap::Rights;
+
+    let checks = programs::c::CHECK;
+    let run = || {
+        for &(name, file, arguments, code) in checks {
+            let mut message = [0u8; 256];
+            let length = abi::arguments::encode(arguments.iter().copied(), &mut message).expect("the arguments fit");
+            let (tx, rx) = ipc::channel();
+            ipc::kernel_send(&tx, &message[..length], Vec::new()).expect("sending the arguments");
+            drop(tx);
+            let loaded = process::load(name, file).unwrap_or_else(|e| panic!("loading {name}: {e:?}"));
+            let thread = process::start(&loaded, alloc::vec![(rx, Rights::ALL)], abi::startup::ARGUMENTS);
+            threads::join(thread);
+            assert_eq!(loaded.exit_code(), Some(code), "{name} {arguments:?}");
+        }
+    };
+
+    run();
+    threads::yield_now();
+    let frames = mm::unused_frames();
+    run();
+    threads::yield_now();
+    assert_eq!(mm::unused_frames(), frames, "C programs leaked frames");
+    assert_eq!(ipc::live_channels(), 0, "C programs leaked channels");
+    kprintln!("[selftest] c: {} runs of 4 C programs, twice - each ended with the code its main returned; nothing leaked", checks.len());
+}

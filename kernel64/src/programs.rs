@@ -59,6 +59,36 @@ pub use pc::*;
 #[cfg(target_arch = "aarch64")]
 pub static REGS: &[u8] = program!("regs");
 
+/// C programs: compiled by Clang, linked with libc.a, and - on AArch64,
+/// which has no disk to keep them on yet - embedded like the rest.
+/// (On the PC they are files on the disk, run by the boot tests.)
+#[cfg(feature = "c-programs")]
+pub mod c {
+    macro_rules! c_program {
+        ($name:literal) => {
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/c-aarch64/", $name))
+        };
+    }
+
+    static CHELLO: &[u8] = c_program!("chello");
+    static CMEM: &[u8] = c_program!("cmem");
+    static CPRINT: &[u8] = c_program!("cprint");
+    static CPRIMES: &[u8] = c_program!("cprimes");
+
+    /// What the C self-test runs: a program, its arguments, and the
+    /// exit code it must end with.
+    pub static CHECK: &[(&str, &[u8], &[&str], i64)] = &[
+        ("chello", CHELLO, &["one", "two words"], 0),
+        ("chello", CHELLO, &["float"], 0),
+        ("chello", CHELLO, &["fail"], 3),
+        ("chello", CHELLO, &["exit"], 4),
+        ("cmem", CMEM, &[], 0),
+        ("cmem", CMEM, &["sort", "pear", "apple", "fig"], 0),
+        ("cprint", CPRINT, &["one"], 0),
+        ("cprimes", CPRIMES, &["100"], 0),
+    ];
+}
+
 /// The programs the user-mode self-test runs, and how each must end:
 /// with an exit code of its own, or killed for breaking a rule.
 #[cfg(target_arch = "x86_64")]

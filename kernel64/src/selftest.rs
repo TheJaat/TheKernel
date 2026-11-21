@@ -26,6 +26,8 @@ mod user;
 #[cfg(target_arch = "x86_64")]
 pub use system::{smp, wakeups};
 pub use user::{files, ipc, kill, user};
+#[cfg(feature = "c-programs")]
+pub use user::c;
 
 pub fn run() {
     frames();
