@@ -17,6 +17,10 @@ bench = false
 # Only our own: the system call interface, shared with user programs.
 # Every line of the kernel is ours to read.
 abi = { path = "../abi" }
+
+# What the AArch64 kernel does not use yet (see the note at the top of
+# main.rs): these move up beside `abi` as the port reaches them.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 # The allocator, shared with user programs.
 heap = { path = "../../heap" }
 # virtio constants: which PCI devices the kernel sets up for drivers.

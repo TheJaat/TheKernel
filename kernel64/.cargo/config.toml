@@ -15,3 +15,13 @@ rustflags = [
     # That is what the -2 GiB link address in linker.ld relies on.
     "-C", "code-model=kernel",
 ]
+
+# AArch64 (`cargo build --target aarch64-unknown-none-softfloat`).
+# "softfloat": the compiler must not use the floating-point and vector
+# registers - the same reason as "no SSE" above. No code model is asked
+# for: AArch64 code finds things relative to where it is running
+# (within 4 GiB), which works at any address.
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "relocation-model=static",
+]

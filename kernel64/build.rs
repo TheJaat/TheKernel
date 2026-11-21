@@ -5,8 +5,12 @@
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    println!("cargo:rustc-link-arg-bins=-T{dir}/linker.ld");
-    println!("cargo:rerun-if-changed=linker.ld");
+    // One script per architecture: where the kernel is loaded, and
+    // what a loader expects to find at its start, differ.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
+    let script = if arch == "aarch64" { "linker-aarch64.ld" } else { "linker.ld" };
+    println!("cargo:rustc-link-arg-bins=-T{dir}/{script}");
+    println!("cargo:rerun-if-changed={script}");
 
     // For the `big-image` feature: three quarters of a megabyte that
     // cannot be compressed away or mistaken for zeroes, and that the

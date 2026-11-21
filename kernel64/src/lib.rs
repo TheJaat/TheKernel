@@ -17,10 +17,12 @@
 // host tests, from the host's allocator.
 extern crate alloc;
 
+pub mod aarch64;
 pub mod acpi;
 pub mod bootinfo;
 pub mod cap;
 pub mod channel;
+pub mod devicetree;
 pub mod elf;
 pub mod ioports;
 pub mod logring;

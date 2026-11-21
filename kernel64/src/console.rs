@@ -2,8 +2,7 @@
 //! kernel.
 //!
 //! Portable: the actual bytes go to `arch::console_write`, which on
-//! x86_64 is the COM1 serial port and on another architecture will be
-//! whatever early console it has.
+//! x86_64 is the COM1 serial port and on AArch64 a PL011.
 //!
 //! A lock keeps each message whole: without it, a message printed by an
 //! interrupt handler could land in the middle of another one's line.
@@ -47,6 +46,7 @@ impl Write for Console {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         crate::arch::console_write(text);
         // And on the screen - once the kernel has taken it, to stop.
+        #[cfg(target_arch = "x86_64")]
         crate::lastwords::echo(text);
         Ok(())
     }
@@ -119,6 +119,7 @@ pub unsafe fn break_lock() {
         QUEUE.force_unlock();
     }
     // The kernel is stopping: what it says now goes on the screen too.
+    #[cfg(target_arch = "x86_64")]
     crate::lastwords::begin();
 }
 

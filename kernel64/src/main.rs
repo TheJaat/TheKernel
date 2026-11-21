@@ -21,6 +21,12 @@
 // No `fn main`: nothing calls it. The entry point is `_start`, in
 // arch/x86_64/entry.rs, which the linker script names.
 #![no_main]
+// The port to AArch64 is under way. Everything marked
+// `cfg(target_arch = "x86_64")` in this file has not crossed yet; the
+// mark comes off a module when AArch64 has what that module needs. On
+// AArch64 that leaves parts of the shared modules unused for now, which
+// is not a mistake to warn about.
+#![cfg_attr(target_arch = "aarch64", allow(dead_code))]
 
 // Box, Vec, String and friends - backed by the heap in mm.rs.
 extern crate alloc;
@@ -29,24 +35,39 @@ extern crate alloc;
 mod console; // first, so its macros are visible in every later module
 
 mod arch;
+#[cfg(target_arch = "x86_64")]
 mod devices;
+#[cfg(target_arch = "x86_64")]
 mod interrupts;
 mod irqlock;
+#[cfg(target_arch = "x86_64")]
 mod lastwords;
+#[cfg(target_arch = "x86_64")]
 mod ipc;
+#[cfg(target_arch = "x86_64")]
 mod memory_object;
+#[cfg(target_arch = "x86_64")]
 mod mm;
+#[cfg(target_arch = "x86_64")]
 mod process;
+#[cfg(target_arch = "x86_64")]
 mod programs;
+#[cfg(target_arch = "x86_64")]
 mod selftest;
+#[cfg(target_arch = "x86_64")]
 mod syscall;
+#[cfg(target_arch = "x86_64")]
 mod threads;
 
+#[cfg(target_arch = "x86_64")]
 use alloc::string::String;
 
+#[cfg(target_arch = "x86_64")]
 use kernel64::acpi::{Acpi, IoApic, Madt};
+#[cfg(target_arch = "x86_64")]
 use kernel64::bootinfo::BootInfo;
 
+#[cfg(target_arch = "x86_64")]
 /// The first Rust code to run, called by `_start` with the physical
 /// address of the TaajBootInfo (in RDI, per the C calling convention).
 ///
@@ -145,11 +166,97 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     idle()
 }
 
+/// On AArch64 there is no heap yet, but there must be an allocator: the
+/// kernel's library uses `Vec`, and Rust will not link a program that
+/// could ask for memory with nothing to ask. This one always says no -
+/// which, if anything ever did ask, ends in a panic that says so.
+#[cfg(target_arch = "aarch64")]
+mod no_heap {
+    use core::alloc::{GlobalAlloc, Layout};
+
+    struct NoHeap;
+
+    // SAFETY: `alloc` may return null, meaning "no memory"; that is all
+    // this one does, so there is never anything to free.
+    unsafe impl GlobalAlloc for NoHeap {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+
+        unsafe fn dealloc(&self, _pointer: *mut u8, _layout: Layout) {}
+    }
+
+    #[global_allocator]
+    static HEAP: NoHeap = NoHeap;
+}
+
+/// The first Rust code to run on AArch64, called by `_start`
+/// (arch/aarch64/entry.rs) with what it learned on the way: the
+/// physical address of the device tree, the exception level the loader
+/// entered at, and the physical address the image was loaded at.
+///
+/// It does much less than the x86_64 one above, and stops: this is how
+/// far the port has come.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> ! {
+    use kernel64::aarch64::{cpu_name, physical_bits, KERNEL_WINDOW, TEXT_OFFSET};
+    use kernel64::devicetree::Header;
+
+    arch::init_early_console();
+
+    kprintln!();
+    kprintln!("Hello from TheTaaJ!");
+    kprintln!("64-bit kernel on AArch64, kernel_main at {:p}", kernel_main as *const ());
+
+    // From here on, a CPU fault is a message rather than silence.
+    arch::init_cpu();
+    kprintln!("[cpu] exception vectors loaded");
+    arch::breakpoint();
+    kprintln!("[cpu] resumed after the breakpoint - exceptions round-trip");
+
+    let cpu = arch::report();
+    kprintln!(
+        "[cpu] {} (id {:#x}), at exception level {}; the loader entered at level {entered_at}",
+        cpu_name(cpu.cpu_id),
+        cpu.cpu_id,
+        cpu.level
+    );
+    kprintln!(
+        "[cpu] {} bits of physical address; MMU on, the kernel loaded at {loaded_at:#x} and running at {:#x}",
+        physical_bits(cpu.physical_range),
+        KERNEL_WINDOW + TEXT_OFFSET
+    );
+
+    match arch::device_tree_header(device_tree).map(Header::parse) {
+        Some(Ok(header)) => kprintln!(
+            "[boot] device tree at {device_tree:#x}: {} bytes, version {}, boot CPU {}",
+            header.total_size,
+            header.version,
+            header.boot_cpu
+        ),
+        Some(Err(error)) => kprintln!("[boot] at {device_tree:#x} the loader left {error}"),
+        None => kprintln!("[boot] no device tree: the loader passed {device_tree:#x}"),
+    }
+
+    #[cfg(feature = "fault-page")]
+    {
+        kprintln!();
+        kprintln!("[test] forcing a page fault...");
+        let value = arch::fault_tests::page_fault();
+        kprintln!("[test] FAILED: read {value:#x} from unmapped memory");
+    }
+
+    kprintln!();
+    kprintln!("[kernel] this is as far as the AArch64 port goes - halting");
+    arch::halt_forever()
+}
+
 /// Only in a `big-image` build: the kernel carries 768 KiB it does not
 /// need, which pushes its end above 2 MiB - where the BIOS loader used
 /// to refuse it. If the loader copied all of it to the right place,
 /// every byte is what the build script wrote.
-#[cfg(feature = "big-image")]
+#[cfg(all(target_arch = "x86_64", feature = "big-image"))]
 fn check_big_image() {
     static BALLAST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ballast.bin"));
     // `black_box`: the compiler must read the bytes from memory when
@@ -174,6 +281,7 @@ fn check_big_image() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Reads the MADT, or - with no usable ACPI - assumes the standard PC
 /// layout: one CPU, the local APIC and one I/O APIC at their
 /// architectural default addresses, no overrides.
@@ -203,6 +311,7 @@ fn read_madt(rsdp: u64) -> Madt {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn report_platform(p: &arch::platform::Report) {
     kprintln!("[irq] local APIC id {}; legacy PICs remapped and masked", p.cpu_apic_id);
     for &(id, address, gsi_base, inputs) in &p.io_apics {
@@ -220,6 +329,7 @@ fn report_platform(p: &arch::platform::Report) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// The end of booting: the boot thread's work is done, so it exits and
 /// leaves the CPU to the threads it started - and to the idle thread.
 fn idle() -> ! {
@@ -229,6 +339,7 @@ fn idle() -> ! {
     threads::exit()
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Starts `init`, the first process, and gives it everything a user
 /// space needs to build itself:
 ///
@@ -293,7 +404,7 @@ fn start_init(info: &BootInfo) {
     process::set_essential(&init);
 }
 
-#[cfg(feature = "fault-tests")]
+#[cfg(all(target_arch = "x86_64", feature = "fault-tests"))]
 fn run_fault_test() {
     use arch::fault_tests as test;
     kprintln!();
@@ -334,6 +445,7 @@ fn run_fault_test() {
     kprintln!("[test] FAILED: the fault did not happen");
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Prints everything the bootloader told us.
 fn report(info: &BootInfo) {
     kprintln!();

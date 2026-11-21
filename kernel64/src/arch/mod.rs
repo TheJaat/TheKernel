@@ -16,3 +16,18 @@ pub use self::x86_64::{
 
 #[cfg(all(target_arch = "x86_64", feature = "fault-tests"))]
 pub use self::x86_64::fault_tests;
+
+// AArch64 exports only what it has so far. The list grows towards the
+// one above as the port goes on; when the two are the same, nothing
+// outside `arch/` will know which CPU it runs on.
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+
+#[cfg(target_arch = "aarch64")]
+pub use self::aarch64::{
+    breakpoint, console_write, console_write_bytes, device_tree_header, disable_interrupts, halt_forever, init_cpu,
+    init_early_console, report, restore_interrupts, stop_other_cpus,
+};
+
+#[cfg(all(target_arch = "aarch64", feature = "fault-tests"))]
+pub use self::aarch64::fault_tests;
