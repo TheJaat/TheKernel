@@ -121,20 +121,46 @@ pub mod smp {
     pub fn poke(_cpus: u64) {}
 }
 
-/// Entering and leaving programs. Not yet: the next step of the port.
+/// Entering programs. (Leaving them is an exception like any other:
+/// vectors.rs.)
 pub mod syscall {
-    /// Tells the CPU where the kernel's stack is for the next entry
-    /// from a program. Nothing to tell on AArch64: the kernel's stack
-    /// pointer is a register of its own (`SP_EL1`), and stays where
-    /// the thread left it when it went to the program.
-    pub fn set_kernel_stack(_top: u64) {}
+    use core::sync::atomic::{AtomicU64, Ordering};
 
-    /// Starts running a program.
+    /// How far below the top of its stack a program's stack pointer
+    /// starts. Nothing is pushed for it, as a return address is on
+    /// x86; the gap only keeps the stack pointer a multiple of 16, as
+    /// the calling convention wants, with two words above it that
+    /// exist.
+    pub const ENTRY_STACK_GAP: u64 = 16;
+
+    /// The top of the running thread's kernel stack. One CPU, so one
+    /// number; each CPU gets its own when there are more.
+    static KERNEL_STACK: AtomicU64 = AtomicU64::new(0);
+
+    /// Notes where the kernel's stack is for the thread about to run.
+    /// There is nothing to tell the CPU, as there is on x86: its
+    /// kernel stack pointer is a register of its own (`SP_EL1`), which
+    /// stays where the thread left it when it went to its program.
+    /// The note is for `enter_user`, which puts it there the first
+    /// time.
+    pub fn set_kernel_stack(top: u64) {
+        KERNEL_STACK.store(top, Ordering::Relaxed);
+    }
+
+    /// Drops to level 0 at `entry`, with stack pointer `stack` and two
+    /// arguments for `_start` in x0 and x1. Every other register is
+    /// zero, so nothing of the kernel's leaks to the program.
     ///
     /// # Safety
-    /// None yet: it does not exist.
-    pub unsafe fn enter_user(_entry: u64, _stack: u64, _first: u64, _second: u64) -> ! {
-        panic!("programs cannot run on AArch64 yet")
+    /// The current address space must map `entry` and the stack for
+    /// programs, and `set_kernel_stack` must have named this thread's
+    /// kernel stack.
+    pub unsafe fn enter_user(entry: u64, stack: u64, first: u64, second: u64) -> ! {
+        let top = KERNEL_STACK.load(Ordering::Relaxed);
+        assert!(top != 0, "a program started on a thread without a kernel stack of its own");
+        // SAFETY: the caller's promise; `top` is the top of the stack
+        // this very code runs on, which the thread never needs again.
+        unsafe { super::vectors::enter_user_frame(top, entry, stack, first, second) }
     }
 }
 

@@ -24,9 +24,27 @@
 //! with, notes which slot it is, and joins the common code, which saves
 //! the rest into a `Frame` and calls `exception` below.
 //!
-//! Two things are expected: the breakpoint that proves this path
-//! works, and interrupts, which are handed to `super::interrupt`.
-//! Everything else is reported and the kernel stops.
+//! Three things are expected: the breakpoint that proves this path
+//! works; interrupts, which are handed to `super::interrupt`; and
+//! whatever a program does - a system call, which is carried out, or
+//! a fault, which ends the program. Everything else is reported and
+//! the kernel stops.
+//!
+//! # Programs
+//!
+//! A program runs at exception level 0 with a stack pointer of its
+//! own, `SP_EL0`. The moment it takes an exception the CPU is at
+//! level 1 and `sp` means a different register, `SP_EL1`: the stack
+//! switch that x86 needs a TSS or a `swapgs` for is, here, the CPU
+//! simply using the other register. `SP_EL1` is where the thread left
+//! it when it went to the program - the top of its kernel stack
+//! (`enter_user`).
+//!
+//! So the frame of a program records `SP_EL0`, not the kernel's stack
+//! pointer, and puts it back on the way out. That is all it takes for
+//! each thread to have its own: a thread only ever leaves the CPU
+//! from inside the kernel (context.rs), with its program's stack
+//! pointer already in its frame.
 
 use core::arch::{asm, global_asm};
 
@@ -43,7 +61,9 @@ pub struct Frame {
     pub elr: u64,
     /// The CPU's state then: level, interrupt masks, condition flags.
     pub spsr: u64,
-    /// The stack pointer before the frame was pushed.
+    /// The interrupted code's stack pointer: the program's (`SP_EL0`)
+    /// if it was a program, else the kernel's before the frame was
+    /// pushed.
     pub sp: u64,
 }
 
@@ -147,15 +167,25 @@ exception_common:
     mrs     x1, elr_el1
     mrs     x2, spsr_el1
     stp     x30, x1, [sp, #240]
-    add     x3, sp, #272
+    add     x3, sp, #272            // the kernel's stack pointer, before
+    tst     x2, #0xf                // the level it came from: 0 is a program,
+    b.ne    1f
+    mrs     x3, sp_el0              // whose stack pointer is this one
+1:
     stp     x2, x3, [sp, #256]
 
     mov     x1, sp                  // exception(number, &mut frame)
     bl      exception
 
     // Back to where it happened - or to wherever the handler changed
-    // `elr` to.
+    // `elr` to. A program's first entry comes here too, with a frame
+    // that was made up (`enter_user_frame`).
+exception_return:
     ldp     x2, x3, [sp, #256]
+    tst     x2, #0xf
+    b.ne    1f
+    msr     sp_el0, x3              // going to a program: its stack pointer
+1:
     ldp     x30, x1, [sp, #240]
     msr     spsr_el1, x2
     msr     elr_el1, x1
@@ -176,6 +206,31 @@ exception_common:
     ldp     x0, x1, [sp]
     add     sp, sp, #272
     eret
+
+    // void enter_user_frame(u64 top, u64 entry, u64 stack, u64 first, u64 second)
+    //
+    // Starts a program: makes up, at the very top of this thread's
+    // kernel stack, the frame a program would have left there had it
+    // been interrupted at its first instruction - and "returns" to
+    // it. Everything in the frame is zero but the two arguments (x0,
+    // x1), the entry point and the stack pointer; state 0 means level
+    // 0, 64-bit, interrupts on. Whatever was on this stack is
+    // abandoned: the thread never returns to it.
+    .global enter_user_frame
+enter_user_frame:
+    msr     daifset, #0xf           // nothing may arrive half-way through
+    sub     x0, x0, #272
+    mov     sp, x0
+    mov     x9, #0
+1:
+    str     xzr, [x0, x9]
+    add     x9, x9, #8
+    cmp     x9, #272
+    b.lo    1b
+    stp     x3, x4, [sp]            // x0 and x1
+    str     x1, [sp, #248]          // elr
+    str     x2, [sp, #264]          // sp
+    b       exception_return
 
     // u64 exception_round_trip(void)
     //
@@ -257,6 +312,9 @@ extern "C" {
     /// The table above. Only its address is used.
     static exception_vectors: u8;
 
+    /// See the assembly: the first entry into a program.
+    pub fn enter_user_frame(top: u64, entry: u64, stack: u64, first: u64, second: u64) -> !;
+
     /// See the assembly: how many registers changed while interrupts
     /// came and went.
     fn interrupt_round_trip(ticks: *const u64, wait: u64) -> u64;
@@ -324,6 +382,13 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
     // Slots 1, 5, 9 and 13 are interrupts.
     if vector % 4 == 1 {
         super::interrupt();
+        // About to return to a program - possibly long after the
+        // interrupt, if it took the CPU away. A program that never
+        // makes a system call still passes here on every timer tick:
+        // if it has been asked to end meanwhile, this is where it does.
+        if vector == FROM_PROGRAM + 1 {
+            crate::process::stop_if_killed();
+        }
         return;
     }
 
@@ -338,6 +403,26 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
         // bytes, so the next one is easy to find.
         frame.elr += 4;
         return;
+    }
+
+    if vector == FROM_PROGRAM {
+        // `svc`: the program asks for something. The number is in x8
+        // and the arguments in x0 to x5; the answer goes back in x0.
+        // Every other register returns as it came. (The saved address
+        // is already that of the instruction after the `svc`.)
+        if syndrome.class() == Syndrome::SYSTEM_CALL {
+            let args = [frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5]];
+            frame.x[0] = crate::syscall::dispatch(frame.x[8], args);
+            return;
+        }
+        // Anything else: the program broke a rule. It ends; the
+        // kernel carries on.
+        let name = syndrome.class_name();
+        kprintln!("[process] {name} at {:#x} in user mode", frame.elr);
+        if let Some(abort) = syndrome.abort() {
+            kprintln!("[process]   {abort} at {:#x}: {}", fault_address(), abort.cause);
+        }
+        crate::process::kill_current(name);
     }
 
     // Anything else: the kernel cannot go on. Say everything, and stop.
@@ -358,6 +443,10 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
     dump(frame);
     crate::arch::halt_forever()
 }
+
+/// The first of the four slots for a 64-bit program: its synchronous
+/// exceptions. The next is its interrupts.
+const FROM_PROGRAM: u64 = 8;
 
 /// What the assembly passes instead of a slot number when the stack
 /// an exception arrived on had run out.

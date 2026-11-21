@@ -45,16 +45,7 @@ mod ipc;
 mod memory_object;
 mod mm;
 mod process;
-#[cfg(target_arch = "x86_64")]
 mod programs;
-/// The programs built into the kernel image. On AArch64 there are none
-/// yet: nothing has been compiled for it.
-#[cfg(target_arch = "aarch64")]
-mod programs {
-    pub fn find(_name: &str) -> Option<(&'static str, &'static [u8])> {
-        None
-    }
-}
 mod selftest;
 mod syscall;
 mod threads;
@@ -339,6 +330,13 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
             kprintln!();
             threads::init();
             selftest::threads();
+
+            // Programs: in their own address spaces, at exception
+            // level 0, asking for things with `svc`.
+            selftest::user();
+            selftest::ipc();
+            selftest::files();
+            selftest::kill();
         }
         None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"),
     }

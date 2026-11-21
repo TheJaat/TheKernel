@@ -69,7 +69,18 @@ impl fmt::Display for ElfError {
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
-const EM_X86_64: u16 = 62;
+/// The "machine" numbers of the two CPUs the kernel runs on: which
+/// instructions the file holds.
+pub const EM_X86_64: u16 = 62;
+pub const EM_AARCH64: u16 = 183;
+
+/// The machine this kernel was built for. A program for the other one
+/// is a perfectly good ELF file whose first instruction would be
+/// nonsense here, so the loader refuses it by this number.
+#[cfg(target_arch = "aarch64")]
+pub const NATIVE_MACHINE: u16 = EM_AARCH64;
+#[cfg(not(target_arch = "aarch64"))]
+pub const NATIVE_MACHINE: u16 = EM_X86_64;
 const ET_EXEC: u16 = 2;
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -83,8 +94,13 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
 }
 
 /// Checks `file` and describes what to load where. Segments must end at
-/// or below `user_end`.
+/// or below `user_end`. The program must be for this kernel's CPU.
 pub fn parse(file: &[u8], user_end: u64) -> Result<Image, ElfError> {
+    parse_for(file, user_end, NATIVE_MACHINE)
+}
+
+/// `parse`, for a program that must be for `machine`.
+pub fn parse_for(file: &[u8], user_end: u64, machine: u16) -> Result<Image, ElfError> {
     if file.len() < 64 {
         return Err(ElfError::TooShort);
     }
@@ -97,7 +113,7 @@ pub fn parse(file: &[u8], user_end: u64) -> Result<Image, ElfError> {
     if u16_at(file, 16) != ET_EXEC {
         return Err(ElfError::NotExecutable);
     }
-    if u16_at(file, 18) != EM_X86_64 {
+    if u16_at(file, 18) != machine {
         return Err(ElfError::WrongMachine);
     }
     let entry = u64_at(file, 24);
@@ -187,7 +203,7 @@ mod tests {
         f[5] = 1; // little-endian
         f[6] = 1;
         f[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
-        f[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        f[18..20].copy_from_slice(&NATIVE_MACHINE.to_le_bytes());
         f[24..32].copy_from_slice(&entry.to_le_bytes());
         f[32..40].copy_from_slice(&64u64.to_le_bytes());
         f[54..56].copy_from_slice(&56u16.to_le_bytes());
@@ -325,5 +341,28 @@ mod tests {
         assert_eq!(parse(&f, END), Err(ElfError::EntryNotExecutable));
         let f = elf(0x40_0000, &[], 0);
         assert_eq!(parse(&f, END), Err(ElfError::NothingToLoad));
+    }
+
+    #[test]
+    fn a_program_is_only_for_the_machine_asked_for() {
+        // The same file, said to be for each CPU in turn: each kernel
+        // takes its own and refuses the other's.
+        for (written, asked, good) in [
+            (EM_X86_64, EM_X86_64, true),
+            (EM_AARCH64, EM_AARCH64, true),
+            (EM_X86_64, EM_AARCH64, false),
+            (EM_AARCH64, EM_X86_64, false),
+            (3, EM_X86_64, false), // a 32-bit PC
+        ] {
+            let mut f = typical();
+            f[18..20].copy_from_slice(&written.to_le_bytes());
+            let result = parse_for(&f, END, asked);
+            if good {
+                assert!(result.is_ok(), "{written} for {asked}");
+            } else {
+                assert_eq!(result, Err(ElfError::WrongMachine), "{written} for {asked}");
+            }
+        }
+        assert_eq!(EM_AARCH64, 0xB7);
     }
 }

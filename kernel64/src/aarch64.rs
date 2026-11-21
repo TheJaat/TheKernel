@@ -80,9 +80,9 @@ pub const MEMORY_KINDS: u64 = 0x0044_00FF;
 pub const CONTROL_MMU_OFF: u64 = 0x30D0_0800;
 
 /// ...and with it on: the MMU (bit 0), the data cache (2), a check that
-/// the stack pointer is 16-byte aligned whenever it is used (3), and
-/// the instruction cache (12).
-pub const CONTROL_MMU_ON: u64 = CONTROL_MMU_OFF | 1 | 1 << 2 | 1 << 3 | 1 << 12;
+/// the stack pointer is 16-byte aligned whenever it is used - the
+/// kernel's (3) and a program's (4) - and the instruction cache (12).
+pub const CONTROL_MMU_ON: u64 = CONTROL_MMU_OFF | 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 12;
 
 /// `TCR_EL1` ("translation control"): how addresses are translated.
 ///
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn control_values() {
-        assert_eq!(CONTROL_MMU_ON, 0x30D0_180D);
+        assert_eq!(CONTROL_MMU_ON, 0x30D0_181D);
         assert_eq!(CONTROL_MMU_ON & 1, 1);
         assert_eq!(CONTROL_MMU_OFF & 1, 0);
     }

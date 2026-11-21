@@ -80,9 +80,10 @@ echo "  $file bytes in the file, $size in memory"
 # instruction that calls the firmware.
 #
 # The memory manager must then account for all of that memory: all but
-# a megabyte or two free (the kernel, the tree and the page tables take
-# the rest), and the highest free frame the last one there is. KEPT is
-# how many MiB at the top a test's tree reserves.
+# a few megabytes free (the kernel with the programs built into it, the
+# tree and the page tables take the rest), and the highest free frame
+# the last one there is. KEPT is how many MiB at the top a test's tree
+# reserves.
 boot() {
     name=$1
     level=$2
@@ -97,9 +98,9 @@ boot() {
         return
     fi
     need "$log" "^Hello from TheTaaJ!"
-    need "$log" "kernel_main at 0xffffffff8008"
+    need "$log" "kernel_main at 0xffffffff80[0-9a-f]{6}"
     need "$log" "\[cpu\] exception vectors loaded"
-    need "$log" "\[cpu\] breakpoint at 0xffffffff8008[0-9a-f]+ - continuing"
+    need "$log" "\[cpu\] breakpoint at 0xffffffff80[0-9a-f]{6} - continuing"
     need "$log" "\[cpu\] resumed after the breakpoint"
     need "$log" "at exception level 1; the loader entered at level $level"
     need "$log" "the kernel loaded at 0x4[0-9a-f]*80000 and running at 0xffffffff80080000"
@@ -129,6 +130,22 @@ boot() {
         need "$log" "\[selftest\] threads: two yielding threads ran as \"[ab]+\""
         need "$log" "\[selftest\] threads: a thread that never yields was preempted"
         need "$log" "\[selftest\] threads: sleep\(5\) took [567] ticks; 200 threads spawned and reaped, nothing leaked"
+        # Programs, at exception level 0: the ones that keep to the
+        # rules end with their own codes, and each of the others is
+        # ended for the rule it broke - reading the kernel's memory,
+        # masking interrupts, writing to memory it was given to read.
+        need "$log" "\[hello\] hello from user mode! I am process 1, running at exception level 0"
+        need "$log" "\[hello\] the kernel refused all 5 bad pointers"
+        need "$log" "\[process\]   user read at 0xffffffff80100000: protection violation \(at level 3\)"
+        need "$log" "\[process\] [0-9]+ \"peek\" killed: data abort in a program"
+        need "$log" "\[process\] [0-9]+ \"cli\" killed: trapped system register access"
+        need "$log" "\[process\]   user write at 0x100000000000: protection violation \(at level 3\)"
+        need "$log" "\[regs\] at the start: 29 registers zero, the stack pointer a multiple of 16"
+        need "$log" "\[regs\] 26 registers and the stack pointer, through system calls and timer interrupts for 5 ticks: none changed"
+        need "$log" "\[selftest\] user: hello exited 42, spin, heapcheck and regs exited 0, peek, cli and memro were killed; 14 processes, nothing leaked"
+        need "$log" "\[selftest\] ipc: echo service and client - rights, transfer, backpressure, crash isolation; 0 channels left"
+        need "$log" "\[selftest\] files: fs and fscheck, twice - every check passed, 0 channels and no frames left"
+        need "$log" "\[selftest\] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked"
     fi
     need "$log" "\[tree\] timer       ${TIMER:-interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)}"
     if grep -aq "unexpected interrupt" "$log"; then fail "an interrupt arrived that nothing asked for"; fi
@@ -139,7 +156,7 @@ boot() {
     fi
     free=$((mib - ${KEPT:-0}))
     top=$(printf '%x' $((0x40000000 + free * 1048576 - 4096)))
-    need "$log" "\[memory\] [0-9]+ frames free of $((mib * 256 + 262144)) \(($((free - 3))|$((free - 2))|$((free - 1))) MiB\), bitmap [0-9]+ KiB at 0x4"
+    need "$log" "\[memory\] [0-9]+ frames free of $((mib * 256 + 262144)) \(($((free - 4))|$((free - 3))|$((free - 2))|$((free - 1))) MiB\), bitmap [0-9]+ KiB at 0x4"
     need "$log" "\[memory\] own page tables at 0x4[0-9a-f]+: direct map 0xffff800000000000, NX on"
     need "$log" "\[memory\] heap at 0xffffc00000000000, 1024 KiB to start"
     need "$log" "\[tree\] read again through the direct map: the same [0-9]+ nodes, in memory kept out of the allocator"
@@ -244,9 +261,9 @@ fault page "forcing a page fault" "0x25: data abort" \
 # The two below break the rules of the kernel's own image, as its own
 # page tables state them: a constant is written to, a variable is run.
 fault rodata "writing to read-only data" "0x25: data abort" \
-    "kernel write at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
+    "kernel write at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
 fault nx "executing data" "0x21: instruction abort" \
-    "kernel instruction fetch at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
+    "kernel instruction fetch at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
 
 # overflow NAME ANNOUNCE WHOSE WHERE: a kernel that recurses until a
 # stack runs out. The report must name the stack, and the address must

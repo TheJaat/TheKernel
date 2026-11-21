@@ -128,6 +128,11 @@ extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
     frame.rflags = (frame.rflags & USER_FLAGS) | INTERRUPTS_ON;
 }
 
+/// How far below the top of its stack a program's stack pointer
+/// starts: RSP as if `_start` had just been called - 16-byte aligned,
+/// minus the return address a call would have pushed.
+pub const ENTRY_STACK_GAP: u64 = 8;
+
 /// Turns on `syscall`/`sysret`.
 ///
 /// # Safety

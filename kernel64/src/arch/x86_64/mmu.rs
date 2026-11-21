@@ -140,3 +140,8 @@ pub fn flush(address: u64) {
     // SAFETY: invlpg only discards a cached translation.
     unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
 }
+
+/// Called after instructions were written to memory, before they are
+/// run. Nothing to do: an x86 CPU notices writes to memory it has
+/// instructions cached from. Not every CPU does (arch/aarch64).
+pub fn code_written(_start: *const u8, _length: usize) {}

@@ -212,13 +212,80 @@ pub unsafe fn install_kernel_tables(root: u64, _no_execute: bool) {
 }
 
 /// Switches the low half of the address space to the tree at physical
-/// `root` - a program's. Not yet: there are no programs, so the only
-/// root there is is the kernel's, and that is already in place.
+/// `root` - a process's - or, given the kernel's own root, to nothing.
+///
+/// The kernel's half never changes: it is in the other root register
+/// (`TTBR1_EL1`), which is why a process's tree holds no copy of the
+/// kernel's mappings here, as it must on x86.
+///
+/// The order is the one the change of the kernel's tables used
+/// (`replace_kernel_tables`), for the same reason: the low half is
+/// switched off, what the CPU remembers of it is forgotten, and only
+/// then does the new tree go in - so there is no moment at which the
+/// CPU could hold one process's translation for an address while
+/// walking another's tables. Forgetting *everything* at each switch is
+/// the plain way to do it; the cheaper way is to give each process a
+/// number (an ASID) that tags what the CPU remembers, which can come
+/// when it matters.
 ///
 /// # Safety
-/// As on the PC: the tree must be a process's, made by `new_user`.
+/// The tree must be a process's, made by `new_user`, or the kernel's.
+/// The caller must not be using a low address.
 pub unsafe fn activate(root: u64) {
-    assert!(root == mm::kernel_root(), "address spaces cannot be switched on AArch64 yet");
+    let off = root == mm::kernel_root();
+    // SAFETY: the caller's promise. This code, its stack and its data
+    // are in the kernel's half, which none of this touches.
+    unsafe {
+        asm!(
+            "mrs {t}, tcr_el1",
+            "orr {t}, {t}, #(1 << 7)",  // EPD0: look nothing up through TTBR0
+            "msr tcr_el1, {t}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            "cbnz {off}, 2f",
+            "msr ttbr0_el1, {root}",
+            "bic {t}, {t}, #(1 << 7)",
+            "msr tcr_el1, {t}",
+            "isb",
+            "2:",
+            t = out(reg) _,
+            off = in(reg) u64::from(off),
+            root = in(reg) root,
+            options(nostack),
+        );
+    }
+}
+
+/// Called after instructions were written to memory - a program's
+/// code, copied into fresh pages - before they are run.
+///
+/// This CPU keeps two caches, one for data and one for instructions,
+/// and does not keep them in step: bytes written through the data
+/// cache may not have reached memory, and the instruction cache may
+/// still hold what those addresses held before. x86 does this by
+/// itself. Here it is two steps: push the written lines out of the
+/// data cache (`dc cvau`, line by line), then empty the instruction
+/// cache (`ic ialluis`: all of it, on every CPU - cruder than line by
+/// line, but right whatever address the program will run the code at,
+/// which is not the address it was written through).
+pub fn code_written(start: *const u8, length: usize) {
+    let kind: u64;
+    // SAFETY: reading the register that describes the caches.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) kind, options(nomem, nostack, preserves_flags)) };
+    // Bits 16-19: the data cache's line, as log2 of its size in words.
+    let line = 4usize << ((kind >> 16) & 0xF);
+    let end = start as usize + length;
+    let mut address = start as usize & !(line - 1);
+    while address < end {
+        // SAFETY: only moves cached bytes to memory; the address is
+        // inside what the caller wrote, so it is mapped.
+        unsafe { asm!("dc cvau, {}", in(reg) address, options(nostack, preserves_flags)) };
+        address += line;
+    }
+    // SAFETY: only discards cached instructions.
+    unsafe { asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack, preserves_flags)) };
 }
 
 /// Called after mappings are added, before they are used. This CPU

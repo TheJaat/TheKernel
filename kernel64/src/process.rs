@@ -232,6 +232,11 @@ pub fn load(name: &str, file: &[u8]) -> Result<Loaded, LoadError> {
                     page.add(*offset).copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
                 }
             }
+            // Instructions, written as data: some CPUs must be told
+            // before they will run what was written.
+            if !flags.contains(Flags::NO_EXECUTE) {
+                mmu::code_written(page, PAGE_SIZE as usize);
+            }
             let flags = flags | Flags::USER | Flags::OWNED;
             tables.map(VirtAddr::new(virt), frame, PageSize::Size4K, flags, frames).map_err(|_| {
                 // Not mapped, so `destroy` will not find it: free it here.
@@ -300,9 +305,9 @@ pub fn start(loaded: &Loaded, handles: Vec<(Object, Rights)>, argument: u64) -> 
         }
     }
     let entry = loaded.entry;
-    // RSP as if `_start` had just been called: 16-byte aligned, minus the
-    // return address a call would have pushed.
-    let stack = USER_STACK_TOP - 8;
+    // The stack pointer as `_start` expects to find it, which is the
+    // calling convention's business and so each CPU's own.
+    let stack = USER_STACK_TOP - syscall::ENTRY_STACK_GAP;
     let thread = threads::spawn_in(Some(Arc::clone(process)), "user", move || {
         // SAFETY: this thread runs in `process`'s address space (the
         // switch loaded its CR3 and kernel stack), which maps both.
