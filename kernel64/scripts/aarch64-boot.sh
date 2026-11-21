@@ -22,7 +22,7 @@ IMAGE=$1
 LOG=$2
 LIMIT=${3:-20}
 
-FINISHED="\[kernel\] this is as far as|KERNEL PANIC|CPU EXCEPTION"
+FINISHED="\[kernel\] this is as far as|KERNEL PANIC|CPU EXCEPTION|KERNEL STACK OVERFLOW"
 
 rm -f "$LOG"
 : > "$LOG"

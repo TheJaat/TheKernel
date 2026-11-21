@@ -25,6 +25,10 @@
 #   fault-*    kernels built to read through a null pointer, to read
 #              unmapped memory, to write to a constant, and to execute
 #              data: each exception must be caught and named
+#   fault-stack, fault-thread-stack
+#              kernels that recurse until a stack runs out - the boot
+#              stack, and a thread's: each must be reported, from a
+#              stack kept for the purpose
 
 set -eu
 
@@ -49,7 +53,7 @@ need() {
 # ---- build ------------------------------------------------------------
 (cd "$HERE" && cargo build --release --quiet --target $TARGET)
 "$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image"
-for fault in null page rodata nx; do
+for fault in null page rodata nx stack thread-stack; do
     (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
     "$OBJCOPY" -O binary "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" "$OUT/Image-fault-$fault"
 done
@@ -107,8 +111,8 @@ boot() {
     need "$log" "\[tree\]             its clock ${CLOCK:-runs at 24000000 Hz}"
     if [ "$gic" = none ]; then
         need "$log" "\[tree\] interrupts  no controller that this kernel knows"
-        need "$log" "\[irq\] the device tree describes no interrupt controller this kernel knows: no interrupts"
-        if grep -aq "\[selftest\] timer" "$log"; then fail "a timer test ran with no interrupt controller"; fi
+        need "$log" "\[irq\] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"
+        if grep -aEq "\[selftest\] (timer|threads)" "$log"; then fail "a timer or thread test ran with no interrupt controller"; fi
     else
         need "$log" "\[tree\] interrupts  GIC version $gic: shared part at 0x8000000, per-CPU part at 0x80[1a]0000"
         # Interrupts: the controller set up, the timer at its rate (ten
@@ -117,8 +121,14 @@ boot() {
         need "$log" "\[irq\] GIC version $gic: 288 interrupt lines, all off but the timer's"
         need "$log" "\[timer\] the CPU's own: counts at [0-9]+ Hz, interrupt 27, 100 ticks a second"
         need "$log" "\[selftest\] timer: 10 ticks in (9[0-9]|[12][0-9][0-9]) ms \(expected 100\)"
+        need "$log" "\[selftest\] context switch: there and back with a known value in each of 11 registers, none changed"
         need "$log" "\[selftest\] interrupts: 5 taken with a known value in each of 28 registers, none changed"
         need "$log" "\[selftest\] interrupts masked for 35 ms: no tick arrived; unmasked: [3-9] counted at once"
+        # Threads, on the same scheduler as the PC: taking turns, being
+        # interrupted, sleeping, and giving everything back.
+        need "$log" "\[selftest\] threads: two yielding threads ran as \"[ab]+\""
+        need "$log" "\[selftest\] threads: a thread that never yields was preempted"
+        need "$log" "\[selftest\] threads: sleep\(5\) took [567] ticks; 200 threads spawned and reaped, nothing leaked"
     fi
     need "$log" "\[tree\] timer       ${TIMER:-interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)}"
     if grep -aq "unexpected interrupt" "$log"; then fail "an interrupt arrived that nothing asked for"; fi
@@ -237,6 +247,28 @@ fault rodata "writing to read-only data" "0x25: data abort" \
     "kernel write at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
 fault nx "executing data" "0x21: instruction abort" \
     "kernel instruction fetch at 0xffffffff800[0-9a-f]+: protection violation \(at level 3\)"
+
+# overflow NAME ANNOUNCE WHOSE WHERE: a kernel that recurses until a
+# stack runs out. The report must name the stack, and the address must
+# be in the page below it.
+overflow() {
+    name=$1
+    log="$OUT/fault-$name.log"
+    echo "aarch64: boot 'fault-$name'"
+    "$HERE/scripts/aarch64-boot.sh" "$OUT/Image-fault-$name" "$log" || fail "the boot did not finish"
+    need "$log" "\[test\] $2"
+    need "$log" "KERNEL STACK OVERFLOW: $3 ran out"
+    need "$log" "kernel write at $4: the page kept unmapped below the stack"
+    need "$log" "    pc  0xffffffff"
+    [ "$(grep -ac 'STACK OVERFLOW\|CPU EXCEPTION\|KERNEL PANIC' "$log")" -eq 1 ] || fail "more than one report"
+    if grep -aEq "FAILED|this is as far as" "$log"; then
+        fail "the kernel carried on after the overflow"
+    fi
+    grep -a "STACK OVERFLOW\|kernel write at" "$log" | cut -c1-110
+}
+
+overflow stack "overflowing the boot stack" "the boot stack" "0xffffffff80[0-9a-f]+0[0-9a-f]{3}"
+overflow thread-stack "overflowing a thread's stack" "a thread's stack" "0xffffd800[0-9a-f]+0[0-9a-f]{3}"
 
 if [ $failed -ne 0 ]; then
     echo "aarch64-test: FAILED (logs in $OUT)"

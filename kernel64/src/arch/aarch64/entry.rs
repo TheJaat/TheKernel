@@ -55,13 +55,23 @@ use core::arch::global_asm;
 
 use kernel64::aarch64::{descriptor, translation_control, CONTROL_MMU_OFF, CONTROL_MMU_ON, MEMORY_KINDS, TEXT_OFFSET};
 
-/// The boot stack: 64 KiB, with a page below it (`__boot_stack_guard`)
+/// The boot stack: 60 KiB, with a page below it (`__boot_stack_guard`)
 /// that is there to be missing. The boot tables map 2 MiB at a time,
 /// so at first the guard is mapped like everything else; the kernel's
 /// own tables (mm.rs) leave it out, and from then on running off the
 /// end of the stack is a fault instead of a quiet overwrite of
 /// whatever lies below.
-const BOOT_STACK_SIZE: usize = 64 * 1024;
+///
+/// Guard and stack together are 64 KiB, starting at an address that is
+/// a multiple of 64 KiB - the shape of every kernel thread's stack
+/// (mm.rs). The exception vectors rely on that shape to tell, from the
+/// stack pointer alone, that a stack has run out (vectors.rs).
+const BOOT_STACK_SIZE: usize = 60 * 1024;
+
+/// The stack an exception is handled on when the stack it arrived on
+/// has run out: 12 KiB, one page up from a multiple of 64 KiB - so
+/// that its own addresses never look like a stack that has run out.
+const OVERFLOW_STACK_SIZE: usize = 12 * 1024;
 
 global_asm!(
     r#"
@@ -244,12 +254,16 @@ boot_l2_kernel: .skip 4096
 boot_l2_device: .skip 4096
 
     .section .bss.boot_stack, "aw", %nobits
-    .balign 4096
+    .balign 0x10000
     .global __boot_stack_guard
 __boot_stack_guard:
     .skip 4096
     .skip {stack_size}
 boot_stack_top:
+    .skip 4096                      // where a guard would be: unused
+    .skip {overflow_size}
+    .global overflow_stack_top
+overflow_stack_top:
 "#,
     text_offset = const TEXT_OFFSET,
     control_off = const CONTROL_MMU_OFF,
@@ -258,4 +272,5 @@ boot_stack_top:
     memory_kinds = const MEMORY_KINDS,
     translation = const translation_control(0),
     stack_size = const BOOT_STACK_SIZE,
+    overflow_size = const OVERFLOW_STACK_SIZE,
 );

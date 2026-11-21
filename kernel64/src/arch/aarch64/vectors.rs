@@ -60,6 +60,36 @@ global_asm!(
     b       exception_common
     .endm
 
+    // The same, for the four slots used when the kernel itself is
+    // interrupted - where the stack the frame is about to go on is the
+    // kernel's own, and may have run out. Every kernel stack is a
+    // 64 KiB slot starting at a multiple of 64 KiB, whose lowest page
+    // is not mapped. So the low 16 bits of the stack pointer say how
+    // far up its slot it is, and if bits 13 to 15 are all zero it is in
+    // the lowest two pages: the missing one, or the last one above it.
+    // Either way there is no room left to handle anything, and the
+    // frame goes on a stack kept for this instead.
+    //
+    // There is no register to look at the stack pointer with: all 31
+    // still hold the interrupted code's values. Hence the first two
+    // lines: x0 becomes the stack pointer and the stack pointer
+    // becomes the sum of both - nothing is lost, as the two lines
+    // after the test show by undoing it. (The condition flags are free:
+    // the CPU saved the interrupted code's in SPSR_EL1.)
+    .macro kernel_vector number
+    .balign 0x80
+    sub     sp, sp, #272
+    add     sp, sp, x0
+    sub     x0, sp, x0              // x0 = the stack pointer
+    tst     x0, #0xe000
+    b.eq    stack_overflow
+    sub     x0, sp, x0              // x0 = what it was
+    sub     sp, sp, x0              // and so is the stack pointer
+    stp     x0, x1, [sp]
+    mov     x0, #\number
+    b       exception_common
+    .endm
+
     .section .text
     .balign 0x800
     .global exception_vectors
@@ -68,10 +98,10 @@ exception_vectors:
     vector 1
     vector 2
     vector 3
-    vector 4
-    vector 5
-    vector 6
-    vector 7
+    kernel_vector 4
+    kernel_vector 5
+    kernel_vector 6
+    kernel_vector 7
     vector 8
     vector 9
     vector 10
@@ -81,7 +111,24 @@ exception_vectors:
     vector 14
     vector 15
 
+    // Reached with x0 = the stack pointer that has run out (less the
+    // frame) and sp = that plus the interrupted code's x0. Two
+    // registers no kernel code uses are borrowed to keep them in while
+    // the stack is changed.
     .balign 0x80
+stack_overflow:
+    msr     tpidrro_el0, x0         // the stack pointer, for the report
+    sub     x0, sp, x0
+    msr     tpidr_el0, x0           // the interrupted code's x0
+    adrp    x0, overflow_stack_top
+    add     x0, x0, :lo12:overflow_stack_top
+    mov     sp, x0
+    mrs     x0, tpidr_el0
+    sub     sp, sp, #272
+    stp     x0, x1, [sp]
+    mov     x0, #16                 // not a slot: "the stack ran out"
+    b       exception_common
+
 exception_common:
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -271,6 +318,9 @@ fn fault_address() -> u64 {
 /// of the vector slot (0 to 15) and what was saved.
 #[no_mangle]
 extern "C" fn exception(vector: u64, frame: &mut Frame) {
+    if vector == STACK_RAN_OUT {
+        stack_ran_out(frame);
+    }
     // Slots 1, 5, 9 and 13 are interrupts.
     if vector % 4 == 1 {
         super::interrupt();
@@ -305,6 +355,39 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
         kprintln!("*** CPU EXCEPTION: an unexpected {kind}");
     }
     kprintln!("    from {source} (vector {vector}), syndrome {:#010x}", syndrome.0);
+    dump(frame);
+    crate::arch::halt_forever()
+}
+
+/// What the assembly passes instead of a slot number when the stack
+/// an exception arrived on had run out.
+const STACK_RAN_OUT: u64 = 16;
+
+/// The end of a kernel stack was reached. This runs on the overflow
+/// stack; the thread whose stack it was cannot go on.
+fn stack_ran_out(frame: &mut Frame) -> ! {
+    crate::arch::stop_other_cpus();
+    // SAFETY: halting right after; whoever held the console never resumes.
+    unsafe { crate::console::break_lock() };
+    let stack_pointer: u64;
+    // SAFETY: reading the register the assembly left the value in.
+    unsafe { asm!("mrs {}, tpidrro_el0", out(reg) stack_pointer, options(nomem, nostack)) };
+    // The assembly had already made room for the frame.
+    frame.sp = stack_pointer + 272;
+    let syndrome = syndrome();
+    let address = fault_address();
+    let guard = crate::mm::kernel_layout().stack_guard;
+    let whose = if (guard..guard + 0x1_0000).contains(&frame.sp) { "the boot stack" } else { "a thread's stack" };
+    kprintln!();
+    kprintln!("*** KERNEL STACK OVERFLOW: {whose} ran out");
+    // Was it an access to the page kept unmapped below a stack? (The
+    // syndrome may be an older exception's, if this one was an
+    // interrupt - hence the check of the address too.)
+    let in_guard = (guard..guard + 0x1000).contains(&address) || crate::mm::is_stack_guard(address);
+    match syndrome.abort() {
+        Some(abort) if in_guard => kprintln!("    {abort} at {address:#x}: the page kept unmapped below the stack"),
+        _ => kprintln!("    an exception or an interrupt arrived with less than a page of the stack left"),
+    }
     dump(frame);
     crate::arch::halt_forever()
 }

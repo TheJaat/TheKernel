@@ -37,24 +37,26 @@ mod console; // first, so its macros are visible in every later module
 mod arch;
 #[cfg(target_arch = "x86_64")]
 mod devices;
-#[cfg(target_arch = "x86_64")]
 mod interrupts;
 mod irqlock;
 #[cfg(target_arch = "x86_64")]
 mod lastwords;
-#[cfg(target_arch = "x86_64")]
 mod ipc;
-#[cfg(target_arch = "x86_64")]
 mod memory_object;
 mod mm;
-#[cfg(target_arch = "x86_64")]
 mod process;
 #[cfg(target_arch = "x86_64")]
 mod programs;
+/// The programs built into the kernel image. On AArch64 there are none
+/// yet: nothing has been compiled for it.
+#[cfg(target_arch = "aarch64")]
+mod programs {
+    pub fn find(_name: &str) -> Option<(&'static str, &'static [u8])> {
+        None
+    }
+}
 mod selftest;
-#[cfg(target_arch = "x86_64")]
 mod syscall;
-#[cfg(target_arch = "x86_64")]
 mod threads;
 
 #[cfg(target_arch = "x86_64")]
@@ -325,14 +327,39 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
                 "[timer] the CPU's own: counts at {} Hz, interrupt {}, {} ticks a second",
                 interrupts.timer_hz,
                 interrupts.timer_interrupt,
-                arch::TIMER_HZ
+                interrupts::HZ
             );
             arch::enable_interrupts();
+            selftest::timer();
             arch::selftest_interrupts();
+
+            // Threads: the code running now becomes thread 1, "boot";
+            // thread 0 is the idle thread. They need the tick, so they
+            // start only where there is one.
+            kprintln!();
+            threads::init();
+            selftest::threads();
         }
-        None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts"),
+        None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"),
     }
 
+    #[cfg(feature = "fault-stack")]
+    {
+        kprintln!();
+        kprintln!("[test] overflowing the boot stack...");
+        let depth = arch::fault_tests::overflow_stack(0);
+        kprintln!("[test] FAILED: recursion returned {depth}");
+    }
+    #[cfg(feature = "fault-thread-stack")]
+    {
+        kprintln!();
+        kprintln!("[test] overflowing a thread's stack...");
+        let id = threads::spawn("overflow", || {
+            let depth = arch::fault_tests::overflow_stack(0);
+            kprintln!("[test] FAILED: recursion returned {depth}");
+        });
+        threads::join(id);
+    }
     #[cfg(feature = "fault-null")]
     {
         kprintln!();

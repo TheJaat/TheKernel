@@ -95,6 +95,17 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
 }
 
+/// The clock to measure short times with, and how many of its steps
+/// make a second - by these names on every CPU. Here it is the
+/// time-stamp counter.
+pub fn clock() -> u64 {
+    tsc()
+}
+
+pub fn clock_hz() -> u64 {
+    platform::tsc_hz()
+}
+
 /// The CPU's time-stamp counter: cycles since reset.
 pub fn tsc() -> u64 {
     let (low, high): (u32, u32);

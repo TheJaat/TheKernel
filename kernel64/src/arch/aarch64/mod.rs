@@ -6,6 +6,7 @@
 //! (interrupts, a timer, context switches, system calls, other CPUs)
 //! is still to come, a piece at a time.
 
+pub mod context;
 mod entry;
 mod gic;
 pub mod mmu;
@@ -93,6 +94,50 @@ pub fn enable_interrupts() {
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Which CPU this is. One is running so far, so: the first.
+pub fn cpu() -> usize {
+    0
+}
+
+/// The clock to measure short times with: the counter the timer
+/// compares against, and how many of its steps make a second.
+pub fn clock() -> u64 {
+    timer::counter()
+}
+
+pub fn clock_hz() -> u64 {
+    timer::frequency()
+}
+
+/// A PC has "I/O ports", a second address space for devices, and each
+/// process a list of the ports it may use. AArch64 has no such thing:
+/// every device is in memory, and page tables decide.
+pub fn set_io_bitmap(_ports: &kernel64::ioports::PortBitmap) {}
+
+/// The other CPUs. None is running yet.
+pub mod smp {
+    /// Interrupts the CPUs in `cpus` (a bit each) so that they look
+    /// for work. With one CPU there is nobody to tell.
+    pub fn poke(_cpus: u64) {}
+}
+
+/// Entering and leaving programs. Not yet: the next step of the port.
+pub mod syscall {
+    /// Tells the CPU where the kernel's stack is for the next entry
+    /// from a program. Nothing to tell on AArch64: the kernel's stack
+    /// pointer is a register of its own (`SP_EL1`), and stays where
+    /// the thread left it when it went to the program.
+    pub fn set_kernel_stack(_top: u64) {}
+
+    /// Starts running a program.
+    ///
+    /// # Safety
+    /// None yet: it does not exist.
+    pub unsafe fn enter_user(_entry: u64, _stack: u64, _first: u64, _second: u64) -> ! {
+        panic!("programs cannot run on AArch64 yet")
+    }
+}
+
 /// Sleeps until an interrupt is pending. With interrupts on, it is
 /// taken at once on waking; a masked one wakes the CPU all the same.
 pub fn wait_for_interrupt() {
@@ -136,6 +181,9 @@ static UNEXPECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 /// Called from the vectors when the CPU's interrupt input is raised:
 /// ask the controller which, handle, say done - until it has no more.
+/// Then, last, let the scheduler take the CPU from the interrupted
+/// thread if its time is up: the switch happens here, inside the
+/// handler, and the interrupt "returns" when the thread next runs.
 fn interrupt() {
     while let Some((id, raw)) = gic::acknowledge() {
         if id == timer::interrupt() {
@@ -151,50 +199,51 @@ fn interrupt() {
         }
         gic::end(raw);
     }
+    crate::interrupts::interrupt_done();
 }
 
-/// Checks interrupts on the real machine: the timer ticks at its
-/// rate, registers survive being interrupted, masked means masked,
-/// and time lost while masked is caught up.
+/// Checks two things about interrupts that the timer test shared
+/// with the PC (selftest.rs) does not: registers survive being
+/// interrupted, and masked means masked - with the time that passed
+/// meanwhile caught up afterwards.
 pub fn selftest_interrupts() {
+    use crate::interrupts::ticks;
     use core::sync::atomic::Ordering;
 
-    // 1. Ten ticks, timed with the counter the timer compares against.
-    let first = timer::ticks();
-    while timer::ticks() == first {
-        wait_for_interrupt();
-    }
-    let (start_ticks, start) = (timer::ticks(), timer::counter());
-    while timer::ticks() < start_ticks + 10 {
-        wait_for_interrupt();
-    }
-    let ms = timer::milliseconds_since(start);
-    let expected = 10 * 1000 / timer::HZ;
-    // Generous bounds: an emulator's clocks can stretch under load.
-    assert!(ms >= expected * 9 / 10 && ms <= expected * 3, "10 timer ticks took {ms} ms, expected {expected}");
-    kprintln!("[selftest] timer: 10 ticks in {ms} ms (expected {expected})");
+    // 0. Not interrupts, but the same kind of check and needed before
+    // there are threads: a switch to another stack and back keeps
+    // every register it must.
+    let stack = crate::mm::allocate_stack().expect("no stack for the switch test");
+    let were_enabled = disable_interrupts();
+    // SAFETY: interrupts are off, and the stack was mapped a moment
+    // ago for this alone.
+    let changed = unsafe { context::round_trip(stack.top()) };
+    restore_interrupts(were_enabled);
+    drop(stack);
+    assert!(changed == 0, "{changed} of 11 registers were changed by a switch to another stack and back");
+    kprintln!("[selftest] context switch: there and back with a known value in each of 11 registers, none changed");
 
-    // 2. Interrupted five times in the middle of a loop that has a
+    // 1. Interrupted five times in the middle of a loop that has a
     // number in every register it can spare.
-    let changed = vectors::interrupted_round_trip(timer::tick_counter(), 5);
+    let changed = vectors::interrupted_round_trip(timer::interrupts_taken(), 5);
     assert!(changed == 0, "{changed} of 28 registers were changed by interrupts");
     kprintln!("[selftest] interrupts: 5 taken with a known value in each of 28 registers, none changed");
 
-    // 3. Masked for 35 ms: three ticks' worth. None may arrive; and
+    // 2. Masked for 35 ms: three ticks' worth. None may arrive; and
     // once unmasked, all three must be counted - by the one interrupt
     // that was waiting.
     disable_interrupts();
-    let (before, start) = (timer::ticks(), timer::counter());
+    let (before, start) = (ticks(), timer::counter());
     while timer::milliseconds_since(start) < 35 {
         core::hint::spin_loop();
     }
-    let during = timer::ticks() - before;
+    let during = ticks() - before;
     enable_interrupts();
     let start = timer::counter();
-    while timer::ticks() < before + 3 && timer::milliseconds_since(start) < 5 {
+    while ticks() < before + 3 && timer::milliseconds_since(start) < 5 {
         core::hint::spin_loop();
     }
-    let after = timer::ticks() - before;
+    let after = ticks() - before;
     assert!(during == 0, "{during} ticks arrived while interrupts were masked");
     assert!(after >= 3, "after 35 ms masked only {after} ticks were counted, not the 3 that passed");
     kprintln!("[selftest] interrupts masked for 35 ms: no tick arrived; unmasked: {after} counted at once");
@@ -319,6 +368,16 @@ pub mod fault_tests {
         let address = 0xFFFF_FFFF_0000_0000u64 as *const u64;
         // SAFETY: none - this is meant to fault.
         unsafe { address.read_volatile() }
+    }
+
+    /// Recurses until the stack runs into the page kept unmapped below
+    /// it.
+    #[allow(unconditional_recursion)]
+    pub fn overflow_stack(depth: u64) -> u64 {
+        // A big frame, kept alive by black_box, so this can neither be
+        // turned into a loop nor optimised away.
+        let frame = core::hint::black_box([depth; 64]);
+        overflow_stack(depth + 1) + frame[7]
     }
 
     /// Reads through a null pointer - the commonest mistake there is.

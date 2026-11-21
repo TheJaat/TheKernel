@@ -211,6 +211,16 @@ pub unsafe fn install_kernel_tables(root: u64, _no_execute: bool) {
     }
 }
 
+/// Switches the low half of the address space to the tree at physical
+/// `root` - a program's. Not yet: there are no programs, so the only
+/// root there is is the kernel's, and that is already in place.
+///
+/// # Safety
+/// As on the PC: the tree must be a process's, made by `new_user`.
+pub unsafe fn activate(root: u64) {
+    assert!(root == mm::kernel_root(), "address spaces cannot be switched on AArch64 yet");
+}
+
 /// Called after mappings are added, before they are used. This CPU
 /// may go on for a while not seeing a write to a table (the write can
 /// sit in a buffer, and instructions already under way looked before

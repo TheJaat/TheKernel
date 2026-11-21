@@ -20,10 +20,12 @@ use kernel64::gic::{milliseconds, next_deadline, tick_interval};
 
 use super::gic;
 
-/// Timer interrupts per second - the same as on the PC.
-pub const HZ: u64 = 100;
+use crate::interrupts::HZ;
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// How many times the timer has interrupted. Not the tick count
+/// (`interrupts::ticks`): one interrupt that comes late counts for
+/// every tick that passed.
+static TAKEN: AtomicU64 = AtomicU64::new(0);
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// The timer's interrupt number; 0 until `init`.
@@ -48,13 +50,10 @@ pub fn milliseconds_since(earlier: u64) -> u64 {
     milliseconds(counter().wrapping_sub(earlier), frequency())
 }
 
-/// The tick counter itself, for code that watches it change.
-pub fn tick_counter() -> &'static AtomicU64 {
-    &TICKS
-}
-
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+/// The count of timer interrupts itself, for code that watches it
+/// change.
+pub fn interrupts_taken() -> &'static AtomicU64 {
+    &TAKEN
 }
 
 pub fn interrupt() -> u32 {
@@ -104,5 +103,8 @@ pub fn on_interrupt() {
     let (next, passed) = next_deadline(deadline, counter(), INTERVAL.load(Ordering::Relaxed));
     // SAFETY: a compare value in the future: the timer stops asking.
     unsafe { asm!("msr cntv_cval_el0, {}", "isb", in(reg) next, options(nomem, nostack, preserves_flags)) };
-    TICKS.fetch_add(passed, Ordering::Relaxed);
+    TAKEN.fetch_add(1, Ordering::Relaxed);
+    for _ in 0..passed {
+        crate::interrupts::timer_tick();
+    }
 }

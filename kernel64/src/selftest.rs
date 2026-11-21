@@ -8,21 +8,23 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kernel64::memory::addr::{phys_to_virt, PhysAddr, VirtAddr};
 use kernel64::paging::{Flags, PageSize};
 
-use crate::arch::mmu;
-use crate::mm;
+use crate::arch::{self, mmu};
+use crate::irqlock::IrqLock;
+use crate::{interrupts, mm, threads};
 
-// Everything above memory: the timer, threads, programs, IPC, files.
-// AArch64 has none of those yet.
+// What AArch64 does not have yet: other CPUs, programs, IPC between
+// them, files.
 #[cfg(target_arch = "x86_64")]
 mod system;
 #[cfg(target_arch = "x86_64")]
-pub use system::{files, ipc, kill, smp, threads, timer, user, wakeups};
+pub use system::{files, ipc, kill, smp, user, wakeups};
 
 pub fn run() {
     frames();
@@ -159,4 +161,116 @@ fn heap() {
     }
     let (used_after, _) = mm::heap_usage();
     assert_eq!(used_after, used_before, "dropping everything did not free everything");
+}
+
+/// The timer interrupt arrives, at the rate it was set to: ten ticks,
+/// timed with a clock that does not depend on it (on a PC the TSC,
+/// calibrated separately against the PIT; on AArch64 the CPU's
+/// counter).
+pub fn timer() {
+    let tsc_hz = arch::clock_hz();
+    let first = interrupts::ticks();
+    // Line up with a tick boundary, then count ten.
+    while interrupts::ticks() == first {
+        arch::wait_for_interrupt();
+    }
+    let start_ticks = interrupts::ticks();
+    let start = arch::clock();
+    while interrupts::ticks() < start_ticks + 10 {
+        arch::wait_for_interrupt();
+    }
+    let ms = (arch::clock() - start) * 1000 / tsc_hz.max(1);
+    let expected = 10 * 1000 / interrupts::HZ;
+    // Generous bounds: a VM's clocks can stretch under load.
+    assert!(ms >= expected / 2 && ms <= expected * 3, "10 timer ticks took {ms} ms, expected {expected}");
+    kprintln!("[selftest] timer: 10 ticks in {ms} ms (expected {expected})");
+}
+
+/// Threads: they take turns, a thread that never yields is still
+/// interrupted, sleep sleeps, and dead threads give everything back.
+pub fn threads() {
+    // 1. Taking turns: two threads that yield after every step.
+    let log = Arc::new(IrqLock::new(Vec::new()));
+    let ids: Vec<_> = (*b"ab")
+        .into_iter()
+        .map(|tag| {
+            let log = Arc::clone(&log);
+            threads::spawn("turns", move || {
+                for _ in 0..3 {
+                    log.lock().push(tag);
+                    threads::yield_now();
+                }
+            })
+        })
+        .collect();
+    for id in ids {
+        threads::join(id);
+    }
+    let log = log.lock().clone();
+    assert_eq!(log.iter().filter(|&&b| b == b'a').count(), 3);
+    assert_eq!(log.iter().filter(|&&b| b == b'b').count(), 3);
+    assert_ne!(log, b"aaabbb", "yield did not hand over the CPU");
+    kprintln!("[selftest] threads: two yielding threads ran as {:?}", core::str::from_utf8(&log).unwrap());
+
+    // 2. Preemption: this thread never yields. If the timer did not take
+    // the CPU from it, nothing else - including this test - would ever
+    // run again; it gives up after two seconds and says so.
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinner = {
+        let stop = Arc::clone(&stop);
+        threads::spawn("spinner", move || {
+            let deadline = arch::clock() + 2 * arch::clock_hz();
+            while !stop.load(Ordering::Relaxed) {
+                assert!(arch::clock() < deadline, "the spinning thread was never preempted");
+                core::hint::spin_loop();
+            }
+        })
+    };
+    threads::sleep(3); // only returns if the spinner is preempted
+    stop.store(true, Ordering::Relaxed);
+    threads::join(spinner);
+    kprintln!("[selftest] threads: a thread that never yields was preempted");
+
+    // 3. Sleeping.
+    let start = interrupts::ticks();
+    threads::sleep(5);
+    let slept = interrupts::ticks() - start;
+    assert!((5..=7).contains(&slept), "sleep(5) took {slept} ticks");
+
+    // 4. Churn: 100 threads come and go. Their stacks must be recycled -
+    // no growth in slots or frames after the first round.
+    //
+    // All 100 wait at a gate until every one exists. Otherwise the peak
+    // number alive would depend on timing - the timer can preempt the
+    // spawning loop and let early threads finish - and a second round
+    // that happened to peak higher would reach a stack slot never used
+    // before, whose page table stays: one frame that looks like a leak.
+    let churn = || {
+        let gate = Arc::new(AtomicBool::new(false));
+        let ids: Vec<_> = (0..100)
+            .map(|n| {
+                let gate = Arc::clone(&gate);
+                threads::spawn("churn", move || {
+                    while !gate.load(Ordering::Acquire) {
+                        threads::yield_now();
+                    }
+                    let v: Vec<u64> = (0..n).collect();
+                    assert_eq!(v.len() as u64, n);
+                })
+            })
+            .collect();
+        gate.store(true, Ordering::Release);
+        for id in ids {
+            threads::join(id);
+        }
+        threads::yield_now(); // let the last exited thread be reaped
+    };
+    churn();
+    let frames = mm::unused_frames();
+    let slots = mm::stack_slots_used();
+    churn();
+    assert_eq!(mm::unused_frames(), frames, "thread churn leaked frames");
+    assert_eq!(mm::stack_slots_used(), slots, "thread churn leaked stack slots");
+    assert_eq!(threads::count(), 2, "only boot and idle should remain");
+    kprintln!("[selftest] threads: sleep(5) took {slept} ticks; 200 threads spawned and reaped, nothing leaked");
 }
