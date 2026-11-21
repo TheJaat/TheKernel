@@ -18,7 +18,15 @@
 #   el2v3      the same with the newer interrupt controller, which the
 #              kernel must allow itself to use on the way down
 #   a53, max   other CPUs, with other sizes of physical address
-#   smp4       four CPUs, of which the kernel so far uses one
+#   smp4       four CPUs: the others started through the firmware (PSCI),
+#              counting together and running threads
+#   smp4-v3, smp4-el2, smp4-el2v3
+#              the same with the newer interrupt controller (a part of
+#              it per CPU), entered at level 2 (the firmware is then
+#              called with smc, and every CPU comes down by itself),
+#              and both
+#   smp8       eight
+#   smp20      twenty, of which the kernel runs sixteen and says so
 #   dirty      random bytes in the memory the kernel must zero itself
 #   unnamed    a device tree that does not say which serial port to use
 #   clockless  a device tree that does not give the serial port's clock
@@ -132,7 +140,9 @@ boot() {
     call=$6
     log="$OUT/$name.log"
     echo "aarch64: boot '$name'"
-    if ! "$HERE/scripts/aarch64-boot.sh" "$OUT/Image" "$log"; then
+    # One boot slot for each CPU the machine has, as far as the kernel
+    # will use them: they all run at once.
+    if ! SLOTS=$((cpus > 16 ? 16 : cpus)) "$HERE/scripts/aarch64-boot.sh" "$OUT/Image" "$log"; then
         fail "the boot did not finish"
         return
     fi
@@ -141,12 +151,12 @@ boot() {
     need "$log" "\[cpu\] exception vectors loaded"
     need "$log" "\[cpu\] breakpoint at 0xffffffff80[0-9a-f]{6} - continuing"
     need "$log" "\[cpu\] resumed after the breakpoint"
-    need "$log" "at exception level 1; the loader entered at level $level"
+    need "$log" "at exception level 1; the loader entered at level $level, with the MMU off"
     need "$log" "the kernel loaded at 0x4[0-9a-f]*80000 and running at 0xffffffff80080000"
     need "$log" "\[tree\] device tree at 0x4[0-9a-f]+: [0-9]+ bytes, version 17, [0-9]+ nodes"
     need "$log" "\[tree\] machine     \"linux,dummy-virt\""
     need "$log" "\[tree\] memory      0x40000000 - 0x[0-9a-f]+ \($mib MiB\)"
-    need "$log" "\[tree\] cpus        $cpus, with ids \[0[, 0-9]*\]"
+    need "$log" "\[tree\] cpus        $cpus, with ids \[0[, 0-9a-f]*\]"
     need "$log" "\[tree\] serial      PL011 at 0x9000000, ${SERIAL:-named as the console}"
     need "$log" "\[tree\]             its clock ${CLOCK:-runs at 24000000 Hz}"
     if [ "$gic" = none ]; then
@@ -164,6 +174,28 @@ boot() {
         need "$log" "\[selftest\] context switch: there and back with a known value in each of 11 registers, none changed"
         need "$log" "\[selftest\] interrupts: 5 taken with a known value in each of 28 registers, none changed"
         need "$log" "\[selftest\] interrupts masked for 35 ms: no tick arrived; unmasked: [3-9] counted at once"
+        # The other CPUs: each started by the firmware and saying so
+        # itself, all of them counting at once without losing a step
+        # under a lock, and then all running threads.
+        used=$((cpus > 16 ? 16 : cpus))
+        if [ "$used" -gt 1 ]; then
+            n=1
+            while [ "$n" -lt "$used" ]; do
+                need "$log" "\[smp\] CPU $n awake: named 0x[0-9a-f]+, stack below 0xffff[0-9a-f]+"
+                n=$((n + 1))
+            done
+            need "$log" "\[smp\] $used CPUs awake: CPU 1[, 0-9]* started by the firmware \(PSCI [0-9]+\.[0-9]+, asked by $call\)"
+            need "$log" "\[smp\] counting together: $used CPUs reached $((used * 100000)) of $((used * 100000)) with a lock"
+            need "$log" "\[smp\] $used CPUs run threads: each has its own timer and idle thread, and all take from one queue"
+            need "$log" "\[selftest\] smp: threads ran on all $used CPUs at once; 40000 hand-offs between two threads, none lost; nothing leaked"
+            need "$log" "\[selftest\] wake-ups: a thread woken by a busy CPU ran on an idle one [0-9]+ us later \(median of 40; slowest [0-9]+ us; [0-9]+ interrupts between CPUs\)"
+            if [ "$cpus" -gt 16 ]; then
+                need "$log" "\[smp\] $((cpus - 16)) more CPU\(s\) than the 16 this kernel uses: left asleep"
+            fi
+        else
+            need "$log" "\[smp\] 1 CPU: no others to start"
+            need "$log" "\[selftest\] smp: 1 CPU; 40000 hand-offs between two threads, none lost; nothing leaked"
+        fi
         # Threads, on the same scheduler as the PC: taking turns, being
         # interrupted, sleeping, and giving everything back.
         need "$log" "\[selftest\] threads: two yielding threads ran as \"[ab]+\""
@@ -316,7 +348,17 @@ MACHINE=,virtualization=on,gic-version=3 job el2v3 boot el2v3 2 512 1 3 smc
 # has memory handed over in the second go.
 CPU=cortex-a53 MEMORY=6G job a53 boot a53 1 6144 1 2 hvc
 CPU=max MEMORY=128M MACHINE=,gic-version=3 job max boot max 1 128 1 3 hvc
+# More CPUs than one. Four, on each version of the interrupt controller
+# (CPUs interrupt each other in a different way on each) and entered
+# at each level (the firmware is asked by a different instruction,
+# and every CPU has to come down from level 2 itself). Eight: all the
+# older controller can have. Twenty: four more than the kernel uses.
 QEMU_ARGS="-smp 4" job smp4 boot smp4 1 512 4 2 hvc
+MACHINE=,gic-version=3 QEMU_ARGS="-smp 4" job smp4-v3 boot smp4-v3 1 512 4 3 hvc
+MACHINE=,virtualization=on QEMU_ARGS="-smp 4" job smp4-el2 boot smp4-el2 2 512 4 2 smc
+MACHINE=,virtualization=on,gic-version=3 QEMU_ARGS="-smp 4" job smp4-el2v3 boot smp4-el2v3 2 512 4 3 smc
+QEMU_ARGS="-smp 8" job smp8 boot smp8 1 512 8 2 hvc
+MACHINE=,gic-version=3 QEMU_ARGS="-smp 20" job smp20 boot smp20 1 512 20 3 hvc
 
 # QEMU's memory starts as zeroes, which is exactly what the kernel's
 # first instructions are supposed to make of the memory after the image

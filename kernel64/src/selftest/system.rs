@@ -123,9 +123,9 @@ pub fn wakeups() {
         })
     };
 
-    let per_microsecond = arch::platform::tsc_hz() / 1_000_000;
+    let per_microsecond = arch::clock_hz() / 1_000_000;
     let spin_until = |tsc: u64| {
-        while arch::tsc() < tsc {
+        while arch::clock() < tsc {
             core::hint::spin_loop();
         }
     };
@@ -138,8 +138,8 @@ pub fn wakeups() {
         // fixed distance from that tick, so without this wait - a
         // different part of the 10 ms each round - one lucky distance
         // would make every round look quick.
-        spin_until(arch::tsc() + (round as u64 * 37 % 10) * 1000 * per_microsecond);
-        let start = arch::tsc();
+        spin_until(arch::clock() + (round as u64 * 37 % 10) * 1000 * per_microsecond);
+        let start = arch::clock();
         shared.asked.store(round, Ordering::Release);
         shared.queue.wake_all();
         // Spinning, not sleeping: this CPU must stay busy, so that the
@@ -147,7 +147,7 @@ pub fn wakeups() {
         while shared.answered.load(Ordering::Acquire) < round {
             core::hint::spin_loop();
         }
-        times.push((arch::tsc() - start) / per_microsecond.max(1));
+        times.push((arch::clock() - start) / per_microsecond.max(1));
     }
     threads::join(sleeper);
 

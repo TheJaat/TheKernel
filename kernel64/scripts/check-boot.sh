@@ -21,6 +21,8 @@ ARCH=${ARCH:-pc}
 if [ "$ARCH" = aarch64 ]; then
     INPUT_DRIVER=serial
     INPUT_READY="\[serial\] serial port ready"
+    # A CPU there is named by its affinity register, not an APIC id.
+    CPU_AWAKE="named 0x"
     DISK_OFFERED="\[virtio\] .* block device: handed to init"
     # What is expected of the commands typed is the PC's list. A few
     # lines of it name the PC's drivers: there the serial port's one
@@ -29,19 +31,22 @@ if [ "$ARCH" = aarch64 ]; then
     # again the text the old one had; a terminal still has it. And the
     # shell's note of a line it read does not begin a line of this log:
     # here the log is the screen, and the typed line is in front of it.
-    # The kernel runs on one CPU there so far, and `time` says so.
+    # So may the next prompt be in front of what a program started in
+    # the background says first: the shell does not wait for it, and
+    # with several CPUs it need not have run yet - as on any terminal.
     EXPECT=$(printf '%s' "${EXPECT:-}" | sed \
         -e 's/\\\[display\\\] asked to stall/\\[serial\\] asked to stall/' \
         -e 's/\\\[init\\\] display /\\[init\\] serial /g' \
         -e 's/\\\[display\\\] the text on the screen was kept: [^;]*/\\[serial\\] serial port ready/' \
         -e 's/\^\\\[shell\\\] line:/\\[shell\\] line:/g' \
-        -e 's/ the 4 CPUs worked for/ the one CPU worked for/' \
+        -e 's/\^forever: yield until stopped/forever: yield until stopped/' \
         -e 's/\\\[kbd\\\] F11/\\[serial\\] F11/' \
         -e 's/\\\[init\\\] kbd /\\[init\\] serial /g' \
         -e 's/\\\[blk\\\] virtio disk\.\*MSI-X/\\[blk\\] virtio disk at 0xa003e00.*interrupts/')
 else
     INPUT_DRIVER=kbd
     INPUT_READY="\[kbd\] PS/2 keyboard ready"
+    CPU_AWAKE="APIC id"
     DISK_OFFERED="\[pci\] .* virtio block device: .* handed to init"
 fi
 
@@ -55,7 +60,6 @@ grep -q "Hello from TheTaaJ" "$LOG"                || fail "no greeting"
 grep -q "resumed after the breakpoint" "$LOG"      || fail "exception path broken"
 grep -q "\[selftest\] memory: all passed" "$LOG"   || fail "memory self-test"
 grep -q "\[selftest\] timer" "$LOG"               || fail "timer self-test"
-if [ "$ARCH" = pc ]; then
 CPUS=${SMP:-4}
 if [ "$CPUS" -eq 1 ]; then
     grep -q "\[smp\] 1 CPU: no others to start" "$LOG" || fail "one CPU: the kernel did not say there were no others"
@@ -64,7 +68,7 @@ else
     # all of them count at once, and with a lock nothing may be lost.
     n=1
     while [ "$n" -lt "$CPUS" ]; do
-        grep -q "\[smp\] CPU $n awake: APIC id" "$LOG" || fail "CPU $n did not wake"
+        grep -q "\[smp\] CPU $n awake: $CPU_AWAKE" "$LOG" || fail "CPU $n did not wake"
         n=$((n + 1))
     done
     grep -q "\[smp\] $CPUS CPUs awake" "$LOG"        || fail "not all $CPUS CPUs woke"
@@ -87,7 +91,6 @@ else
     # that CPU was interrupted, not because its timer happened to tick.
     grep -q "\[selftest\] wake-ups: a thread woken by a busy CPU ran on an idle one" "$LOG" \
         || fail "an idle CPU was not told of a woken thread"
-fi
 fi
 grep -q "\[selftest\] user:" "$LOG"               || fail "user-mode self-test"
 if [ "$ARCH" = pc ]; then
@@ -269,9 +272,7 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
                 took=$(echo "$times" | sed 's/^took \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
                 worked=$(echo "$times" | sed 's/.*worked for \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
                 [ "${took:-0}" -gt 100 ] || fail "the four copies of cprimes were over before the shell waited for them: $times"
-                # (The AArch64 kernel runs on one CPU so far: the four
-                # copies must still each be right, taking turns.)
-                [ "$ARCH" != pc ] || [ $((${worked:-0} * 2)) -ge $((took * 3)) ] \
+                [ $((${worked:-0} * 2)) -ge $((took * 3)) ] \
                     || fail "four programs did not run at once: $times"
                 echo "four copies of cprimes at once: $times"
             fi

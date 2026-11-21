@@ -75,7 +75,20 @@ pub unsafe fn init(interrupt: u32) -> u64 {
     INTERVAL.store(interval, Ordering::Relaxed);
     INTERRUPT.store(interrupt, Ordering::Relaxed);
 
-    let first = counter() + interval;
+    // SAFETY: the caller's promise is `start_here`'s condition.
+    unsafe { start_here() };
+    frequency
+}
+
+/// Starts this CPU's timer. Every CPU has one of its own - the
+/// counter is shared, the compare value and the interrupt are not -
+/// so each CPU that is started does this for itself.
+///
+/// # Safety
+/// After `init` on the boot CPU; on this CPU, once, interrupts masked,
+/// after its part of the interrupt controller is set up.
+pub unsafe fn start_here() {
+    let first = counter() + INTERVAL.load(Ordering::Relaxed);
     // SAFETY: the compare value, then control: bit 0 enables the
     // timer, bit 1 (left clear) would mask its interrupt.
     unsafe {
@@ -89,8 +102,7 @@ pub unsafe fn init(interrupt: u32) -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    gic::enable(interrupt);
-    frequency
+    gic::enable(INTERRUPT.load(Ordering::Relaxed));
 }
 
 /// The timer's interrupt arrived. The timer goes on asking for as long

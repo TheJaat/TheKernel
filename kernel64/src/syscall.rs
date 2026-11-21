@@ -71,6 +71,8 @@ fn debug_write(pointer: u64, length: u64) -> Result<u64, Error> {
     // Not trusted to be UTF-8 either: invalid bytes become U+FFFD. Into
     // the log's queue, not onto the serial line: the program does not
     // wait for it (console.rs).
-    crate::console::write_later(String::from_utf8_lossy(&bytes).as_bytes());
+    // The log is told who wrote it, to keep each writer's lines whole.
+    let pid = process::current().map_or(0, |process| process.pid);
+    crate::console::write_later(pid, String::from_utf8_lossy(&bytes).as_bytes());
     Ok(length)
 }

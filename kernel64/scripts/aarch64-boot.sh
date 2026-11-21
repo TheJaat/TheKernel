@@ -16,6 +16,17 @@
 #   CPU        the CPU model (default cortex-a72)
 #   MEMORY     how much memory (default 512M)
 #   QEMU_ARGS  any further QEMU options
+#   UEFI       a FAT image with a UEFI loader on it (and the kernel it
+#              loads): the machine is then started by UEFI firmware,
+#              which runs that loader, instead of QEMU putting IMAGE in
+#              memory itself. IMAGE is not used.
+#   FIRMWARE   the directory that firmware is in (default
+#              /usr/share/AAVMF)
+#   ACPI       "on" to let the firmware describe the machine with ACPI
+#              tables, as it would by default - it then hands a loader
+#              no device tree. Only with UEFI; otherwise off.
+#   SLOTS      how many host CPUs the machine can keep busy (default 1):
+#              say as many as it has CPUs
 #   KEYS       keys to type at the serial port once its driver is ready,
 #              by the names QEMU's monitor uses ("shift-h i ret") - the
 #              list the PC's boot test types, typed here as the bytes a
@@ -26,22 +37,39 @@ set -u
 
 # Boots are timed, so no more of them may run at once than the host has
 # CPUs for: wait for a slot first (boot-slots.sh, which then runs this
-# script again). The kernel uses one CPU so far, whatever the machine has.
+# script again): one for each CPU the machine is given, said in SLOTS.
 if [ -z "${TAAJ_BOOT_HELD:-}" ]; then
-    exec "$(dirname "$0")/boot-slots.sh" 1 "$0" "$@"
+    exec "$(dirname "$0")/boot-slots.sh" "${SLOTS:-1}" "$0" "$@"
 fi
 
 IMAGE=$1
 LOG=$2
 LIMIT=${3:-20}
 
-FINISHED="\[kernel\] idle|\[kernel\] no programs can run|KERNEL PANIC|CPU EXCEPTION|KERNEL STACK OVERFLOW|THE SYSTEM HAS STOPPED"
+FINISHED="\[kernel\] idle|\[kernel\] no programs can run|KERNEL PANIC|CPU EXCEPTION|KERNEL STACK OVERFLOW|THE SYSTEM HAS STOPPED|TheTaaJBoot: .*\(status"
 KEYS=${KEYS:-}
 
 rm -f "$LOG"
 : > "$LOG"
 # -kernel with a flat image that has the AArch64 header: QEMU loads it
 # as a loader on a real board would, and passes the device tree in x0.
+#
+# Or, with UEFI: firmware in the machine's two flash chips (its code,
+# read-only, and the settings it keeps - a fresh copy each boot), and
+# the image with the loader as a disk the firmware can read but the
+# kernel has no driver for (it is on PCI), so that the kernel sees only
+# the disks QEMU_ARGS gives it.
+MACHINE=${MACHINE:-}
+if [ -n "${UEFI:-}" ]; then
+    FIRMWARE=${FIRMWARE:-/usr/share/AAVMF}
+    cp "$FIRMWARE/AAVMF_VARS.fd" "$LOG.vars"
+    [ "${ACPI:-off}" = on ] || MACHINE="$MACHINE,acpi=off"
+    set -- -drive "if=pflash,format=raw,readonly=on,file=$FIRMWARE/AAVMF_CODE.fd" \
+           -drive "if=pflash,format=raw,file=$LOG.vars" \
+           -drive "file=$UEFI,format=raw,if=none,id=esp" -device virtio-blk-pci,drive=esp
+else
+    set -- -kernel "$IMAGE"
+fi
 if [ -n "$KEYS" ]; then
     # The serial port both ways: out to the log, in from a pipe this
     # script keeps open (QEMU would see the end of input otherwise, as
@@ -50,11 +78,11 @@ if [ -n "$KEYS" ]; then
     rm -f "$FIFO"
     mkfifo "$FIFO"
     exec 9<> "$FIFO"
-    qemu-system-aarch64 -M "virt${MACHINE:-}" -cpu "${CPU:-cortex-a72}" -m "${MEMORY:-512M}" \
-        -display none -no-reboot -serial stdio -monitor none -kernel "$IMAGE" ${QEMU_ARGS:-} < "$FIFO" > "$LOG" 2> "$LOG.qemu" &
+    qemu-system-aarch64 -M "virt$MACHINE" -cpu "${CPU:-cortex-a72}" -m "${MEMORY:-512M}" \
+        -display none -no-reboot -serial stdio -monitor none "$@" ${QEMU_ARGS:-} < "$FIFO" > "$LOG" 2> "$LOG.qemu" &
 else
-    qemu-system-aarch64 -M "virt${MACHINE:-}" -cpu "${CPU:-cortex-a72}" -m "${MEMORY:-512M}" \
-        -display none -no-reboot -serial "file:$LOG" -kernel "$IMAGE" ${QEMU_ARGS:-} 2> "$LOG.qemu" &
+    qemu-system-aarch64 -M "virt$MACHINE" -cpu "${CPU:-cortex-a72}" -m "${MEMORY:-512M}" \
+        -display none -no-reboot -serial "file:$LOG" "$@" ${QEMU_ARGS:-} 2> "$LOG.qemu" &
 fi
 qemu=$!
 

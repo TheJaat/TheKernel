@@ -1,16 +1,15 @@
 //! AArch64.
 //!
-//! The port is under way: the kernel starts, turns on the MMU, writes
-//! to the serial port, catches exceptions, and manages memory with the
-//! same code as on a PC. What else the kernel asks of an architecture
-//! (interrupts, a timer, context switches, system calls, other CPUs)
-//! is still to come, a piece at a time.
+//! Everything the kernel asks of an architecture: the first
+//! instructions and the MMU, a serial console, exceptions, interrupts
+//! and a timer, context switches, system calls, and the other CPUs.
 
 pub mod context;
 mod entry;
 mod gic;
 pub mod mmu;
 mod pl011;
+pub mod smp;
 pub mod timer;
 mod vectors;
 
@@ -94,9 +93,20 @@ pub fn enable_interrupts() {
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
 }
 
-/// Which CPU this is. One is running so far, so: the first.
+/// Which CPU this is: the kernel's number for it, 0 for the one that
+/// booted.
+///
+/// Every CPU runs the same code and sees the same memory, so the
+/// answer cannot be in a variable. It is in a register that each CPU
+/// has its own copy of and that is there for exactly this kind of
+/// thing: `TPIDR_EL1`, "thread ID register" for exception level 1,
+/// which the CPU itself never reads or changes. Each CPU's first
+/// instructions put its number there (entry.rs).
 pub fn cpu() -> usize {
-    0
+    let number: u64;
+    // SAFETY: reading a register that holds only what was put in it.
+    unsafe { asm!("mrs {}, tpidr_el1", out(reg) number, options(nomem, nostack, preserves_flags)) };
+    number as usize
 }
 
 /// The clock to measure short times with: the counter the timer
@@ -114,13 +124,6 @@ pub fn clock_hz() -> u64 {
 /// every device is in memory, and page tables decide.
 pub fn set_io_bitmap(_ports: &kernel64::ioports::PortBitmap) {}
 
-/// The other CPUs. None is running yet.
-pub mod smp {
-    /// Interrupts the CPUs in `cpus` (a bit each) so that they look
-    /// for work. With one CPU there is nobody to tell.
-    pub fn poke(_cpus: u64) {}
-}
-
 /// Entering programs. (Leaving them is an exception like any other:
 /// vectors.rs.)
 pub mod syscall {
@@ -133,9 +136,8 @@ pub mod syscall {
     /// exist.
     pub const ENTRY_STACK_GAP: u64 = 16;
 
-    /// The top of the running thread's kernel stack. One CPU, so one
-    /// number; each CPU gets its own when there are more.
-    static KERNEL_STACK: AtomicU64 = AtomicU64::new(0);
+    /// The top of the kernel stack of the thread running on each CPU.
+    static KERNEL_STACK: [AtomicU64; kernel64::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; kernel64::smp::MAX_CPUS];
 
     /// Notes where the kernel's stack is for the thread about to run.
     /// There is nothing to tell the CPU, as there is on x86: its
@@ -144,7 +146,7 @@ pub mod syscall {
     /// The note is for `enter_user`, which puts it there the first
     /// time.
     pub fn set_kernel_stack(top: u64) {
-        KERNEL_STACK.store(top, Ordering::Relaxed);
+        KERNEL_STACK[super::cpu()].store(top, Ordering::Relaxed);
     }
 
     /// Drops to level 0 at `entry`, with stack pointer `stack` and two
@@ -156,7 +158,7 @@ pub mod syscall {
     /// programs, and `set_kernel_stack` must have named this thread's
     /// kernel stack.
     pub unsafe fn enter_user(entry: u64, stack: u64, first: u64, second: u64) -> ! {
-        let top = KERNEL_STACK.load(Ordering::Relaxed);
+        let top = KERNEL_STACK[super::cpu()].load(Ordering::Relaxed);
         assert!(top != 0, "a program started on a thread without a kernel stack of its own");
         // SAFETY: the caller's promise; `top` is the top of the stack
         // this very code runs on, which the thread never needs again.
@@ -164,11 +166,18 @@ pub mod syscall {
     }
 }
 
-/// Sleeps until an interrupt is pending. With interrupts on, it is
-/// taken at once on waking; a masked one wakes the CPU all the same.
+/// Lets interrupts in and sleeps until one is pending; it is taken at
+/// once on waking. For the idle loop - which a CPU started after the
+/// first enters with interrupts still off.
+///
+/// (An interrupt that arrives between the two instructions is taken
+/// there, and `wfi` then sleeps until the next. Nothing is lost by
+/// that: a thread it made ready was switched to on the way out of the
+/// interrupt, and the timer is never more than a tick away.)
 pub fn wait_for_interrupt() {
-    // SAFETY: wfi touches no memory and changes no register.
-    unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    // SAFETY: clears the I mask bit, as `enable_interrupts` does; wfi
+    // touches no memory and changes no register.
+    unsafe { asm!("msr daifclr, #2", "wfi", options(nomem, nostack, preserves_flags)) };
 }
 
 /// What `init_interrupts` set up, for the kernel to say.
@@ -198,6 +207,10 @@ pub unsafe fn init_interrupts(machine: &kernel64::devicetree::Machine) -> Option
         // The tree's third timer interrupt is the virtual timer's.
         let timer_interrupt = machine.timer_interrupts[2].unwrap_or(USUAL_TIMER_INTERRUPT);
         let timer_hz = timer::init(timer_interrupt);
+        // The two interrupts other CPUs may send this one. Asked for
+        // even on a machine with one CPU: nobody sends them there.
+        gic::enable(kernel64::gic::SOFTWARE_RESCHEDULE);
+        gic::enable(kernel64::gic::SOFTWARE_STOP);
         Some(Interrupts { version: info.version, lines: info.lines, timer_interrupt, timer_hz })
     }
 }
@@ -241,6 +254,15 @@ fn interrupt() {
     while let Some((id, raw)) = gic::acknowledge() {
         if id == timer::interrupt() {
             timer::on_interrupt();
+        } else if id == kernel64::gic::SOFTWARE_RESCHEDULE {
+            // Another CPU made a thread ready while this one sat
+            // halted. Nothing to do but count it: the choosing is
+            // done below, as after every interrupt.
+            crate::interrupts::poked();
+        } else if id == kernel64::gic::SOFTWARE_STOP {
+            // The kernel is stopping, on another CPU, and says so there.
+            gic::end(raw);
+            halt_forever();
         } else if gic::has_shared(id) && {
             // A device's. Off first, then counted: its driver is a
             // program, which will not have dealt with the device by
@@ -315,9 +337,13 @@ pub fn selftest_interrupts() {
     assert!(unexpected == 0, "{unexpected} interrupts arrived that nothing asked for");
 }
 
-/// There are no other CPUs running yet; this CPU just stops listening.
+/// Stops every other CPU, for a kernel that is about to halt: each is
+/// sent an interrupt whose handler halts it. Not waited for - a CPU
+/// with interrupts off will not answer, and the one that is stopping
+/// cannot do anything about that.
 pub fn stop_other_cpus() {
     disable_interrupts();
+    smp::stop_others();
 }
 
 /// Stops this CPU for good. `wfi` ("wait for interrupt") sleeps until

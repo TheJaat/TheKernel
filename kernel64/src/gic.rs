@@ -55,6 +55,10 @@ pub mod distributor {
     /// the CPU it goes to, in the form of `route`.
     pub const ROUTE: usize = 0x6000;
 
+    /// Version 2 only: writing here sends a software interrupt to
+    /// other CPUs (see `software_v2`).
+    pub const SOFTWARE: usize = 0xF00;
+
     /// Version 2: forward interrupts to the CPUs.
     pub const ENABLE: u32 = 1;
     /// Version 3: forward group 1 interrupts.
@@ -189,6 +193,39 @@ pub fn is_redistributor_of(type_register: u64, mpidr: u64) -> bool {
     type_register >> 32 == affinity(mpidr)
 }
 
+// ---- one CPU interrupting another -----------------------------------------
+
+/// Interrupts 0 to 15 are "software generated": no device raises
+/// them, a CPU does, by writing a register, to interrupt another CPU.
+/// The kernel uses two.
+///
+/// "Look at the queue": a thread was made ready that the CPU could
+/// run, and it sits halted (sched.rs calls this a poke).
+pub const SOFTWARE_RESCHEDULE: u32 = 0;
+/// "Stop": the kernel is halting, on every CPU.
+pub const SOFTWARE_STOP: u32 = 1;
+
+/// Version 2: what to write to the distributor's SOFTWARE register to
+/// send software interrupt `id` to the CPUs in `targets` - a bit for
+/// each, the same bits as in a TARGETS byte.
+pub fn software_v2(targets: u8, id: u32) -> u32 {
+    u32::from(targets) << 16 | (id & 0xF)
+}
+
+/// Version 3: what to write to the CPU's own `ICC_SGI1R_EL1` register
+/// to send software interrupt `id` to the CPU whose `MPIDR_EL1` is
+/// `mpidr`. The register names a group of up to 16 CPUs by the upper
+/// three parts of their name, and each one in it by a bit - so a CPU
+/// whose lowest part is 16 or more cannot be named: None.
+pub fn software_v3(mpidr: u64, id: u32) -> Option<u64> {
+    let lowest = mpidr & 0xFF;
+    if lowest >= 16 {
+        return None;
+    }
+    let part = |shift: u32| (mpidr >> shift) & 0xFF;
+    Some(part(32) << 48 | part(16) << 32 | u64::from(id & 0xF) << 24 | part(8) << 16 | 1 << lowest)
+}
+
 // ---- the timer -----------------------------------------------------------
 
 /// How far the CPU's counter moves between two ticks, for a counter
@@ -296,6 +333,21 @@ mod tests {
         assert!(is_redistributor_of(0x0403_0201 << 32, mpidr));
         // The low half of TYPE is not part of the name.
         assert!(is_redistributor_of(0x0403_0201 << 32 | 0xFFFF_FFFF, mpidr));
+    }
+
+    #[test]
+    fn one_cpu_interrupts_another() {
+        // Version 2: CPUs 1 and 3, interrupt 0; CPU 0, interrupt 1.
+        assert_eq!(software_v2(0b1010, SOFTWARE_RESCHEDULE), 0x000A_0000);
+        assert_eq!(software_v2(1, SOFTWARE_STOP), 0x0001_0001);
+        // Version 3: CPU 2 of a simple machine.
+        assert_eq!(software_v3(0x8000_0002, SOFTWARE_RESCHEDULE), Some(1 << 2));
+        assert_eq!(software_v3(0x8000_0002, SOFTWARE_STOP), Some(1 << 24 | 1 << 2));
+        // A name with all four parts, 4.3.2.1: each in its own place.
+        assert_eq!(software_v3(0x04_8003_0201, 0), Some(4 << 48 | 3 << 32 | 2 << 16 | 1 << 1));
+        // The sixteenth CPU of a group can be named, the seventeenth not.
+        assert_eq!(software_v3(15, 0), Some(1 << 15));
+        assert_eq!(software_v3(16, 0), None);
     }
 
     #[test]

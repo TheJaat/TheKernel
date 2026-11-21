@@ -29,10 +29,19 @@
 //!
 //! Order is kept: before the kernel writes a message of its own it
 //! writes out everything queued before it.
+//!
+//! And lines are kept whole, as far as that can be had: while one
+//! writer has a line unfinished, what the others write - the kernel
+//! too - waits for it to end, for a few ticks at most
+//! (`kernel64::logmerge`, which has the why). So a message of the
+//! kernel's is *not* always written before `kprintln!` returns: it may
+//! be held, for those few ticks, behind a program's half line. When
+//! the kernel is stopping nothing is held any more (`break_lock`).
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel64::logring::LogRing;
+use kernel64::logmerge::{Merge, Writer};
 
 use crate::irqlock::IrqLock;
 
@@ -49,16 +58,34 @@ const CHUNK: usize = 16;
 /// is still some 3000 characters a second: a screenful in under one.
 const TICK_CHUNK: usize = 32;
 
-/// The lock for the serial line, and what it guards: the queue.
-static QUEUE: IrqLock<LogRing<QUEUE_SIZE>> = IrqLock::new(LogRing::new());
+/// Room for what waits behind somebody's unfinished line: a few
+/// ticks' worth of messages.
+const HELD_SIZE: usize = 4 * 1024;
 
-struct Console;
+type Log = Merge<QUEUE_SIZE, HELD_SIZE>;
+
+/// The lock for the serial line, and what it guards: the queue.
+static QUEUE: IrqLock<Log> = IrqLock::new(Merge::new());
+
+/// The kernel is on its way to halting: its last words are written at
+/// once, whoever's line they land in.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// The serial line itself, for the kernel's own messages.
+struct Console {
+    /// Whether the last piece written ended a line; None if nothing
+    /// was written.
+    ended: Option<bool>,
+}
 
 /// Implementing `fmt::Write` is all it takes to get `{}` formatting:
 /// `write_fmt` comes free with the trait and calls `write_str` with each
 /// formatted piece.
 impl Write for Console {
     fn write_str(&mut self, text: &str) -> fmt::Result {
+        if !text.is_empty() {
+            self.ended = Some(text.ends_with('\n'));
+        }
         crate::arch::console_write(text);
         // And on the screen - once the kernel has taken it, to stop.
         #[cfg(target_arch = "x86_64")]
@@ -70,7 +97,8 @@ impl Write for Console {
 /// Writes out up to `limit` queued bytes; and, once the queue is empty,
 /// a line saying what was dropped, if anything was. Returns whether it
 /// wrote anything. The caller holds the lock.
-fn flush(queue: &mut LogRing<QUEUE_SIZE>, limit: usize) -> bool {
+fn flush(log: &mut Log, limit: usize) -> bool {
+    let queue = log.queue();
     let mut chunk = [0u8; CHUNK];
     let mut written = 0;
     while written < limit {
@@ -84,7 +112,7 @@ fn flush(queue: &mut LogRing<QUEUE_SIZE>, limit: usize) -> bool {
     if queue.is_empty() {
         let dropped = queue.take_dropped();
         if dropped > 0 {
-            let _ = writeln!(Console, "\n[log] {dropped} bytes of program output are missing here: the serial line could not keep up");
+            let _ = writeln!(Console { ended: None }, "\n[log] {dropped} bytes of program output are missing here: the serial line could not keep up");
             return true;
         }
     }
@@ -94,17 +122,47 @@ fn flush(queue: &mut LogRing<QUEUE_SIZE>, limit: usize) -> bool {
 /// Not for direct use - the macros call it. `pub` only because macros
 /// expand at the call site, which may be in another module.
 pub fn print(args: fmt::Arguments) {
-    let mut queue = QUEUE.lock();
+    let mut log = QUEUE.lock();
+    let stopping = STOPPING.load(Ordering::Relaxed);
+    if !stopping && !log.free_for(Writer::Kernel) {
+        // A program is in the middle of a line. This message waits
+        // behind it - formatted now, written when that line ends or
+        // the timer has waited long enough.
+        let now = crate::interrupts::ticks();
+        let _ = Held { log: &mut log, now }.write_fmt(args);
+        return;
+    }
+    if stopping {
+        log.let_go();
+    }
     // What programs printed before this comes before it.
-    flush(&mut queue, usize::MAX);
+    flush(&mut log, usize::MAX);
+    let mut console = Console { ended: None };
     // Writing to the console cannot fail, so the Result carries nothing.
-    let _ = Console.write_fmt(args);
+    let _ = console.write_fmt(args);
+    if let Some(ended) = console.ended {
+        log.wrote(Writer::Kernel, ended);
+    }
 }
 
-/// Queues a program's output for the log. Never waits: if there is no
-/// room the message is dropped, and counted.
-pub fn write_later(bytes: &[u8]) {
-    QUEUE.lock().push(bytes);
+/// A message of the kernel's that has to wait: its pieces go where a
+/// program's would.
+struct Held<'a> {
+    log: &'a mut Log,
+    now: u64,
+}
+
+impl Write for Held<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.log.write(Writer::Kernel, text.as_bytes(), self.now);
+        Ok(())
+    }
+}
+
+/// Queues what the program `pid` printed for the log. Never waits: if
+/// there is no room the message is dropped, and counted.
+pub fn write_later(pid: u64, bytes: &[u8]) {
+    QUEUE.lock().write(Writer::Program(pid), bytes, crate::interrupts::ticks());
 }
 
 /// Writes a little of what is queued; false if there was nothing. For
@@ -115,8 +173,12 @@ pub fn write_queued() -> bool {
 
 /// Writes a little of what is queued, from the timer interrupt: what
 /// keeps programs' output moving on a machine that is never idle.
+/// And what lets go of text that has waited long enough for somebody
+/// else's line to end.
 pub fn write_on_tick() {
-    flush(&mut QUEUE.lock(), TICK_CHUNK);
+    let mut log = QUEUE.lock();
+    log.tick(crate::interrupts::ticks());
+    flush(&mut log, TICK_CHUNK);
 }
 
 /// Frees the console lock, for a panic or fatal exception that must be
@@ -139,6 +201,7 @@ pub unsafe fn break_lock() {
     if QUEUE.is_locked() {
         QUEUE.force_unlock();
     }
+    STOPPING.store(true, Ordering::Relaxed);
     // The kernel is stopping: what it says now goes on the screen too.
     #[cfg(target_arch = "x86_64")]
     crate::lastwords::begin();

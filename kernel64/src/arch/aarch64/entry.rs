@@ -76,6 +76,43 @@ const OVERFLOW_STACK_SIZE: usize = 12 * 1024;
 global_asm!(
     r#"
     .section .text.entry, "ax"
+    // From EL2 down to EL1, at the instruction after this one.
+    //
+    // EL2 is where a hypervisor lives. This kernel is not one, so it
+    // sets EL2 to stay out of the way and "returns" to EL1 - an
+    // exception return to a level that was never left. Every CPU that
+    // is entered at EL2 does this for itself: the registers written
+    // here are each CPU's own.
+    .macro leave_el2
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1             // EL1 is 64-bit; nothing it does traps to EL2
+    mov     x1, #3
+    msr     cnthctl_el2, x1         // EL1 may use the timer and its counter
+    msr     cntvoff_el2, xzr        // ...which reads the same as EL2's
+    mov     x1, #0x33ff
+    msr     cptr_el2, x1            // floating point does not trap to EL2
+    msr     hstr_el2, xzr
+    // If the interrupt controller is one the CPU talks to through its
+    // own registers (GIC version 3), EL2 decides whether EL1 may use
+    // them. It may.
+    mrs     x1, id_aa64pfr0_el1
+    ubfx    x1, x1, #24, #4
+    cbz     x1, 8f
+    mrs     x1, s3_4_c12_c9_5       // ICC_SRE_EL2
+    orr     x1, x1, #0xf            // registers on, at EL2 and for EL1
+    msr     s3_4_c12_c9_5, x1
+    isb
+8:
+    ldr     x1, ={control_off}
+    msr     sctlr_el1, x1           // EL1 starts with its MMU off
+    mov     x1, #0x3c5              // "came from": EL1, its own stack pointer, interrupts off
+    msr     spsr_el2, x1
+    adr     x1, 9f
+    msr     elr_el2, x1             // "return" to the next instruction
+    eret
+9:
+    .endm
+
     .global _start
 _start:
     b       .Lbegin                 // "code0": over the header
@@ -91,44 +128,26 @@ _start:
 
 .Lbegin:
     msr     daifset, #0xf           // no interrupts of any kind
-    mov     x19, x0                 // the device tree; x19 to x21 survive to kernel_main
+    mov     x19, x0                 // the device tree; x19 to x22 survive to kernel_main
     mrs     x20, CurrentEL
     lsr     x20, x20, #2            // the level the loader entered at: 1 or 2
     cmp     x20, #1
-    b.eq    .Lat_el1
+    b.ne    .Lnot_el1
+    // A loader is to enter with its MMU off. Nothing below depends on
+    // it - every address used is relative - but a loader that forgot
+    // is a loader with a bug, and the kernel can at least say so
+    // (bit 0 of the control register of the level it came in at).
+    mrs     x22, sctlr_el1
+    and     x22, x22, #1
+    b       .Lat_el1
+.Lnot_el1:
     cmp     x20, #2
     b.ne    .Lhang                  // EL3 is firmware's; nothing here knows how to leave it
+    mrs     x22, sctlr_el2
+    and     x22, x22, #1
 
     // ---- 1. from EL2 down to EL1 ------------------------------------
-    // EL2 is where a hypervisor lives. This kernel is not one, so it
-    // sets EL2 to stay out of the way and "returns" to EL1 - an
-    // exception return to a level that was never left.
-    mov     x1, #(1 << 31)
-    msr     hcr_el2, x1             // EL1 is 64-bit; nothing it does traps to EL2
-    mov     x1, #3
-    msr     cnthctl_el2, x1         // EL1 may use the timer and its counter
-    msr     cntvoff_el2, xzr        // ...which reads the same as EL2's
-    mov     x1, #0x33ff
-    msr     cptr_el2, x1            // floating point does not trap to EL2
-    msr     hstr_el2, xzr
-    // If the interrupt controller is one the CPU talks to through its
-    // own registers (GIC version 3), EL2 decides whether EL1 may use
-    // them. It may.
-    mrs     x1, id_aa64pfr0_el1
-    ubfx    x1, x1, #24, #4
-    cbz     x1, 1f
-    mrs     x1, s3_4_c12_c9_5       // ICC_SRE_EL2
-    orr     x1, x1, #0xf            // registers on, at EL2 and for EL1
-    msr     s3_4_c12_c9_5, x1
-    isb
-1:
-    ldr     x1, ={control_off}
-    msr     sctlr_el1, x1           // EL1 starts with its MMU off
-    mov     x1, #0x3c5              // "came from": EL1, its own stack pointer, interrupts off
-    msr     spsr_el2, x1
-    adr     x1, .Lat_el1
-    msr     elr_el2, x1             // "return" to the next instruction
-    eret
+    leave_el2
 
 .Lat_el1:
     // Where was the image loaded? `adr` answers relative to this
@@ -232,12 +251,73 @@ _start:
     mov     x0, x19                 // the device tree
     mov     x1, x20                 // the level entered at
     mov     x2, x21                 // where the image was loaded
+    mov     x3, x22                 // whether the loader's MMU was on
+    msr     tpidr_el1, xzr          // "which CPU am I": the first (mod.rs, `cpu`)
     mov     x29, xzr                // no caller: a backtrace ends here
     mov     x30, xzr
     bl      kernel_main
 
 .Lhang:
     wfe
+    b       .Lhang
+
+    // ---- every CPU after the first -----------------------------------
+    // The firmware starts a CPU here when the boot CPU asks it to
+    // (smp.rs), as it started the first at `_start`: MMU off, at this
+    // code's physical address, possibly at EL2. x0 is the number the
+    // boot CPU passed along: the physical address of what it prepared
+    // (`Start` in smp.rs, whose fields are read below by their place).
+    //
+    // There is less to do than at `_start`. The image is where it is,
+    // `.bss` is in use, and the kernel's page tables exist: this CPU
+    // only has to adopt them. For the one instruction between "MMU on"
+    // and "running at a high address" it borrows the low mapping the
+    // boot CPU made for itself, long ago, and never took apart.
+    .global secondary_start
+secondary_start:
+    msr     daifset, #0xf
+    mov     x19, x0
+    mrs     x20, CurrentEL
+    lsr     x20, x20, #2
+    cmp     x20, #1
+    b.eq    2f
+    cmp     x20, #2
+    b.ne    .Lhang
+    leave_el2
+2:
+    // The same settings as the boot CPU has now, read from it.
+    ldr     x1, [x19, #24]
+    msr     mair_el1, x1
+    ldr     x1, [x19, #8]
+    msr     tcr_el1, x1
+    ldr     x1, [x19, #32]
+    msr     cpacr_el1, x1
+    ldr     x1, [x19, #40]
+    msr     cntkctl_el1, x1
+    adrp    x1, boot_l0_low
+    msr     ttbr0_el1, x1
+    ldr     x1, [x19, #0]
+    msr     ttbr1_el1, x1           // the kernel's tables, not the boot ones
+    // Everything else it was given, into registers: once the MMU is
+    // on and the low half is given up, x19 is an address of nothing.
+    ldr     x2, [x19, #16]
+    ldr     x21, [x19, #48]         // its stack
+    ldr     x22, [x19, #56]         // its number
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    msr     sctlr_el1, x2
+    isb
+    ldr     x1, =.Lsecondary_high
+    br      x1
+.Lsecondary_high:
+    mov     sp, x21
+    msr     tpidr_el1, x22
+    mov     x0, x22
+    mov     x29, xzr
+    mov     x30, xzr
+    bl      secondary_main
     b       .Lhang
 
     .ltorg                          // the constants the `ldr x, =` lines above load

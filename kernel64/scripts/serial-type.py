@@ -12,8 +12,13 @@ LOG is the machine's serial output, read to know when to go on:
        and restart) before typing on
   ~    wait until the shell has run every line typed so far - ten
        seconds at most; "~~" up to ninety
+  see:WORD
+       wait until WORD is in the log more often than it was when Enter
+       was last pressed - ten seconds at most. For what a command
+       started in the background says when it is over.
 
-One key at a time, with a pause: a person typing, not a burst.
+One key at a time, with a pause: a person typing, not a burst. Before
+Ctrl+C the pause is longer: what it stops is given time to start.
 """
 import sys
 import time
@@ -62,9 +67,11 @@ def wait_until(condition, seconds):
 def main():
     log, fifo, keys = sys.argv[1], sys.argv[2], sys.argv[3:]
     for key in keys:
-        if key not in ("/", "~", "~~"):
+        if key not in ("/", "~", "~~") and not key.startswith("see:"):
             key_bytes(key)      # a key with no bytes: said before anything is typed
     entered = 0
+    # The log as it was at the last Enter, for "see:".
+    before = b""
     with open(fifo, "wb", buffering=0) as line:
         for key in keys:
             if key == "/":
@@ -72,9 +79,23 @@ def main():
                 wait_until(lambda: count(log, READY) > seen, 10)
             elif key in ("~", "~~"):
                 wait_until(lambda: count(log, RAN) >= entered, 90 if key == "~~" else 10)
+            elif key.startswith("see:"):
+                word = key[4:].encode()
+                wait_until(lambda: count(log, word) > before.count(word), 10)
             else:
                 if key == "ret":
                     entered += 1
+                    try:
+                        before = open(log, "rb").read()
+                    except OSError:
+                        before = b""
+                if key == "ctrl-c":
+                    # Ctrl+C is pressed at something seen to be running.
+                    # A fiftieth of a second after Enter the program may
+                    # not have said its first line yet - and with other
+                    # CPUs free to run the shell meanwhile, it is ended
+                    # before it does.
+                    time.sleep(0.3)
                 line.write(key_bytes(key))
                 time.sleep(0.02)
         # Each Enter runs a command; wait until the shell has run them all.

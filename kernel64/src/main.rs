@@ -210,7 +210,7 @@ fn start_memory(info: &'static BootInfo, info_address: u64) -> &'static BootInfo
 /// the port has come.
 #[cfg(target_arch = "aarch64")]
 #[no_mangle]
-extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> ! {
+extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu_was_on: u64) -> ! {
     use kernel64::aarch64::{cpu_name, physical_bits, KERNEL_WINDOW, TEXT_OFFSET};
     use kernel64::bootinfo::{MemoryRegion, MEMORY_RESERVED, MEMORY_USABLE};
     use kernel64::devicetree::{Machine, Tree};
@@ -239,10 +239,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
 
     let cpu = arch::report();
     kprintln!(
-        "[cpu] {} (id {:#x}), at exception level {}; the loader entered at level {entered_at}",
+        "[cpu] {} (id {:#x}), at exception level {}; the loader entered at level {entered_at}, with the MMU {}",
         cpu_name(cpu.cpu_id),
         cpu.cpu_id,
-        cpu.level
+        cpu.level,
+        if mmu_was_on == 0 { "off" } else { "on - it is to be off: the loader has a bug, which this kernel happens to survive" }
     );
     kprintln!(
         "[cpu] {} bits of physical address; MMU on, the kernel loaded at {loaded_at:#x} and running at {:#x}",
@@ -333,12 +334,27 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
             selftest::timer();
             arch::selftest_interrupts();
 
+            // The other CPUs, if the machine has any: woken, shown to
+            // run at the same time, and then left waiting.
+            kprintln!();
+            // SAFETY: once, on the boot CPU, the controller and the
+            // timer set up above, before any process exists.
+            unsafe { arch::smp::start(&machine) };
+
             // Threads: the code running now becomes thread 1, "boot";
             // thread 0 is the idle thread. They need the tick, so they
             // start only where there is one.
             kprintln!();
             threads::init();
+            // Still on one CPU: these checks are about taking turns,
+            // and turns are only taken where there is one CPU to share.
             selftest::threads();
+
+            // Now all of them. Everything after this runs on
+            // whichever CPU is free.
+            arch::smp::release();
+            selftest::smp();
+            selftest::wakeups();
 
             // Programs: in their own address spaces, at exception
             // level 0, asking for things with `svc`.

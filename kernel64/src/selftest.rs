@@ -19,11 +19,8 @@ use crate::arch::{self, mmu};
 use crate::irqlock::IrqLock;
 use crate::{interrupts, mm, threads};
 
-// What AArch64 does not have yet: other CPUs.
-#[cfg(target_arch = "x86_64")]
 mod system;
 mod user;
-#[cfg(target_arch = "x86_64")]
 pub use system::{smp, wakeups};
 pub use user::{files, ipc, kill, user};
 #[cfg(target_arch = "aarch64")]

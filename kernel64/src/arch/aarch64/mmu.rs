@@ -192,10 +192,20 @@ pub unsafe fn install_kernel_tables(root: u64, _no_execute: bool) {
     let replace: extern "C" fn(u64) = unsafe { core::mem::transmute(low as *const ()) };
     replace(root);
 
-    // The low mapping has done its last job. Turn that half off too
-    // (EPD0, bit 7) and forget what was remembered of it; it comes
-    // back when there is a program to run in it.
+    // The low mapping has done its last job.
     // SAFETY: the caller promised nothing uses a low address.
+    unsafe { low_half_off() };
+}
+
+/// Turns the low half of the address space off (EPD0, bit 7) and
+/// forgets what was remembered of it; it comes back when there is a
+/// program to run in it. For a CPU that has just come up through the
+/// low mapping and is done with it.
+///
+/// # Safety
+/// Nothing on this CPU may be using a low address.
+pub unsafe fn low_half_off() {
+    // SAFETY: the caller's promise.
     unsafe {
         asm!(
             "mrs {t}, tcr_el1",
