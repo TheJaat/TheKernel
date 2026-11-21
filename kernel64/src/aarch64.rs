@@ -70,8 +70,10 @@ pub mod descriptor {
 /// `MAIR_EL1`: the kinds of memory a descriptor chooses between, one
 /// byte each. Kind 0 (`0xFF`) is ordinary memory, cached for reading
 /// and writing; kind 1 (`0x00`) is a device: every access happens, in
-/// order, once.
-pub const MEMORY_KINDS: u64 = 0x00FF;
+/// order, once; kind 2 (`0x44`) is ordinary memory that is not cached,
+/// for a screen's pixels, which should reach the screen. The
+/// page-table code (`paging.rs`) chooses between them by these numbers.
+pub const MEMORY_KINDS: u64 = 0x0044_00FF;
 
 /// `SCTLR_EL1` ("system control") with the MMU off: only the bits the
 /// architecture says must be 1.

@@ -15,8 +15,9 @@
 #   dirty      random bytes in the memory the kernel must zero itself
 #   unnamed    a device tree that does not say which serial port to use
 #   clockless  a device tree that does not give the serial port's clock
-#   fault      a kernel built to read unmapped memory: the exception
-#              must be caught and named
+#   fault-*    kernels built to read unmapped memory, to write to a
+#              read-only page, and to execute data: each exception must
+#              be caught and named
 
 set -eu
 
@@ -41,8 +42,10 @@ need() {
 # ---- build ------------------------------------------------------------
 (cd "$HERE" && cargo build --release --quiet --target $TARGET)
 "$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image"
-(cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-page --target-dir target/aarch64-fault-page)
-"$OBJCOPY" -O binary "$HERE/target/aarch64-fault-page/$TARGET/release/kernel64" "$OUT/Image-fault-page"
+for fault in page rodata nx; do
+    (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
+    "$OBJCOPY" -O binary "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" "$OUT/Image-fault-$fault"
+done
 
 # ---- the image header -------------------------------------------------
 # What a loader looks at before it runs a single instruction. Numbers
@@ -97,6 +100,9 @@ boot() {
     if [ -z "${CLOCK:-}" ] && grep -aq "as a guess" "$log"; then
         fail "the serial port was guessed though the tree describes it"
     fi
+    need "$log" "\[paging\] the tables the CPU is using, read by the kernel: 5 lookups, all as the CPU does them"
+    need "$log" "\[paging\] a page at 0x4[0-9a-f]+ mapped twice: .* where the CPU refuses a write"
+    need "$log" "\[paging\] a third address unmapped, then mapped to the page at 0x4[0-9a-f]+: the CPU reads the new page there"
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
     [ "$(grep -ac 'breakpoint at' "$log")" -eq 1 ] || fail "the breakpoint was taken more than once"
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
@@ -134,19 +140,37 @@ SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" boot unnamed 1 51
 CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" boot clockless 1 512 1 2 hvc
 need "$OUT/clockless.log" "\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess"
 
-# ---- the fault --------------------------------------------------------
-echo "aarch64: boot 'fault' (a read of unmapped memory)"
-log="$OUT/fault.log"
-"$HERE/scripts/aarch64-boot.sh" "$OUT/Image-fault-page" "$log" || fail "the boot did not finish"
-need "$log" "\[test\] forcing a page fault"
-need "$log" "CPU EXCEPTION 0x25: data abort"
-need "$log" "kernel read at 0xffffffff00000000: not mapped \(the level 1 table has no entry\)"
-need "$log" "from the kernel \(vector 4\)"
-need "$log" "    pc  0xffffffff8008"
-if grep -aEq "FAILED|this is as far as" "$log"; then
-    fail "the kernel carried on after the fault"
-fi
-grep -a "kernel read at" "$log" | cut -c1-110
+# ---- the faults -------------------------------------------------------
+# One build and one boot per fault. Each must be caught, named, and
+# end the kernel there.
+fault() {
+    name=$1
+    announce=$2
+    class=$3
+    what=$4
+    log="$OUT/fault-$name.log"
+    echo "aarch64: boot 'fault-$name'"
+    "$HERE/scripts/aarch64-boot.sh" "$OUT/Image-fault-$name" "$log" || fail "the boot did not finish"
+    need "$log" "\[test\] $announce"
+    need "$log" "CPU EXCEPTION $class"
+    need "$log" "$what"
+    need "$log" "from the kernel \(vector 4\)"
+    need "$log" "    pc  0xffffffff"
+    if grep -aEq "FAILED|this is as far as" "$log"; then
+        fail "the kernel carried on after the fault"
+    fi
+    grep -aE "$what" "$log" | cut -c1-110
+}
+
+fault page "forcing a page fault" "0x25: data abort" \
+    "kernel read at 0xffffffff00000000: not mapped \(the level 1 table has no entry\)"
+# The two below break a rule on a page the kernel mapped with its own
+# page-table code: they check that what that code writes means to the
+# CPU what was asked for.
+fault rodata "writing to read-only data" "0x25: data abort" \
+    "kernel write at 0xffffffffffe01000: protection violation \(at level 3\)"
+fault nx "executing data" "0x21: instruction abort" \
+    "kernel instruction fetch at 0xffffffffffe00000: protection violation \(at level 3\)"
 
 if [ $failed -ne 0 ]; then
     echo "aarch64-test: FAILED (logs in $OUT)"

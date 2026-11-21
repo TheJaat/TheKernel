@@ -162,10 +162,27 @@ pub fn device_tree(physical: u64) -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(physical as *const u8, size as usize) })
 }
 
-/// Deliberately faults, for checking the handlers. Only built with one
-/// of the `fault-*` features.
+/// Deliberately faults, for checking the handlers and the page-table
+/// protections. Only built with one of the `fault-*` features.
 #[cfg(feature = "fault-tests")]
 pub mod fault_tests {
+    use super::mmu::{TEST_READ_ONLY, TEST_WRITABLE};
+
+    /// Writes to the page `mmu::selftest` mapped read-only.
+    pub fn write_rodata() {
+        // SAFETY: none - this is meant to fault.
+        unsafe { (TEST_READ_ONLY as *mut u64).write_volatile(0xBAD) };
+    }
+
+    /// Jumps to the page `mmu::selftest` mapped writable, and so not
+    /// executable. It holds a number, not code; the CPU must refuse
+    /// before it looks.
+    pub fn execute_data() {
+        // SAFETY: none - this is meant to fault.
+        let code: extern "C" fn() = unsafe { core::mem::transmute(TEST_WRITABLE as *const ()) };
+        code();
+    }
+
     /// Reads an address no table maps: a data abort.
     pub fn page_fault() -> u64 {
         // In the kernel's half, 2 GiB below its window: the level 1

@@ -27,7 +27,6 @@ pub mod elf;
 pub mod ioports;
 pub mod logring;
 pub mod memory;
-#[cfg(target_arch = "x86_64")]
 pub mod paging;
 pub mod pci;
 pub mod queue;

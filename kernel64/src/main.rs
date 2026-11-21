@@ -203,6 +203,8 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
     use kernel64::aarch64::{cpu_name, physical_bits, KERNEL_WINDOW, TEXT_OFFSET};
     use kernel64::devicetree::{Machine, Tree};
 
+    arch::mmu::set_load_address(loaded_at);
+
     // The device tree first, and silently: it says where the serial
     // port is, so nothing can be said until it has been read.
     let tree = arch::device_tree(device_tree).map(Tree::new);
@@ -245,12 +247,29 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
         kprintln!("[tree] no serial port with a clock described: using the one QEMU's virt machine has, as a guess");
     }
 
+    kprintln!();
+    arch::mmu::selftest();
+
     #[cfg(feature = "fault-page")]
     {
         kprintln!();
         kprintln!("[test] forcing a page fault...");
         let value = arch::fault_tests::page_fault();
         kprintln!("[test] FAILED: read {value:#x} from unmapped memory");
+    }
+    #[cfg(feature = "fault-rodata")]
+    {
+        kprintln!();
+        kprintln!("[test] writing to read-only data...");
+        arch::fault_tests::write_rodata();
+        kprintln!("[test] FAILED: the fault did not happen");
+    }
+    #[cfg(feature = "fault-nx")]
+    {
+        kprintln!();
+        kprintln!("[test] executing data...");
+        arch::fault_tests::execute_data();
+        kprintln!("[test] FAILED: the fault did not happen");
     }
 
     kprintln!();
