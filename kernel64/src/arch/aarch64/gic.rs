@@ -6,7 +6,7 @@
 //! arriving as the CPU's ordinary interrupt ("IRQ").
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use kernel64::devicetree::InterruptController;
 use kernel64::gic::{self, cpu_interface, distributor, redistributor, Kind};
@@ -15,6 +15,13 @@ use crate::mm;
 
 /// 2 or 3, once `init` has run; 0 before.
 static VERSION: AtomicU8 = AtomicU8::new(0);
+/// How many interrupt numbers the controller has.
+static LINES: AtomicU32 = AtomicU32::new(0);
+
+/// Whether `id` is a shared interrupt this controller really has.
+pub fn has_shared(id: u32) -> bool {
+    gic::kind(id) == Kind::Shared && id < LINES.load(Ordering::Relaxed)
+}
 /// The distributor's registers.
 static DISTRIBUTOR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 /// Version 2: the CPU interface. Version 3: the boot CPU's
@@ -91,6 +98,7 @@ pub unsafe fn init(controller: InterruptController) -> Info {
     DISTRIBUTOR.store(dist, Ordering::Relaxed);
     PER_CPU.store(per_cpu, Ordering::Relaxed);
     VERSION.store(version, Ordering::Relaxed);
+    LINES.store(lines, Ordering::Relaxed);
     Info { version, lines }
 }
 
@@ -198,6 +206,35 @@ pub fn enable(id: u32) {
         }
         write(base, enable, mask);
     }
+}
+
+/// Lets a device's interrupt - a shared one, `id` 32 or more -
+/// through, to this CPU, read as the machine's description says
+/// (`edge` or level).
+///
+/// The order: off first, since how a line is read may only be changed
+/// while it is off; then how, and to whom; then on.
+pub fn enable_shared(id: u32, edge: bool) {
+    assert!(has_shared(id), "interrupt {id} is not a shared one this controller has");
+    disable(id);
+    let version = VERSION.load(Ordering::Relaxed);
+    let dist = DISTRIBUTOR.load(Ordering::Relaxed);
+    let (config, edge_bit) = gic::trigger(id);
+    // SAFETY: the distributor, mapped by `init`; `id` is below the
+    // number of lines it has (checked above).
+    unsafe {
+        let now = read(dist, config);
+        write(dist, config, if edge { now | edge_bit } else { now & !edge_bit });
+        if version == 3 {
+            let mpidr: u64;
+            asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
+            let route = gic::route(mpidr);
+            let at = distributor::ROUTE + 8 * id as usize;
+            write(dist, at, route as u32);
+            write(dist, at + 4, (route >> 32) as u32);
+        }
+    }
+    enable(id);
 }
 
 /// "Which interrupt?" Taking the answer tells the controller this CPU

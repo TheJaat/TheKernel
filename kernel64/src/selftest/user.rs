@@ -182,6 +182,70 @@ pub fn kill() {
     kprintln!("[selftest] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked");
 }
 
+/// A disk: the block driver, given a device the kernel found and made
+/// ready, and a client that tests it - every kind of request, the
+/// refusals, and writes read back. The driver is a program: all it has
+/// of the device is three handles.
+///
+/// Twice, with the same handles: the second driver finds the device as
+/// the first left it, and must reset it and start over - which is what
+/// restarting a crashed driver will be. Then nothing may be left; and
+/// the device must have interrupted, or the driver was not waiting for
+/// it but asking over and over.
+#[cfg(target_arch = "aarch64")]
+pub fn disk(device: Option<crate::mmio_devices::Ready>) {
+    use crate::{arch, ipc, process, programs};
+    use kernel64::cap::Rights;
+
+    let Some(device) = device else {
+        kprintln!("[selftest] disk: no block device a driver exists for - not run");
+        return;
+    };
+    let run = || {
+        let (to_driver, description) = ipc::channel();
+        ipc::kernel_send(&to_driver, &device.info.to_bytes(), Vec::new()).expect("sending the description");
+        let (writers, write_requests) = ipc::channel();
+        let (readers, read_requests) = ipc::channel();
+        // The driver's handles, in the order it expects: registers,
+        // DMA memory, the description, its two request channels, and
+        // last the interrupt.
+        let mut handles = device.handles.clone();
+        let interrupt = (handles.len() > 2).then(|| handles.remove(2));
+        handles.extend([(description, Rights::ALL), (write_requests, Rights::ALL), (read_requests, Rights::ALL)]);
+        handles.extend(interrupt);
+        let (driver, driver_thread) = process::spawn("blk", programs::BLK, handles).expect("loading blk");
+        let (client, client_thread) =
+            process::spawn("blkcheck", programs::BLKCHECK, alloc::vec![(writers, Rights::ALL), (readers, Rights::ALL)])
+                .expect("loading blkcheck");
+        threads::join(client_thread);
+        threads::join(driver_thread);
+        drop(to_driver);
+        assert_eq!(client.exit_code(), Some(0), "blkcheck failed (the code is the line of the failed check)");
+        assert_eq!(driver.exit_code(), Some(0), "blk should end when its last client goes");
+    };
+
+    let before = arch::device_interrupts();
+    run();
+    threads::yield_now();
+    let frames = mm::unused_frames();
+    let first = arch::device_interrupts() - before;
+    run();
+    threads::yield_now();
+    let second = arch::device_interrupts() - before - first;
+    assert_eq!(mm::unused_frames(), frames, "the disk driver leaked frames");
+    assert_eq!(ipc::live_channels(), 0, "channels leaked");
+    if device.info.interrupt {
+        // Each run makes well over a hundred requests of the device. Not
+        // each is an interrupt of its own - one that finishes while the
+        // line is off shares the next - but most are.
+        assert!(first >= 20 && second >= 20, "the disk interrupted {first} and {second} times: the driver is not waiting for it");
+    }
+    kprintln!(
+        "[selftest] disk: blk and blkcheck, twice on one device - every check passed; {} interrupts passed to the driver; nothing leaked",
+        first + second
+    );
+}
+
 /// C: programs written in C, compiled by a compiler that knows nothing
 /// of this system, and linked with its C library. Each is started as
 /// the shell would start it - its arguments in a channel - and must

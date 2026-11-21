@@ -102,6 +102,11 @@ pub fn clock() -> u64 {
     tsc()
 }
 
+/// Called when a driver waits for an interrupt that was switched off
+/// when it fired. No line on the PC is: every device interrupts with a
+/// message (MSI-X), which is one event and needs no switching off.
+pub fn rearm_interrupt(_source: u32) {}
+
 pub fn clock_hz() -> u64 {
     platform::tsc_hz()
 }

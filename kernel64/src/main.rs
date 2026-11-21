@@ -305,10 +305,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
     selftest::run();
     arch::mmu::selftest();
 
-    // Devices: what is in the places the tree describes. Only looked
-    // at so far; drivers are programs, and come next.
+    // Devices: what is in the places the tree describes. Looking
+    // needs only memory; making one ready for a driver needs its
+    // interrupt, and so waits for the controller.
     kprintln!();
-    let _devices = mmio_devices::find(&machine);
+    let devices = mmio_devices::find(&machine);
 
     // Interrupts: the controller the tree describes, and the CPU's
     // own timer.
@@ -347,6 +348,10 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
             // The same, written in C.
             #[cfg(feature = "c-programs")]
             selftest::c();
+
+            // A device, driven by a program.
+            kprintln!();
+            selftest::disk(mmio_devices::first_disk(&devices));
         }
         None => kprintln!("[irq] the device tree describes no interrupt controller this kernel knows: no interrupts, no threads"),
     }

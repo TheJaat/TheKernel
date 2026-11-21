@@ -49,6 +49,11 @@ pub mod distributor {
     /// Version 2 only - one byte per interrupt: a bit for each CPU
     /// that may be given it.
     pub const TARGETS: usize = 0x800;
+    /// Two bits per interrupt: how its line says "now" (see `trigger`).
+    pub const CONFIG: usize = 0xC00;
+    /// Version 3 only - eight bytes per shared interrupt: the name of
+    /// the CPU it goes to, in the form of `route`.
+    pub const ROUTE: usize = 0x6000;
 
     /// Version 2: forward interrupts to the CPUs.
     pub const ENABLE: u32 = 1;
@@ -105,6 +110,27 @@ pub const ANY_PRIORITY: u32 = 0xFF;
 /// starting at `base`: the register's offset, and the bit as a mask.
 pub fn bit(base: usize, id: u32) -> (usize, u32) {
     (base + (id as usize / 32) * 4, 1 << (id % 32))
+}
+
+/// Where interrupt `id` says how its line is to be read: the
+/// register's offset, and the bit that means "edge".
+///
+/// A device asks for attention by raising a wire. The controller can
+/// read the wire two ways. *Level*: the interrupt is wanted for as
+/// long as the wire is up - so it must be kept from arriving again
+/// until someone has made the device lower it. *Edge*: the interrupt
+/// is wanted once each time the wire goes up - the controller
+/// remembers that it did, and a wire left up asks for nothing more.
+/// Which one a device means is in the machine's description.
+pub fn trigger(id: u32) -> (usize, u32) {
+    (distributor::CONFIG + (id as usize / 16) * 4, 0b10 << ((id % 16) * 2))
+}
+
+/// The value of a shared interrupt's ROUTE register that sends it to
+/// the CPU whose `MPIDR_EL1` is `mpidr`: the four parts of the CPU's
+/// name, where that register has them (bits 0-23 and 32-39).
+pub fn route(mpidr: u64) -> u64 {
+    mpidr & 0x0000_00FF_00FF_FFFF
 }
 
 /// Where interrupt `id`'s byte is among registers of one byte each
@@ -307,5 +333,25 @@ mod tests {
         assert_eq!(milliseconds(5, 0), 0);
         // Days of uptime must not overflow on the way.
         assert_eq!(milliseconds(u64::MAX, 1000), u64::MAX);
+    }
+
+    #[test]
+    fn where_an_interrupt_says_how_its_line_is_read() {
+        // Sixteen interrupts to a register, two bits each, the higher
+        // of the two meaning "edge".
+        assert_eq!(trigger(0), (0xC00, 0b10));
+        assert_eq!(trigger(15), (0xC00, 0b10 << 30));
+        assert_eq!(trigger(16), (0xC04, 0b10));
+        assert_eq!(trigger(79), (0xC00 + 4 * 4, 0b10 << 30)); // the last virtio place of QEMU's machine
+        assert_eq!(trigger(48), (0xC0C, 0b10));
+    }
+
+    #[test]
+    fn a_shared_interrupt_is_routed_by_the_cpus_name() {
+        // MPIDR has other bits set (31 always; 30 on a one-CPU machine).
+        assert_eq!(route(0x8000_0000), 0);
+        assert_eq!(route(0x0000_0000_8000_0003), 3);
+        assert_eq!(route(0x0000_0001_C000_0102), 0x0000_0001_0000_0102);
+        assert_eq!(distributor::ROUTE + 8 * 79, 0x6278);
     }
 }

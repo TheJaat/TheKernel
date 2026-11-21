@@ -38,6 +38,9 @@ pub static FSCHECK: &[u8] = program!("fscheck");
 pub static MEMRO: &[u8] = program!("memro");
 pub static HEAPCHECK: &[u8] = program!("heapcheck");
 pub static FOREVER: &[u8] = program!("forever");
+/// The disk driver: the same program for a disk on a PCI bus and one
+/// at a place in memory.
+pub static BLK: &[u8] = program!("blk");
 
 /// PC only: they use I/O ports, a segment register, or devices only
 /// the PC kernel knows how to hand out so far.
@@ -49,7 +52,6 @@ mod pc {
     pub static SHELL: &[u8] = program!("shell");
     pub static INIT: &[u8] = program!("init");
     pub static DISPLAY: &[u8] = program!("display");
-    pub static BLK: &[u8] = program!("blk");
     pub static REGISTRY: &[u8] = program!("registry");
 }
 #[cfg(target_arch = "x86_64")]
@@ -58,6 +60,10 @@ pub use pc::*;
 /// AArch64 only: it checks registers by name.
 #[cfg(target_arch = "aarch64")]
 pub static REGS: &[u8] = program!("regs");
+/// AArch64 only, so far: the disk driver's test. (The PC's disk holds
+/// the system's files, and is tested by using them.)
+#[cfg(target_arch = "aarch64")]
+pub static BLKCHECK: &[u8] = program!("blkcheck");
 
 /// C programs: compiled by Clang, linked with libc.a, and - on AArch64,
 /// which has no disk to keep them on yet - embedded like the rest.

@@ -691,6 +691,70 @@ impl PciDeviceInfo {
     }
 }
 
+/// A device at a fixed place in memory (virtio-mmio) that the kernel
+/// set up for a driver: these bytes, with handles to its resources -
+/// the memory its registers are in, DMA memory and, if `interrupt`,
+/// its interrupt.
+///
+/// A different length from `PciDeviceInfo`, on purpose: a driver that
+/// can be given either tells them apart by that alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MmioDeviceInfo {
+    /// What kind of device (virtio's numbering: 2 is a block device).
+    pub device: u32,
+    /// Which register interface: 1 legacy, 2 modern.
+    pub version: u32,
+    /// Where the registers are in physical memory, and how many bytes.
+    /// The registers handle maps whole pages, so in the mapping they
+    /// begin `registers % 4096` bytes in.
+    pub registers: u64,
+    pub registers_size: u32,
+    /// As in `PciDeviceInfo`.
+    pub dma_physical: u64,
+    pub dma_size: u64,
+    /// There is an interrupt handle. The driver must tell the device it
+    /// has seen each interrupt before it waits for the next.
+    pub interrupt: bool,
+}
+
+impl MmioDeviceInfo {
+    pub const SIZE: usize = 37;
+
+    /// Where the registers begin in a mapping of the registers handle.
+    pub const fn offset_in_page(&self) -> usize {
+        (self.registers % 4096) as usize
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0; Self::SIZE];
+        b[0..4].copy_from_slice(&self.device.to_le_bytes());
+        b[4..8].copy_from_slice(&self.version.to_le_bytes());
+        b[8..16].copy_from_slice(&self.registers.to_le_bytes());
+        b[16..20].copy_from_slice(&self.registers_size.to_le_bytes());
+        b[20..28].copy_from_slice(&self.dma_physical.to_le_bytes());
+        b[28..36].copy_from_slice(&self.dma_size.to_le_bytes());
+        b[36] = u8::from(self.interrupt);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<MmioDeviceInfo> {
+        if b.len() != Self::SIZE {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap_or([0; 4]));
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+        Some(MmioDeviceInfo {
+            device: u32_at(0),
+            version: u32_at(4),
+            registers: u64_at(8),
+            registers_size: u32_at(16),
+            dma_physical: u64_at(20),
+            dma_size: u64_at(28),
+            interrupt: b[36] != 0,
+        })
+    }
+}
+
 /// The block service's protocol: a disk as numbered 512-byte sectors.
 ///
 /// A request: [op] [sector: u64 LE] [data: one sector, for WRITE]
@@ -746,6 +810,32 @@ pub mod block {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_memory_mapped_device_survives_the_trip_through_bytes() {
+        use super::{MmioDeviceInfo, PciDeviceInfo};
+        // Every field different, and bigger than a byte where it can
+        // be, so that swapped or cut-off ones would show.
+        let info = MmioDeviceInfo {
+            device: 0x0102_0304,
+            version: 0x0506_0708,
+            registers: 0x1122_3344_0a00_3e00,
+            registers_size: 0x200,
+            dma_physical: 0x5566_7788_99aa_b000,
+            dma_size: 0x1_0000,
+            interrupt: true,
+        };
+        let bytes = info.to_bytes();
+        assert_eq!(MmioDeviceInfo::from_bytes(&bytes), Some(info));
+        assert_eq!(info.offset_in_page(), 0xe00);
+        // A wrong length is no description at all - and a PCI one is a
+        // wrong length, which is how a driver tells the two apart.
+        assert_eq!(MmioDeviceInfo::from_bytes(&bytes[..36]), None);
+        assert_eq!(MmioDeviceInfo::from_bytes(&[0; PciDeviceInfo::SIZE]), None);
+        assert_eq!(PciDeviceInfo::from_bytes(&bytes), None);
+        let off = MmioDeviceInfo { interrupt: false, ..info };
+        assert_eq!(MmioDeviceInfo::from_bytes(&off.to_bytes()), Some(off));
+    }
+
     #[test]
     fn system_info_survives_the_trip_through_words() {
         // Every field different, so that two swapped ones would show.

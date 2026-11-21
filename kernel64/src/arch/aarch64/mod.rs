@@ -204,6 +204,33 @@ pub unsafe fn init_interrupts(machine: &kernel64::devicetree::Machine) -> Option
 
 /// Interrupts that arrived and that nothing handles.
 static UNEXPECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many device interrupts were passed on to drivers.
+static DEVICE_INTERRUPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn device_interrupts() -> u64 {
+    DEVICE_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A line for the device interrupt the controller calls `id`, read as
+/// the machine's description says. It is not let through yet: that
+/// happens when a driver first waits for it. None if the controller
+/// has no such interrupt, or no line is left.
+pub fn device_interrupt(id: u32, edge: bool) -> Option<&'static crate::interrupts::InterruptLine> {
+    if !gic::has_shared(id) {
+        return None;
+    }
+    let line = crate::interrupts::allocate_device_line_for(id)?;
+    // Set up - how it is read, where it goes - and then off again
+    // until someone waits.
+    gic::enable_shared(id, edge);
+    gic::disable(id);
+    Some(line)
+}
+
+/// Lets device interrupt `id` through again: its driver is waiting.
+pub fn rearm_interrupt(id: u32) {
+    gic::enable(id);
+}
 
 /// Called from the vectors when the CPU's interrupt input is raised:
 /// ask the controller which, handle, say done - until it has no more.
@@ -214,6 +241,16 @@ fn interrupt() {
     while let Some((id, raw)) = gic::acknowledge() {
         if id == timer::interrupt() {
             timer::on_interrupt();
+        } else if gic::has_shared(id) && {
+            // A device's. Off first, then counted: its driver is a
+            // program, which will not have dealt with the device by
+            // the time this returns, and a line still raised would
+            // interrupt again at once, for ever. It comes back on
+            // when the driver waits again (`rearm_interrupt`).
+            gic::disable(id);
+            crate::interrupts::source_fired(id)
+        } {
+            DEVICE_INTERRUPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         } else {
             // Nothing else is enabled, so this should not happen. If
             // it does, say so once and silence the line: a device

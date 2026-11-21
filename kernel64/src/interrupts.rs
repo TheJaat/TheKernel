@@ -5,7 +5,7 @@
 //! device interrupted and wake its driver. Device drivers run in user
 //! mode; the kernel never touches their hardware.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::threads::WaitQueue;
 
@@ -63,14 +63,24 @@ pub fn ticks() -> u64 {
 /// (a PCI device's legacy pin) keeps interrupting until the device is
 /// serviced, so it would need masking here and unmasking by the
 /// driver's acknowledgement - which is why PCI devices get MSI-X.
+///
+/// For a line that does need it there is `source`: the interrupt
+/// controller's number for the line, or 0. When one is set, the
+/// handler switches the line off at the controller before it counts
+/// (`source_fired`), and the line is switched on again only when its
+/// driver comes back to wait - by which time the driver has dealt with
+/// the device. The interrupt cannot arrive a second time while the
+/// first is being handled in a program, whichever way the wire is
+/// read, and the kernel needs to know nothing about the device.
 pub struct InterruptLine {
     pending: AtomicU64,
     waiters: WaitQueue,
+    source: AtomicU32,
 }
 
 impl InterruptLine {
     const fn new() -> InterruptLine {
-        InterruptLine { pending: AtomicU64::new(0), waiters: WaitQueue::new() }
+        InterruptLine { pending: AtomicU64::new(0), waiters: WaitQueue::new(), source: AtomicU32::new(0) }
     }
 
     /// Fired and not yet waited for?
@@ -93,6 +103,13 @@ impl InterruptLine {
     /// waiting process is being killed.
     pub fn wait(&self) -> Option<u64> {
         loop {
+            // A line that was switched off when it fired: on again,
+            // now that its driver is ready for the next one. If the
+            // device has been asking meanwhile, it arrives at once.
+            let source = self.source.load(Ordering::Relaxed);
+            if source != 0 {
+                crate::arch::rearm_interrupt(source);
+            }
             if !self.waiters.wait_while(|| self.pending.load(Ordering::Relaxed) == 0) {
                 return None;
             }
@@ -117,6 +134,29 @@ static DEVICES_USED: AtomicUsize = AtomicUsize::new(0);
 pub fn allocate_device_line() -> Option<(usize, &'static InterruptLine)> {
     let n = DEVICES_USED.fetch_add(1, Ordering::Relaxed);
     DEVICES.get(n).map(|line| (n, line))
+}
+
+#[cfg(target_arch = "aarch64")]
+/// A free device line for the interrupt the controller calls `source`
+/// (not 0), which is to be switched off each time it fires.
+pub fn allocate_device_line_for(source: u32) -> Option<&'static InterruptLine> {
+    let (_, line) = allocate_device_line()?;
+    line.source.store(source, Ordering::Relaxed);
+    Some(line)
+}
+
+#[cfg(target_arch = "aarch64")]
+/// From the interrupt handler: the controller's interrupt `source`
+/// arrived, and the handler has switched it off. Counts it on its
+/// line; false if no line has that source.
+pub fn source_fired(source: u32) -> bool {
+    match DEVICES.iter().find(|line| line.source.load(Ordering::Relaxed) == source) {
+        Some(line) => {
+            line.fire();
+            true
+        }
+        None => false,
+    }
 }
 
 /// From the interrupt handler, for device line `n`.

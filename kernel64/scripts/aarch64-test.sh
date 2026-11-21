@@ -26,8 +26,19 @@
 #   notimer    a device tree that does not give the timer's interrupt
 #   disk       a virtio disk and a virtio source of random numbers: the
 #              kernel must find both among the thirty-two places the
-#              tree describes, and say what each is
-#   modern     the same disk, speaking the newer virtio interface
+#              tree describes, and say what each is. Then the disk is
+#              driven, by a program: the block driver, with a client
+#              that tests it - and afterwards the image file must hold
+#              exactly what was written, and nothing else changed
+#   disk-v3    the same with the other interrupt controller, entered at
+#              exception level 2
+#   disk-ro    a disk that may not be written: every write refused, the
+#              image untouched
+#   disk-level a device tree that says the disk's interrupt line is read
+#              by level - the kind that interrupts for ever unless it
+#              is switched off until its driver has answered the device
+#   modern     the same disk, speaking the newer virtio interface: found,
+#              and left alone - no driver speaks that yet
 #   reserved   device trees that keep some of the memory back: at the
 #              very start and the top of 512 MiB, and at the top of 6 GiB
 #   fault-*    kernels built to read through a null pointer, to read
@@ -172,6 +183,36 @@ boot() {
         need "$log" "\[selftest\] ipc: echo service and client - rights, transfer, backpressure, crash isolation; 0 channels left"
         need "$log" "\[selftest\] files: fs and fscheck, twice - every check passed, 0 channels and no frames left"
         need "$log" "\[selftest\] kill: spinning, yielding, sleeping, waiting and not yet started - each stopped within 3 ticks; nothing leaked"
+        # A disk, if the machine has one: DISK_TEST says what is to
+        # happen to the image DISK_IMAGE (6143 sectors of a pattern).
+        case "${DISK_TEST:-none}" in
+        none)
+            need "$log" "\[selftest\] disk: no block device a driver exists for - not run"
+            if grep -aq "\[blk\]" "$log"; then fail "a disk driver ran on a machine with no disk for it"; fi
+            ;;
+        written | untouched)
+            if [ "$DISK_TEST" = written ]; then
+                did="33 written at 100 and the last one"; mode=""; checks=348
+            else
+                did="read-only - every write refused"; mode=", read-only"; checks=340
+            fi
+            need "$log" "\[virtio\] 0xa003e00 block device: registers in the page at 0xa003000, 64 KiB DMA at 0x4[0-9a-f]+000, interrupt 79, off until its driver waits - ready for a driver"
+            need "$log" "\[blk\] virtio disk at 0xa003e00: 6143 sectors \(3071 KiB\)$mode, queue of 1024, interrupts"
+            need "$log" "\[blkcheck\] $checks checks, all passed: 6143 sectors, $did"
+            # Twice: the second driver takes over the device the first left.
+            [ "$(grep -ac "^\[blkcheck\] $checks checks, all passed" "$log")" -eq 2 ] || fail "the disk test did not run exactly twice"
+            [ "$(grep -ac '"blk" exited with code 0' "$log")" -eq 2 ] || fail "the driver did not end cleanly twice"
+            need "$log" "\[selftest\] disk: blk and blkcheck, twice on one device - every check passed; [0-9]{2,} interrupts passed to the driver; nothing leaked"
+            "$HERE/scripts/disk-pattern.py" check "$DISK_IMAGE" 6143 "$DISK_TEST" | sed 's/^/  /'
+            "$HERE/scripts/disk-pattern.py" check "$DISK_IMAGE" 6143 "$DISK_TEST" > /dev/null 2>&1 || fail "the disk image is not what the test should have left"
+            ;;
+        unrun)
+            # A disk no driver is started for: nothing may touch it.
+            if grep -aq "\[blk\]" "$log"; then fail "a disk driver ran on a machine with no disk for it"; fi
+            "$HERE/scripts/disk-pattern.py" check "$DISK_IMAGE" 6143 untouched | sed 's/^/  /'
+            "$HERE/scripts/disk-pattern.py" check "$DISK_IMAGE" 6143 untouched > /dev/null 2>&1 || fail "the disk image changed"
+            ;;
+        esac
         # The same from C: arguments, exit codes, arithmetic with
         # fractions done without the floating-point registers, the
         # library's strings and memory, printf.
@@ -215,7 +256,7 @@ boot() {
     # many found occupied as this machine was given devices.
     devices=${DEVICES:-0}
     need "$log" "\[virtio\] 32 places at 0xa000000 - 0xa004000: $devices with a device, $((32 - devices)) empty"
-    [ "$(grep -ac '^\[virtio\] 0x' "$log")" -eq "$devices" ] || fail "not exactly $devices virtio devices reported"
+    [ "$(grep -acE '^\[virtio\] 0x[0-9a-f]+: ' "$log")" -eq "$devices" ] || fail "not exactly $devices virtio devices reported"
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
     # What only this boot must also say: ALSO, a pattern on each line.
     if [ -n "${ALSO:-}" ]; then
@@ -323,17 +364,34 @@ bitmap 48 KiB at 0x40010000" job reserved boot reserved 1 512 1 2 hvc
 KEPT=16 CPU=cortex-a53 MEMORY=6G QEMU_ARGS="-dtb $OUT/reserved-high.dtb" ALSO="\[tree\] reserved    0x1bf000000 - 0x1c0000000" job reserved-high boot reserved-high 1 6144 1 2 hvc
 
 # Devices. A disk of 3 MiB less one sector - a size no default would
-# give - and a second device of another kind. QEMU fills the places
+# give - filled with a pattern (disk-pattern.py). QEMU fills the places
 # from the last one down, so the disk, named first, is in the last.
-head -c $((3 * 1048576 - 512)) /dev/zero > "$OUT/disk.img"
-DISK="-drive file=$OUT/disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
-DEVICES=2 QEMU_ARGS="$DISK -device virtio-rng-device" ALSO="\[virtio\] 0xa003e00: block device \(legacy interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)
+# Each boot has an image of its own: QEMU locks the file, the boots run
+# at once, and each is looked at afterwards for what its boot did.
+disk() {
+    "$HERE/scripts/disk-pattern.py" make "$OUT/$1.img" 6143
+    echo "-drive file=$OUT/$1.img,if=none,format=raw,id=d0${2:-} -device virtio-blk-device,drive=d0"
+}
+FOUND="\[virtio\] 0xa003e00: block device \(legacy interface\), 6143 sectors \(3071 KiB\), interrupt 79"
+DEVICES=2 DISK_TEST=written DISK_IMAGE="$OUT/disk.img" QEMU_ARGS="$(disk disk) -device virtio-rng-device" ALSO="$FOUND \(edge\)
 \[virtio\] 0xa003c00: source of random numbers \(legacy interface\), interrupt 78 \(edge\)" job disk boot disk 1 512 1 2 hvc
-# The same disk on a machine told to offer the newer interface.
-# (A copy: QEMU locks a disk image, and the two boots may run at once.)
-cp "$OUT/disk.img" "$OUT/disk-modern.img"
-DISK="-drive file=$OUT/disk-modern.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
-DEVICES=1 QEMU_ARGS="-global virtio-mmio.force-legacy=false $DISK" ALSO="\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)" job modern boot modern 1 512 1 2 hvc
+# The other interrupt controller: a shared interrupt has to be told
+# which CPU to go to in a different way.
+DEVICES=1 DISK_TEST=written DISK_IMAGE="$OUT/disk-v3.img" MACHINE=,virtualization=on,gic-version=3 QEMU_ARGS="$(disk disk-v3)" ALSO="$FOUND \(edge\)" job disk-v3 boot disk-v3 2 512 1 3 smc
+# A disk that may not be written.
+DEVICES=1 DISK_TEST=untouched DISK_IMAGE="$OUT/disk-ro.img" QEMU_ARGS="$(disk disk-ro ,readonly=on)" ALSO="$FOUND \(edge\)" job disk-ro boot disk-ro 1 512 1 2 hvc
+# The tree says "level" of the disk's interrupt (the third cell: 4,
+# where QEMU writes 1). The device does hold its line up until it is
+# answered, so the controller, believing the tree, would interrupt
+# again the moment the handler returned - unless the line is off until
+# the driver, a program, has answered.
+"$HERE/scripts/dtb-set.py" "$OUT/virt.dtb" "$OUT/level.dtb" virtio_mmio@a003e00 interrupts 0 0x2f 4
+DEVICES=1 DISK_TEST=written DISK_IMAGE="$OUT/disk-level.img" QEMU_ARGS="-dtb $OUT/level.dtb $(disk disk-level)" ALSO="$FOUND \(level\)" job disk-level boot disk-level 1 512 1 2 hvc
+# The same disk on a machine told to offer the newer interface: found,
+# said to have no driver, and not touched.
+DEVICES=1 DISK_TEST=unrun DISK_IMAGE="$OUT/modern.img" QEMU_ARGS="-global virtio-mmio.force-legacy=false $(disk modern)" ALSO="\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)
+\[virtio\] 0xa003e00 block device: the modern interface - no driver speaks it yet
+\[selftest\] disk: no block device a driver exists for - not run" job modern boot modern 1 512 1 2 hvc
 
 # ---- the faults -------------------------------------------------------
 job fault-null fault null "reading through a null pointer" "0x25: data abort" \
