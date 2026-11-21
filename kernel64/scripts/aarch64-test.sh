@@ -49,9 +49,26 @@ OUT="$BUILD/aarch64"
 mkdir -p "$OUT"
 
 failed=0
+# A check that did not hold. The boots run at once, each in a shell of
+# its own, so a variable would not reach the end of this script: a
+# failure is also a file, named after the boot.
 fail() {
     echo "  FAILED: $1"
     failed=1
+    if [ -n "${FAILFILE:-}" ]; then : > "$FAILFILE"; fi
+}
+
+# job NAME COMMAND...: runs one boot and its checks in the background,
+# keeping what it prints for the end, where the reports are shown in
+# the order the jobs were started. How many really run at once is not
+# decided here: every boot waits for a slot (boot-slots.sh).
+names=
+job() {
+    job_name=$1
+    shift
+    names="$names $job_name"
+    rm -f "$OUT/$job_name.failed"
+    ( FAILFILE="$OUT/$job_name.failed"; "$@" ) > "$OUT/$job_name.report" 2>&1 &
 }
 
 # need LOG PATTERN: the log must have a line matching the pattern.
@@ -200,6 +217,12 @@ boot() {
     need "$log" "\[virtio\] 32 places at 0xa000000 - 0xa004000: $devices with a device, $((32 - devices)) empty"
     [ "$(grep -ac '^\[virtio\] 0x' "$log")" -eq "$devices" ] || fail "not exactly $devices virtio devices reported"
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
+    # What only this boot must also say: ALSO, a pattern on each line.
+    if [ -n "${ALSO:-}" ]; then
+        printf '%s\n' "$ALSO" | while IFS= read -r pattern; do
+            need "$log" "$pattern"
+        done
+    fi
     [ "$(grep -ac 'breakpoint at' "$log")" -eq 1 ] || fail "the breakpoint was taken more than once"
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
         fail "the log has a panic, an exception or a failed check"
@@ -207,73 +230,6 @@ boot() {
     grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts\|frames free\|top of memory\|selftest\] timer" "$log" | sed 's/^/  /' | cut -c1-110
 }
 
-boot plain 1 512 1 2 hvc
-MACHINE=,virtualization=on boot el2 2 512 1 2 smc
-MACHINE=,virtualization=on,gic-version=3 boot el2v3 2 512 1 3 smc
-# 6 GiB: the end of memory is above 4 GiB, a number that needs both of
-# the two cells the tree gives it. And five of the six are out of the
-# kernel's reach while it builds its page tables: this is the boot that
-# has memory handed over in the second go.
-CPU=cortex-a53 MEMORY=6G boot a53 1 6144 1 2 hvc
-CPU=max MEMORY=128M MACHINE=,gic-version=3 boot max 1 128 1 3 hvc
-QEMU_ARGS="-smp 4" boot smp4 1 512 4 2 hvc
-
-# QEMU's memory starts as zeroes, which is exactly what the kernel's
-# first instructions are supposed to make of the memory after the image
-# (.bss: its tables, its stack, its variables). So a kernel that forgot
-# to would pass every boot above. This one puts random bytes there
-# first, as real memory after a restart would have.
-bss_start=$(( (file + 4095) / 4096 * 4096 ))
-head -c $((size - bss_start)) /dev/urandom > "$OUT/junk.bin"
-QEMU_ARGS="-device loader,file=$OUT/junk.bin,addr=$((0x40080000 + bss_start)),force-raw=on" boot dirty 1 512 1 2 hvc
-
-# Trees with something missing. QEMU writes out the tree it would make
-# (dumpdtb), a property is taken out of the copy, and QEMU is given the
-# copy to pass on (-dtb).
-qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -display none -machine dumpdtb="$OUT/virt.dtb" 2>/dev/null
-# Nobody says which serial port is the console: the first one is used.
-"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/unnamed.dtb" chosen stdout-path
-SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" boot unnamed 1 512 1 2 hvc
-# The serial port's clock is not given: the kernel must say it guessed.
-"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/clockless.dtb" pl011@9000000 clocks
-CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" boot clockless 1 512 1 2 hvc
-need "$OUT/clockless.log" "\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess"
-# The interrupt controller is one the kernel has never heard of (its
-# "compatible" is gone): no interrupts, said plainly, and no waiting.
-"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/nogic.dtb" intc@8000000 compatible
-QEMU_ARGS="-dtb $OUT/nogic.dtb" boot nogic 1 512 1 none hvc
-# The timer's interrupts are not given: the usual number is used.
-"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/notimer.dtb" timer interrupts
-TIMER="not described" QEMU_ARGS="-dtb $OUT/notimer.dtb" boot notimer 1 512 1 2 hvc
-# The loader keeps memory for itself: the top 16 MiB, and the first
-# 64 KiB - which is exactly where the kernel would otherwise put its
-# frame bitmap. The kernel must say so, have that much less, find its
-# highest free frame below the 16 MiB, and put the bitmap elsewhere.
-"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-top.dtb" 0x5f000000 0x1000000
-"$HERE/scripts/dtb-reserve.py" "$OUT/reserved-top.dtb" "$OUT/reserved.dtb" 0x40000000 0x10000
-KEPT=16 QEMU_ARGS="-dtb $OUT/reserved.dtb" boot reserved 1 512 1 2 hvc
-need "$OUT/reserved.log" "\[tree\] reserved    0x40000000 - 0x40010000"
-need "$OUT/reserved.log" "\[tree\] reserved    0x5f000000 - 0x60000000"
-need "$OUT/reserved.log" "bitmap 48 KiB at 0x40010000"
-# The same at the top of 6 GiB: memory the kernel is only given in the
-# second go, where what is reserved has to be taken out a second time.
-"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-high.dtb" 0x1bf000000 0x1000000
-KEPT=16 CPU=cortex-a53 MEMORY=6G QEMU_ARGS="-dtb $OUT/reserved-high.dtb" boot reserved-high 1 6144 1 2 hvc
-need "$OUT/reserved-high.log" "\[tree\] reserved    0x1bf000000 - 0x1c0000000"
-
-# Devices. A disk of 3 MiB less one sector - a size no default would
-# give - and a second device of another kind. QEMU fills the places
-# from the last one down, so the disk, named first, is in the last.
-head -c $((3 * 1048576 - 512)) /dev/zero > "$OUT/disk.img"
-DISK="-drive file=$OUT/disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
-DEVICES=2 QEMU_ARGS="$DISK -device virtio-rng-device" boot disk 1 512 1 2 hvc
-need "$OUT/disk.log" "\[virtio\] 0xa003e00: block device \(legacy interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)"
-need "$OUT/disk.log" "\[virtio\] 0xa003c00: source of random numbers \(legacy interface\), interrupt 78 \(edge\)"
-# The same disk on a machine told to offer the newer interface.
-DEVICES=1 QEMU_ARGS="-global virtio-mmio.force-legacy=false $DISK" boot modern 1 512 1 2 hvc
-need "$OUT/modern.log" "\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)"
-
-# ---- the faults -------------------------------------------------------
 # One build and one boot per fault. Each must be caught, named, and
 # end the kernel there.
 fault() {
@@ -295,17 +251,6 @@ fault() {
     grep -aE "$what" "$log" | cut -c1-110
 }
 
-fault null "reading through a null pointer" "0x25: data abort" \
-    "kernel read at 0x0: not mapped \(the level 0 table has no entry\)"
-fault page "forcing a page fault" "0x25: data abort" \
-    "kernel read at 0xffffffff00000000: not mapped \(the level 1 table has no entry\)"
-# The two below break the rules of the kernel's own image, as its own
-# page tables state them: a constant is written to, a variable is run.
-fault rodata "writing to read-only data" "0x25: data abort" \
-    "kernel write at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
-fault nx "executing data" "0x21: instruction abort" \
-    "kernel instruction fetch at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
-
 # overflow NAME ANNOUNCE WHOSE WHERE: a kernel that recurses until a
 # stack runs out. The report must name the stack, and the address must
 # be in the page below it.
@@ -325,8 +270,92 @@ overflow() {
     grep -a "STACK OVERFLOW\|kernel write at" "$log" | cut -c1-110
 }
 
-overflow stack "overflowing the boot stack" "the boot stack" "0xffffffff80[0-9a-f]+0[0-9a-f]{3}"
-overflow thread-stack "overflowing a thread's stack" "a thread's stack" "0xffffd800[0-9a-f]+0[0-9a-f]{3}"
+# ---- the ordinary boots ----------------------------------------------
+job plain boot plain 1 512 1 2 hvc
+MACHINE=,virtualization=on job el2 boot el2 2 512 1 2 smc
+MACHINE=,virtualization=on,gic-version=3 job el2v3 boot el2v3 2 512 1 3 smc
+# 6 GiB: the end of memory is above 4 GiB, a number that needs both of
+# the two cells the tree gives it. And five of the six are out of the
+# kernel's reach while it builds its page tables: this is the boot that
+# has memory handed over in the second go.
+CPU=cortex-a53 MEMORY=6G job a53 boot a53 1 6144 1 2 hvc
+CPU=max MEMORY=128M MACHINE=,gic-version=3 job max boot max 1 128 1 3 hvc
+QEMU_ARGS="-smp 4" job smp4 boot smp4 1 512 4 2 hvc
+
+# QEMU's memory starts as zeroes, which is exactly what the kernel's
+# first instructions are supposed to make of the memory after the image
+# (.bss: its tables, its stack, its variables). So a kernel that forgot
+# to would pass every boot above. This one puts random bytes there
+# first, as real memory after a restart would have.
+bss_start=$(( (file + 4095) / 4096 * 4096 ))
+head -c $((size - bss_start)) /dev/urandom > "$OUT/junk.bin"
+QEMU_ARGS="-device loader,file=$OUT/junk.bin,addr=$((0x40080000 + bss_start)),force-raw=on" job dirty boot dirty 1 512 1 2 hvc
+
+# Trees with something missing. QEMU writes out the tree it would make
+# (dumpdtb), a property is taken out of the copy, and QEMU is given the
+# copy to pass on (-dtb).
+qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -display none -machine dumpdtb="$OUT/virt.dtb" 2>/dev/null
+# Nobody says which serial port is the console: the first one is used.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/unnamed.dtb" chosen stdout-path
+SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" job unnamed boot unnamed 1 512 1 2 hvc
+# The serial port's clock is not given: the kernel must say it guessed.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/clockless.dtb" pl011@9000000 clocks
+CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" ALSO="\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess" job clockless boot clockless 1 512 1 2 hvc
+# The interrupt controller is one the kernel has never heard of (its
+# "compatible" is gone): no interrupts, said plainly, and no waiting.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/nogic.dtb" intc@8000000 compatible
+QEMU_ARGS="-dtb $OUT/nogic.dtb" job nogic boot nogic 1 512 1 none hvc
+# The timer's interrupts are not given: the usual number is used.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/notimer.dtb" timer interrupts
+TIMER="not described" QEMU_ARGS="-dtb $OUT/notimer.dtb" job notimer boot notimer 1 512 1 2 hvc
+# The loader keeps memory for itself: the top 16 MiB, and the first
+# 64 KiB - which is exactly where the kernel would otherwise put its
+# frame bitmap. The kernel must say so, have that much less, find its
+# highest free frame below the 16 MiB, and put the bitmap elsewhere.
+"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-top.dtb" 0x5f000000 0x1000000
+"$HERE/scripts/dtb-reserve.py" "$OUT/reserved-top.dtb" "$OUT/reserved.dtb" 0x40000000 0x10000
+KEPT=16 QEMU_ARGS="-dtb $OUT/reserved.dtb" ALSO="\[tree\] reserved    0x40000000 - 0x40010000
+\[tree\] reserved    0x5f000000 - 0x60000000
+bitmap 48 KiB at 0x40010000" job reserved boot reserved 1 512 1 2 hvc
+# The same at the top of 6 GiB: memory the kernel is only given in the
+# second go, where what is reserved has to be taken out a second time.
+"$HERE/scripts/dtb-reserve.py" "$OUT/virt.dtb" "$OUT/reserved-high.dtb" 0x1bf000000 0x1000000
+KEPT=16 CPU=cortex-a53 MEMORY=6G QEMU_ARGS="-dtb $OUT/reserved-high.dtb" ALSO="\[tree\] reserved    0x1bf000000 - 0x1c0000000" job reserved-high boot reserved-high 1 6144 1 2 hvc
+
+# Devices. A disk of 3 MiB less one sector - a size no default would
+# give - and a second device of another kind. QEMU fills the places
+# from the last one down, so the disk, named first, is in the last.
+head -c $((3 * 1048576 - 512)) /dev/zero > "$OUT/disk.img"
+DISK="-drive file=$OUT/disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+DEVICES=2 QEMU_ARGS="$DISK -device virtio-rng-device" ALSO="\[virtio\] 0xa003e00: block device \(legacy interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)
+\[virtio\] 0xa003c00: source of random numbers \(legacy interface\), interrupt 78 \(edge\)" job disk boot disk 1 512 1 2 hvc
+# The same disk on a machine told to offer the newer interface.
+# (A copy: QEMU locks a disk image, and the two boots may run at once.)
+cp "$OUT/disk.img" "$OUT/disk-modern.img"
+DISK="-drive file=$OUT/disk-modern.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+DEVICES=1 QEMU_ARGS="-global virtio-mmio.force-legacy=false $DISK" ALSO="\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)" job modern boot modern 1 512 1 2 hvc
+
+# ---- the faults -------------------------------------------------------
+job fault-null fault null "reading through a null pointer" "0x25: data abort" \
+    "kernel read at 0x0: not mapped \(the level 0 table has no entry\)"
+job fault-page fault page "forcing a page fault" "0x25: data abort" \
+    "kernel read at 0xffffffff00000000: not mapped \(the level 1 table has no entry\)"
+# The two below break the rules of the kernel's own image, as its own
+# page tables state them: a constant is written to, a variable is run.
+job fault-rodata fault rodata "writing to read-only data" "0x25: data abort" \
+    "kernel write at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
+job fault-nx fault nx "executing data" "0x21: instruction abort" \
+    "kernel instruction fetch at 0xffffffff80[0-9a-f]{6}: protection violation \(at level 3\)"
+
+job fault-stack overflow stack "overflowing the boot stack" "the boot stack" "0xffffffff80[0-9a-f]+0[0-9a-f]{3}"
+job fault-thread-stack overflow thread-stack "overflowing a thread's stack" "a thread's stack" "0xffffd800[0-9a-f]+0[0-9a-f]{3}"
+
+# ---- the reports ------------------------------------------------------
+wait
+for name in $names; do
+    cat "$OUT/$name.report"
+    if [ -e "$OUT/$name.failed" ]; then failed=1; fi
+done
 
 if [ $failed -ne 0 ]; then
     echo "aarch64-test: FAILED (logs in $OUT)"

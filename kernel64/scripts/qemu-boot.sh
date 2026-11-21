@@ -23,6 +23,13 @@
 
 set -u
 
+# Boots are timed, so no more of them may run at once than the host has
+# CPUs for: wait for a slot first (boot-slots.sh, which then runs this
+# script again). One slot for each CPU of the machine.
+if [ -z "${TAAJ_BOOT_HELD:-}" ]; then
+    exec "$(dirname "$0")/boot-slots.sh" "${SMP:-4}" "$0" "$@"
+fi
+
 ISO=$1
 LOG=$2
 LIMIT=${3:-20}

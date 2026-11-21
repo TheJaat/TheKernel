@@ -18,6 +18,13 @@
 
 set -u
 
+# Boots are timed, so no more of them may run at once than the host has
+# CPUs for: wait for a slot first (boot-slots.sh, which then runs this
+# script again). The kernel uses one CPU so far, whatever the machine has.
+if [ -z "${TAAJ_BOOT_HELD:-}" ]; then
+    exec "$(dirname "$0")/boot-slots.sh" 1 "$0" "$@"
+fi
+
 IMAGE=$1
 LOG=$2
 LIMIT=${3:-20}
