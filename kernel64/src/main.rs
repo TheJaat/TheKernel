@@ -201,9 +201,16 @@ mod no_heap {
 #[no_mangle]
 extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> ! {
     use kernel64::aarch64::{cpu_name, physical_bits, KERNEL_WINDOW, TEXT_OFFSET};
-    use kernel64::devicetree::Header;
+    use kernel64::devicetree::{Machine, Tree};
 
-    arch::init_early_console();
+    // The device tree first, and silently: it says where the serial
+    // port is, so nothing can be said until it has been read.
+    let tree = arch::device_tree(device_tree).map(Tree::new);
+    let machine = match &tree {
+        Some(Ok(tree)) => Machine::read(tree),
+        _ => Machine::default(),
+    };
+    let console_from_tree = arch::init_early_console(machine.serial);
 
     kprintln!();
     kprintln!("Hello from TheTaaJ!");
@@ -228,15 +235,14 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
         KERNEL_WINDOW + TEXT_OFFSET
     );
 
-    match arch::device_tree_header(device_tree).map(Header::parse) {
-        Some(Ok(header)) => kprintln!(
-            "[boot] device tree at {device_tree:#x}: {} bytes, version {}, boot CPU {}",
-            header.total_size,
-            header.version,
-            header.boot_cpu
-        ),
-        Some(Err(error)) => kprintln!("[boot] at {device_tree:#x} the loader left {error}"),
-        None => kprintln!("[boot] no device tree: the loader passed {device_tree:#x}"),
+    kprintln!();
+    match &tree {
+        Some(Ok(tree)) => report_machine(device_tree, tree, &machine),
+        Some(Err(error)) => kprintln!("[tree] at {device_tree:#x} the loader left {error}"),
+        None => kprintln!("[tree] no device tree: the loader passed {device_tree:#x}"),
+    }
+    if !console_from_tree {
+        kprintln!("[tree] no serial port with a clock described: using the one QEMU's virt machine has, as a guess");
     }
 
     #[cfg(feature = "fault-page")]
@@ -250,6 +256,72 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64) -> 
     kprintln!();
     kprintln!("[kernel] this is as far as the AArch64 port goes - halting");
     arch::halt_forever()
+}
+
+/// Prints what the device tree said about the machine.
+#[cfg(target_arch = "aarch64")]
+fn report_machine(address: u64, tree: &kernel64::devicetree::Tree, machine: &kernel64::devicetree::Machine) {
+    use kernel64::devicetree::{FirmwareCall, Machine};
+
+    kprintln!(
+        "[tree] device tree at {address:#x}: {} bytes, version {}, {} nodes, the deepest {} down",
+        tree.header.total_size,
+        tree.header.version,
+        machine.nodes,
+        machine.deepest
+    );
+    if let Some(model) = machine.model {
+        kprintln!("[tree] machine     {model:?}");
+    }
+    for range in machine.memory() {
+        kprintln!(
+            "[tree] memory      {:#x} - {:#x} ({} MiB)",
+            range.start,
+            range.start + range.size,
+            range.size / (1024 * 1024)
+        );
+    }
+    if machine.memory_count > Machine::MEMORY_MAX {
+        kprintln!("[tree]             and {} more ranges, not kept", machine.memory_count - Machine::MEMORY_MAX);
+    }
+    for range in tree.reserved() {
+        kprintln!("[tree] reserved    {:#x} - {:#x}", range.start, range.start + range.size);
+    }
+    kprintln!("[tree] cpus        {}, with ids {:x?}", machine.cpu_count, machine.cpus());
+    match machine.serial {
+        Some(serial) => {
+            kprintln!(
+                "[tree] serial      PL011 at {:#x}, {}",
+                serial.registers.start,
+                if serial.chosen { "named as the console" } else { "the first one found" }
+            );
+            match serial.clock_hz {
+                Some(clock) => kprintln!("[tree]             its clock runs at {clock} Hz"),
+                None => kprintln!("[tree]             its clock is not given"),
+            }
+        }
+        None => kprintln!("[tree] serial      none that this kernel knows"),
+    }
+    match machine.interrupt_controller {
+        Some(gic) => kprintln!(
+            "[tree] interrupts  GIC version {}: shared part at {:#x}, per-CPU part at {:#x}",
+            gic.version,
+            gic.distributor.start,
+            gic.per_cpu.start
+        ),
+        None => kprintln!("[tree] interrupts  no controller that this kernel knows"),
+    }
+    match machine.timer_interrupts {
+        [Some(secure), Some(physical), Some(virtual_), Some(hypervisor)] => kprintln!(
+            "[tree] timer       interrupts {secure} (secure), {physical} (physical), {virtual_} (virtual), {hypervisor} (hypervisor)"
+        ),
+        _ => kprintln!("[tree] timer       not described"),
+    }
+    match machine.firmware_call {
+        Some(FirmwareCall::Hvc) => kprintln!("[tree] firmware    called with hvc"),
+        Some(FirmwareCall::Smc) => kprintln!("[tree] firmware    called with smc"),
+        None => kprintln!("[tree] firmware    no way to call it described"),
+    }
 }
 
 /// Only in a `big-image` build: the kernel carries 768 KiB it does not

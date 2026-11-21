@@ -14,18 +14,25 @@ mod vectors;
 use core::arch::asm;
 
 /// Where QEMU's `virt` machine has its serial port, and the clock that
-/// port counts from. Fixed numbers, for one machine: the right way to
-/// learn both is from the device tree, which the kernel cannot read
-/// yet.
+/// port counts from. Used only when the device tree does not say: a
+/// guess, which is right on that one machine and may be anything on
+/// another - but a kernel with no tree and no console could not even
+/// say that it has no tree.
 const QEMU_VIRT_UART: u64 = 0x0900_0000;
 const QEMU_VIRT_UART_CLOCK: u32 = 24_000_000;
 
-/// Sets up the earliest output there is: the serial port.
-pub fn init_early_console() {
-    let registers = mmu::map_early_device(QEMU_VIRT_UART);
-    // SAFETY: on the virt machine a PL011 is at that address, just
-    // mapped as device memory; this is called once, first thing.
-    unsafe { pl011::init(registers, QEMU_VIRT_UART_CLOCK) };
+/// Sets up the earliest output there is: the serial port the device
+/// tree described. Returns false if it described none (or none whose
+/// clock it gave) and the guess above was used for what was missing.
+pub fn init_early_console(serial: Option<kernel64::devicetree::Serial>) -> bool {
+    let address = serial.map(|serial| serial.registers.start);
+    let clock = serial.and_then(|serial| serial.clock_hz);
+    let registers = mmu::map_early_device(address.unwrap_or(QEMU_VIRT_UART));
+    // SAFETY: the tree (or, failing it, the virt machine's layout) says
+    // a PL011 is at that address, just mapped as device memory; this is
+    // called once, before anything is printed.
+    unsafe { pl011::init(registers, clock.unwrap_or(QEMU_VIRT_UART_CLOCK)) };
+    address.is_some() && clock.is_some()
 }
 
 pub fn console_write(text: &str) {
@@ -121,20 +128,38 @@ pub fn report() -> Report {
     Report { cpu_id, level: level >> 2, physical_range: features & 0xF }
 }
 
-/// The first bytes of the device tree the loader left at `physical`,
-/// or None if that cannot be an address of one.
+/// The device tree the loader left at `physical`, as bytes - or None
+/// if that cannot be the address of one, or the bytes there do not
+/// begin as one does.
 ///
-/// Read through the low mapping entry.rs made for the purpose, which
-/// covers the tree only if it lies below 512 GiB.
-pub fn device_tree_header(physical: u64) -> Option<&'static [u8; kernel64::devicetree::HEADER_SIZE]> {
-    // The loader's contract: 8-byte aligned. Zero means "none".
+/// Read through the low mapping entry.rs made for the purpose: the one
+/// GiB the address is in. A tree that runs over the end of that GiB is
+/// refused rather than read into memory that is not mapped.
+pub fn device_tree(physical: u64) -> Option<&'static [u8]> {
+    use kernel64::devicetree::{Header, HEADER_SIZE};
+    const GIB: u64 = 1 << 30;
+
+    // The loader's contract: 8-byte aligned. Zero means "none". And
+    // entry.rs mapped nothing above 512 GiB.
     if physical == 0 || !physical.is_multiple_of(8) || physical >> 39 != 0 {
         return None;
     }
+    let room = GIB - physical % GIB;
+    if room < HEADER_SIZE as u64 {
+        return None;
+    }
     // SAFETY: entry.rs mapped the GiB this address is in to itself, as
-    // readable memory, and nothing writes there: the loader put the
-    // tree in memory the kernel has not touched.
-    Some(unsafe { &*(physical as *const [u8; kernel64::devicetree::HEADER_SIZE]) })
+    // readable memory, and the forty bytes are inside it. Nothing
+    // writes there: the loader put the tree in memory the kernel has
+    // not touched.
+    let header = unsafe { &*(physical as *const [u8; HEADER_SIZE]) };
+    let size = u64::from(Header::parse(header).ok()?.total_size);
+    if size > room {
+        return None;
+    }
+    // SAFETY: as above, for the whole of the blob - which the header,
+    // now known to be a device tree's, says is `size` bytes.
+    Some(unsafe { core::slice::from_raw_parts(physical as *const u8, size as usize) })
 }
 
 /// Deliberately faults, for checking the handlers. Only built with one

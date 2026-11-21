@@ -25,7 +25,7 @@ mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub use self::aarch64::{
-    breakpoint, console_write, console_write_bytes, device_tree_header, disable_interrupts, halt_forever, init_cpu,
+    breakpoint, console_write, console_write_bytes, device_tree, disable_interrupts, halt_forever, init_cpu,
     init_early_console, report, restore_interrupts, stop_other_cpus,
 };
 

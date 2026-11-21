@@ -13,6 +13,8 @@
 #   a53, max   other CPUs, with other sizes of physical address
 #   smp4       four CPUs, of which the kernel so far uses one
 #   dirty      random bytes in the memory the kernel must zero itself
+#   unnamed    a device tree that does not say which serial port to use
+#   clockless  a device tree that does not give the serial port's clock
 #   fault      a kernel built to read unmapped memory: the exception
 #              must be caught and named
 
@@ -56,11 +58,19 @@ file=$(wc -c < "$OUT/Image")
 echo "  $file bytes in the file, $size in memory"
 
 # ---- boots ------------------------------------------------------------
-# boot NAME LEVEL: runs the image (with whatever MACHINE, CPU and
-# QEMU_ARGS say) and checks every line an ordinary boot must print.
+# boot NAME LEVEL MEMORY CPUS GIC CALL: runs the image (with whatever
+# MACHINE, CPU, MEMORY and QEMU_ARGS say) and checks every line an
+# ordinary boot must print - including what the kernel read from the
+# device tree, which must be what this machine was made with: MEMORY in
+# MiB, how many CPUS, which version of interrupt controller, and the
+# instruction that calls the firmware.
 boot() {
     name=$1
     level=$2
+    mib=$3
+    cpus=$4
+    gic=$5
+    call=$6
     log="$OUT/$name.log"
     echo "aarch64: boot '$name'"
     if ! "$HERE/scripts/aarch64-boot.sh" "$OUT/Image" "$log"; then
@@ -74,20 +84,34 @@ boot() {
     need "$log" "\[cpu\] resumed after the breakpoint"
     need "$log" "at exception level 1; the loader entered at level $level"
     need "$log" "the kernel loaded at 0x4[0-9a-f]*80000 and running at 0xffffffff80080000"
-    need "$log" "\[boot\] device tree at 0x4[0-9a-f]+: [0-9]+ bytes, version 17, boot CPU 0"
+    need "$log" "\[tree\] device tree at 0x4[0-9a-f]+: [0-9]+ bytes, version 17, [0-9]+ nodes"
+    need "$log" "\[tree\] machine     \"linux,dummy-virt\""
+    need "$log" "\[tree\] memory      0x40000000 - 0x[0-9a-f]+ \($mib MiB\)"
+    need "$log" "\[tree\] cpus        $cpus, with ids \[0[, 0-9]*\]"
+    need "$log" "\[tree\] serial      PL011 at 0x9000000, ${SERIAL:-named as the console}"
+    need "$log" "\[tree\]             its clock ${CLOCK:-runs at 24000000 Hz}"
+    need "$log" "\[tree\] interrupts  GIC version $gic: shared part at 0x8000000, per-CPU part at 0x80[1a]0000"
+    need "$log" "\[tree\] timer       interrupts 29 \(secure\), 30 \(physical\), 27 \(virtual\), 26 \(hypervisor\)"
+    need "$log" "\[tree\] firmware    called with $call"
+    [ "$(grep -ac '^\[tree\] memory' "$log")" -eq 1 ] || fail "more than one memory range"
+    if [ -z "${CLOCK:-}" ] && grep -aq "as a guess" "$log"; then
+        fail "the serial port was guessed though the tree describes it"
+    fi
     need "$log" "\[kernel\] this is as far as the AArch64 port goes - halting"
     [ "$(grep -ac 'breakpoint at' "$log")" -eq 1 ] || fail "the breakpoint was taken more than once"
     if grep -aEq "PANIC|EXCEPTION|FAILED" "$log"; then
         fail "the log has a panic, an exception or a failed check"
     fi
-    grep -a "^\[cpu\] .* bits of physical\|entered at" "$log" | sed 's/^/  /' | cut -c1-110
+    grep -a "entered at\|^\[tree\] memory\|^\[tree\] cpus\|^\[tree\] interrupts" "$log" | sed 's/^/  /' | cut -c1-110
 }
 
-boot plain 1
-MACHINE=,virtualization=on boot el2 2
-CPU=cortex-a53 MEMORY=1G boot a53 1
-CPU=max MEMORY=128M MACHINE=,gic-version=3 boot max 1
-QEMU_ARGS="-smp 4" boot smp4 1
+boot plain 1 512 1 2 hvc
+MACHINE=,virtualization=on boot el2 2 512 1 2 smc
+# 6 GiB: the end of memory is above 4 GiB, a number that needs both of
+# the two cells the tree gives it.
+CPU=cortex-a53 MEMORY=6G boot a53 1 6144 1 2 hvc
+CPU=max MEMORY=128M MACHINE=,gic-version=3 boot max 1 128 1 3 hvc
+QEMU_ARGS="-smp 4" boot smp4 1 512 4 2 hvc
 
 # QEMU's memory starts as zeroes, which is exactly what the kernel's
 # first instructions are supposed to make of the memory after the image
@@ -96,7 +120,19 @@ QEMU_ARGS="-smp 4" boot smp4 1
 # first, as real memory after a restart would have.
 bss_start=$(( (file + 4095) / 4096 * 4096 ))
 head -c $((size - bss_start)) /dev/urandom > "$OUT/junk.bin"
-QEMU_ARGS="-device loader,file=$OUT/junk.bin,addr=$((0x40080000 + bss_start)),force-raw=on" boot dirty 1
+QEMU_ARGS="-device loader,file=$OUT/junk.bin,addr=$((0x40080000 + bss_start)),force-raw=on" boot dirty 1 512 1 2 hvc
+
+# Trees with something missing. QEMU writes out the tree it would make
+# (dumpdtb), a property is taken out of the copy, and QEMU is given the
+# copy to pass on (-dtb).
+qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -display none -machine dumpdtb="$OUT/virt.dtb" 2>/dev/null
+# Nobody says which serial port is the console: the first one is used.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/unnamed.dtb" chosen stdout-path
+SERIAL="the first one found" QEMU_ARGS="-dtb $OUT/unnamed.dtb" boot unnamed 1 512 1 2 hvc
+# The serial port's clock is not given: the kernel must say it guessed.
+"$HERE/scripts/dtb-without.py" "$OUT/virt.dtb" "$OUT/clockless.dtb" pl011@9000000 clocks
+CLOCK="is not given" QEMU_ARGS="-dtb $OUT/clockless.dtb" boot clockless 1 512 1 2 hvc
+need "$OUT/clockless.log" "\[tree\] no serial port with a clock described: using the one QEMU's virt machine has, as a guess"
 
 # ---- the fault --------------------------------------------------------
 echo "aarch64: boot 'fault' (a read of unmapped memory)"
