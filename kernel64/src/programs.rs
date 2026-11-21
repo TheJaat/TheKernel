@@ -43,6 +43,8 @@ pub static FOREVER: &[u8] = program!("forever");
 pub static BLK: &[u8] = program!("blk");
 /// The network card's driver: likewise one program for both.
 pub static NIC: &[u8] = program!("nic");
+/// The network service: the protocols, and who has which port.
+pub static NET: &[u8] = program!("net");
 
 /// The system's own programs: the first process, and what it starts.
 pub static INIT: &[u8] = program!("init");
@@ -106,6 +108,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("fs", FS),
     ("blk", BLK),
     ("nic", NIC),
+    ("net", NET),
     ("registry", REGISTRY),
     ("echod", ECHOD),
     ("echoc", ECHOC),
@@ -122,6 +125,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("fs", FS),
     ("blk", BLK),
     ("nic", NIC),
+    ("net", NET),
     ("registry", REGISTRY),
     ("echod", ECHOD),
     ("echoc", ECHOC),

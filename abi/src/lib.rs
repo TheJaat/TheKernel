@@ -831,8 +831,13 @@ pub mod block {
 ///                        fresh channel, and the reply `[status]
 ///                        [payload]` comes back on it
 ///   LISTEN               one handle: a channel the driver is to send
-///                        every frame it receives on, from now on (in
-///                        place of whoever listened before). No reply
+///                        frames it receives on, from now on. Followed
+///                        by up to four frame types (u16 each, most
+///                        significant byte first, as in a frame): only
+///                        frames of those types. With none: every
+///                        frame nobody else asked for by type. Whoever
+///                        listened for the same before listens no
+///                        longer (`Listeners` has the rule). No reply
 ///   PART, LAST           a frame to send. No handle and no reply: a
 ///                        network may lose a frame anyway, and a reply
 ///                        per frame would double the cost of each. What
@@ -1003,11 +1008,215 @@ pub mod nic {
         }
     }
 
+    /// Most frame types one LISTEN may name, and most listeners the
+    /// driver keeps at once.
+    pub const LISTEN_TYPES_MAX: usize = 4;
+    pub const LISTENERS_MAX: usize = 4;
+
+    /// The type of a frame: bytes 12 and 13, which say what its payload
+    /// is (0x0800: an IPv4 packet).
+    pub fn frame_type(frame: &[u8]) -> Option<u16> {
+        Some(u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]))
+    }
+
+    /// The types a LISTEN names: what follows its first byte. None if
+    /// that is not a list of at most LISTEN_TYPES_MAX types.
+    pub fn listen_types(payload: &[u8]) -> Option<([u16; LISTEN_TYPES_MAX], usize)> {
+        if !payload.len().is_multiple_of(2) || payload.len() > 2 * LISTEN_TYPES_MAX {
+            return None;
+        }
+        let mut types = [0u16; LISTEN_TYPES_MAX];
+        for (kind, bytes) in types.iter_mut().zip(payload.as_chunks::<2>().0) {
+            *kind = u16::from_be_bytes(*bytes);
+        }
+        Some((types, payload.len() / 2))
+    }
+
+    /// One listener: who (for the driver, a channel), and for what.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Listener<H> {
+        pub who: H,
+        types: [u16; LISTEN_TYPES_MAX],
+        /// How many of `types` count. None: every frame no one else
+        /// asked for by type.
+        count: usize,
+        /// It was sent the first piece of a frame and not the last: it
+        /// must be told to forget it (DROP) before the next.
+        pub torn: bool,
+    }
+
+    impl<H> Listener<H> {
+        fn wants(&self, kind: u16) -> bool {
+            self.types[..self.count].contains(&kind)
+        }
+    }
+
+    /// Who gets which frames. A frame goes to the listener that named
+    /// its type; if none did, to the one that named none.
+    ///
+    /// A new listener takes over what it asks for: a type it names is
+    /// taken from whoever had it, and a listener left with nothing -
+    /// or an older one that also named no types - is closed. So a
+    /// program that starts again simply asks again, and one that
+    /// listens for a type of its own disturbs nobody.
+    pub struct Listeners<H: Copy, const N: usize> {
+        slots: [Option<Listener<H>>; N],
+    }
+
+    impl<H: Copy, const N: usize> Listeners<H, N> {
+        pub fn new() -> Self {
+            Listeners { slots: [None; N] }
+        }
+
+        /// Adds a listener for `types` (at most LISTEN_TYPES_MAX are
+        /// looked at). `closed` is called for every listener this
+        /// ends, and for `who` itself if there is no room - false is
+        /// returned then.
+        pub fn add(&mut self, who: H, types: &[u16], mut closed: impl FnMut(H)) -> bool {
+            let count = types.len().min(LISTEN_TYPES_MAX);
+            let mut mine = [0u16; LISTEN_TYPES_MAX];
+            mine[..count].copy_from_slice(&types[..count]);
+            for slot in &mut self.slots {
+                let Some(old) = slot else { continue };
+                let ended = if old.count == 0 {
+                    count == 0
+                } else {
+                    // Keep the types the new one did not name.
+                    let mut kept = 0;
+                    for n in 0..old.count {
+                        if !mine[..count].contains(&old.types[n]) {
+                            old.types[kept] = old.types[n];
+                            kept += 1;
+                        }
+                    }
+                    old.count = kept;
+                    kept == 0
+                };
+                if ended {
+                    closed(old.who);
+                    *slot = None;
+                }
+            }
+            match self.slots.iter_mut().find(|slot| slot.is_none()) {
+                Some(slot) => {
+                    *slot = Some(Listener { who, types: mine, count, torn: false });
+                    true
+                }
+                None => {
+                    closed(who);
+                    false
+                }
+            }
+        }
+
+        /// The listener a frame of type `kind` goes to, if any.
+        pub fn find(&mut self, kind: u16) -> Option<&mut Listener<H>> {
+            let by_type = self.slots.iter().position(|slot| slot.as_ref().is_some_and(|listener| listener.wants(kind)));
+            let found = by_type.or_else(|| self.slots.iter().position(|slot| slot.as_ref().is_some_and(|listener| listener.count == 0)))?;
+            self.slots[found].as_mut()
+        }
+
+        /// Forgets the listener `who` (it has gone). True if it was one.
+        pub fn remove(&mut self, who: H) -> bool
+        where
+            H: PartialEq,
+        {
+            let mut found = false;
+            for slot in &mut self.slots {
+                if slot.as_ref().is_some_and(|listener| listener.who == who) {
+                    *slot = None;
+                    found = true;
+                }
+            }
+            found
+        }
+
+        pub fn count(&self) -> usize {
+            self.slots.iter().flatten().count()
+        }
+    }
+
+    impl<H: Copy, const N: usize> Default for Listeners<H, N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         extern crate std;
         use std::vec::Vec;
+
+        #[test]
+        fn a_frame_goes_to_whoever_named_its_type() {
+            let mut listeners = Listeners::<u32, 4>::new();
+            let mut closed = Vec::new();
+            assert!(listeners.find(0x0800).is_none());
+            assert!(listeners.add(1, &[], |who| closed.push(who)));
+            assert_eq!(listeners.find(0x0800).map(|l| l.who), Some(1), "no types named: everything");
+            assert!(listeners.add(2, &[0x0800, 0x0806], |who| closed.push(who)));
+            assert_eq!(listeners.find(0x0800).map(|l| l.who), Some(2));
+            assert_eq!(listeners.find(0x0806).map(|l| l.who), Some(2));
+            assert_eq!(listeners.find(0x88B5).map(|l| l.who), Some(1), "what nobody named");
+            assert!(closed.is_empty());
+
+            // A type taken over: the old listener keeps its other one.
+            assert!(listeners.add(3, &[0x0806], |who| closed.push(who)));
+            assert_eq!(listeners.find(0x0806).map(|l| l.who), Some(3));
+            assert_eq!(listeners.find(0x0800).map(|l| l.who), Some(2));
+            assert!(closed.is_empty());
+            // And then its last: it is closed.
+            assert!(listeners.add(4, &[0x0800], |who| closed.push(who)));
+            assert_eq!(closed, [2]);
+            assert_eq!(listeners.find(0x0800).map(|l| l.who), Some(4));
+            // A second listener for everything else replaces the first,
+            // and nobody who named a type.
+            assert!(listeners.add(5, &[], |who| closed.push(who)));
+            assert_eq!(closed, [2, 1]);
+            assert_eq!(listeners.find(0x1234).map(|l| l.who), Some(5));
+            assert_eq!(listeners.find(0x0806).map(|l| l.who), Some(3));
+            assert_eq!(listeners.count(), 3);
+        }
+
+        #[test]
+        fn listeners_come_and_go() {
+            let mut listeners = Listeners::<u32, 2>::new();
+            let mut closed = Vec::new();
+            assert!(listeners.add(1, &[1], |who| closed.push(who)));
+            assert!(listeners.add(2, &[2], |who| closed.push(who)));
+            // No room: the newcomer is the one turned away.
+            assert!(!listeners.add(3, &[3], |who| closed.push(who)));
+            assert_eq!(closed, [3]);
+            assert_eq!(listeners.find(3).map(|l| l.who), None);
+            // Unless it takes someone's place.
+            assert!(listeners.add(4, &[2], |who| closed.push(who)));
+            assert_eq!(closed, [3, 2]);
+            assert!(listeners.remove(1));
+            assert!(!listeners.remove(1));
+            assert_eq!(listeners.find(1).map(|l| l.who), None);
+            assert_eq!(listeners.count(), 1);
+            // What a listener is told is remembered with it.
+            listeners.find(2).unwrap().torn = true;
+            assert!(listeners.find(2).unwrap().torn);
+            // More types than can be named: the first four count.
+            assert!(listeners.add(9, &[10, 11, 12, 13, 14], |who| closed.push(who)));
+            assert_eq!(listeners.find(13).map(|l| l.who), Some(9));
+            assert_eq!(listeners.find(14).map(|l| l.who), None);
+        }
+
+        #[test]
+        fn the_types_of_a_listen_and_of_a_frame() {
+            assert_eq!(listen_types(&[]), Some(([0; 4], 0)));
+            assert_eq!(listen_types(&[0x08, 0x00, 0x08, 0x06]), Some(([0x0800, 0x0806, 0, 0], 2)));
+            assert_eq!(listen_types(&[1, 2, 3, 4, 5, 6, 7, 8]).map(|(_, count)| count), Some(4));
+            assert_eq!(listen_types(&[0x08]), None);
+            assert_eq!(listen_types(&[0; 10]), None);
+            let mut frame = [0u8; 14];
+            frame[12..].copy_from_slice(&[0x88, 0xB5]);
+            assert_eq!(frame_type(&frame), Some(0x88B5));
+            assert_eq!(frame_type(&frame[..13]), None);
+        }
 
         fn pattern(length: usize) -> Vec<u8> {
             (0..length).map(|i| (i * 7 + (i >> 8)) as u8).collect()
@@ -1125,6 +1334,249 @@ pub mod nic {
             let stats = Stats { received: 1 << 40, delivered: 2, not_ours: 3, dropped: 4, sent: 5, refused: 6 };
             assert_eq!(Stats::from_bytes(&stats.to_bytes()), Some(stats));
             assert_eq!(Stats::from_bytes(&stats.to_bytes()[1..]), None);
+        }
+    }
+}
+
+/// The network service's protocol: what a program asks of the machine's
+/// network stack (`user/src/bin/net.rs`), which owns the card.
+///
+/// Requests, each with the end of a fresh channel for the reply
+/// `[status] [payload]`:
+///
+///   INFO      who this machine is on its network, and what the stack
+///             has counted (`Info`)
+///   PING      `Ping`: send an echo request, and answer when its reply
+///             comes - or when the wait is over (TIMED_OUT), or when
+///             nobody on the wire has the address (UNREACHABLE)
+///   UDP_BIND  a port (u16 LE; 0: any free one), and a second handle:
+///             one end of a channel that from now on *is* the socket.
+///             Reply payload: the port (u16 LE)
+///
+/// A socket is a channel, both ways: each message one datagram,
+/// `[address: 4 bytes] [port: u16 LE] [data]`. Sent by the program,
+/// the address and port are where it goes; sent by the service, where
+/// it came from. Closing the channel closes the socket and frees the
+/// port - also when a program ends without saying so.
+///
+/// No reply for a datagram: a network promises nothing about one, and
+/// neither does this. A datagram a program has no room for is dropped
+/// and counted.
+pub mod net {
+    pub const INFO: u8 = 1;
+    pub const PING: u8 = 2;
+    pub const UDP_BIND: u8 = 3;
+
+    pub const OK: u8 = 0;
+    pub const BAD_REQUEST: u8 = 1;
+    /// A ping: no answer came in the time given.
+    pub const TIMED_OUT: u8 = 2;
+    /// Nobody on the wire has the address (or the gateway's).
+    pub const UNREACHABLE: u8 = 3;
+    /// Another program has that port.
+    pub const IN_USE: u8 = 4;
+    /// No more sockets, or pings, at once.
+    pub const NO_ROOM: u8 = 5;
+    /// More data than a packet carries.
+    pub const TOO_BIG: u8 = 6;
+    /// The address is nowhere a packet can be sent.
+    pub const NO_ROUTE: u8 = 7;
+
+    pub fn describe(status: u8) -> &'static str {
+        match status {
+            OK => "ok",
+            TIMED_OUT => "no answer",
+            UNREACHABLE => "nobody on this network has that address",
+            IN_USE => "another program has that port",
+            NO_ROOM => "the network service has no room for more",
+            TOO_BIG => "more than one packet carries",
+            NO_ROUTE => "that address is not on this network, and there is no way out of it",
+            _ => "the network service did not understand",
+        }
+    }
+
+    /// The first bytes of a socket's message: an address and a port.
+    pub const DATAGRAM_HEADER: usize = 6;
+    /// The most data in one datagram here: what a message carries.
+    /// (A packet could carry 1472 bytes; a datagram that arrives with
+    /// more than this is dropped and counted.)
+    pub const DATAGRAM_MAX: usize = super::MESSAGE_MAX as usize - DATAGRAM_HEADER;
+
+    /// Writes a socket's message into `out`; its length. None if the
+    /// data is more than DATAGRAM_MAX or `out` too small.
+    pub fn datagram_encode(out: &mut [u8], address: [u8; 4], port: u16, data: &[u8]) -> Option<usize> {
+        let length = DATAGRAM_HEADER + data.len();
+        if data.len() > DATAGRAM_MAX || out.len() < length {
+            return None;
+        }
+        out[..4].copy_from_slice(&address);
+        out[4..6].copy_from_slice(&port.to_le_bytes());
+        out[6..length].copy_from_slice(data);
+        Some(length)
+    }
+
+    /// A socket's message: the address, the port, the data.
+    pub fn datagram_decode(message: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
+        let (header, data) = message.split_at_checked(DATAGRAM_HEADER)?;
+        Some(([header[0], header[1], header[2], header[3]], u16::from_le_bytes([header[4], header[5]]), data))
+    }
+
+    /// The most data a ping carries, and the longest it waits (ticks).
+    pub const PING_DATA_MAX: u16 = 1472;
+    pub const PING_WAIT_MAX: u32 = 3000;
+    /// A PING's reply payload: who answered (4 bytes) and the "time to
+    /// live" its packet arrived with.
+    pub const PING_REPLY_SIZE: usize = 5;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Ping {
+        pub to: [u8; 4],
+        /// A number of the asker's choosing, sent and expected back.
+        pub sequence: u16,
+        /// How many bytes of data to send along.
+        pub length: u16,
+        /// How long to wait for the answer, in ticks.
+        pub wait: u32,
+    }
+
+    impl Ping {
+        pub const SIZE: usize = 1 + 4 + 2 + 2 + 4;
+
+        pub fn to_bytes(&self) -> [u8; Ping::SIZE] {
+            let mut bytes = [0u8; Ping::SIZE];
+            bytes[0] = PING;
+            bytes[1..5].copy_from_slice(&self.to);
+            bytes[5..7].copy_from_slice(&self.sequence.to_le_bytes());
+            bytes[7..9].copy_from_slice(&self.length.to_le_bytes());
+            bytes[9..13].copy_from_slice(&self.wait.to_le_bytes());
+            bytes
+        }
+
+        /// None if `request` is not a PING, or asks for more than
+        /// PING_DATA_MAX bytes or PING_WAIT_MAX ticks, or for no wait.
+        pub fn from_bytes(request: &[u8]) -> Option<Ping> {
+            let bytes: &[u8; Ping::SIZE] = request.try_into().ok()?;
+            let ping = Ping {
+                to: [bytes[1], bytes[2], bytes[3], bytes[4]],
+                sequence: u16::from_le_bytes([bytes[5], bytes[6]]),
+                length: u16::from_le_bytes([bytes[7], bytes[8]]),
+                wait: u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            };
+            (bytes[0] == PING && ping.length <= PING_DATA_MAX && (1..=PING_WAIT_MAX).contains(&ping.wait)).then_some(ping)
+        }
+    }
+
+    /// Who this machine is, and what its network stack has counted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Info {
+        pub mac: [u8; 6],
+        pub address: [u8; 4],
+        /// How many leading bits of the address name the network.
+        pub prefix: u8,
+        pub gateway: [u8; 4],
+        pub counters: [u64; COUNTERS],
+    }
+
+    /// `Info::counters`, in this order.
+    pub const COUNTERS: usize = 11;
+    pub const FRAMES_IN: usize = 0;
+    pub const FRAMES_OUT: usize = 1;
+    /// "Who has this address?" answered.
+    pub const ARP_ANSWERED: usize = 2;
+    /// Pings answered.
+    pub const ECHOES_ANSWERED: usize = 3;
+    pub const DATAGRAMS_IN: usize = 4;
+    /// Malformed, or a wrong checksum.
+    pub const BAD: usize = 5;
+    pub const NOT_FOR_US: usize = 6;
+    /// Fragments, and protocols not spoken.
+    pub const UNSUPPORTED: usize = 7;
+    /// Not sent: nobody had the address, or too many were waiting.
+    pub const UNDELIVERED: usize = 8;
+    /// Datagrams for a port no program has.
+    pub const NO_SUCH_PORT: usize = 9;
+    /// Datagrams a program had no room for, or that were too long for
+    /// a message.
+    pub const NOT_TAKEN: usize = 10;
+
+    impl Info {
+        pub const SIZE: usize = 6 + 4 + 1 + 4 + COUNTERS * 8;
+
+        pub fn to_bytes(&self) -> [u8; Info::SIZE] {
+            let mut bytes = [0u8; Info::SIZE];
+            bytes[..6].copy_from_slice(&self.mac);
+            bytes[6..10].copy_from_slice(&self.address);
+            bytes[10] = self.prefix;
+            bytes[11..15].copy_from_slice(&self.gateway);
+            for (chunk, counter) in bytes[15..].as_chunks_mut::<8>().0.iter_mut().zip(self.counters) {
+                *chunk = counter.to_le_bytes();
+            }
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Option<Info> {
+            let bytes: &[u8; Info::SIZE] = bytes.try_into().ok()?;
+            let mut info = Info { prefix: bytes[10], ..Info::default() };
+            info.mac.copy_from_slice(&bytes[..6]);
+            info.address.copy_from_slice(&bytes[6..10]);
+            info.gateway.copy_from_slice(&bytes[11..15]);
+            for (counter, chunk) in info.counters.iter_mut().zip(bytes[15..].as_chunks::<8>().0) {
+                *counter = u64::from_le_bytes(*chunk);
+            }
+            Some(info)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_datagram_message_there_and_back() {
+            let mut message = [0u8; super::super::MESSAGE_MAX as usize];
+            let length = datagram_encode(&mut message, [10, 0, 2, 2], 5000, b"hello").unwrap();
+            assert_eq!(&message[..length], [10, 0, 2, 2, 0x88, 0x13, b'h', b'e', b'l', b'l', b'o']);
+            assert_eq!(datagram_decode(&message[..length]), Some(([10, 0, 2, 2], 5000, &b"hello"[..])));
+            assert_eq!(datagram_decode(&message[..6]), Some(([10, 0, 2, 2], 5000, &b""[..])));
+            assert_eq!(datagram_decode(&message[..5]), None);
+            // The most, and one more.
+            assert_eq!(datagram_encode(&mut message, [0; 4], 1, &[7; DATAGRAM_MAX]), Some(1024));
+            assert_eq!(datagram_encode(&mut message, [0; 4], 1, &[7; DATAGRAM_MAX + 1]), None);
+            assert_eq!(datagram_encode(&mut [0u8; 8], [0; 4], 1, b"abc"), None);
+            // However much room there is: a message carries no more.
+            assert_eq!(datagram_encode(&mut [0u8; 2048], [0; 4], 1, &[7; DATAGRAM_MAX + 1]), None);
+        }
+
+        #[test]
+        fn a_ping_request_there_and_back() {
+            let ping = Ping { to: [10, 0, 2, 2], sequence: 0x0102, length: 56, wait: 100 };
+            let bytes = ping.to_bytes();
+            assert_eq!(bytes, [PING, 10, 0, 2, 2, 2, 1, 56, 0, 100, 0, 0, 0]);
+            assert_eq!(Ping::from_bytes(&bytes), Some(ping));
+            assert_eq!(Ping::from_bytes(&bytes[..12]), None);
+            let mut wrong = bytes;
+            wrong[0] = INFO;
+            assert_eq!(Ping::from_bytes(&wrong), None);
+            for refused in [
+                Ping { length: PING_DATA_MAX + 1, ..ping },
+                Ping { wait: 0, ..ping },
+                Ping { wait: PING_WAIT_MAX + 1, ..ping },
+            ] {
+                assert_eq!(Ping::from_bytes(&refused.to_bytes()), None, "{refused:?}");
+            }
+            assert!(Ping::from_bytes(&Ping { length: PING_DATA_MAX, wait: PING_WAIT_MAX, ..ping }.to_bytes()).is_some());
+        }
+
+        #[test]
+        fn info_there_and_back() {
+            let mut info = Info { mac: [1, 2, 3, 4, 5, 6], address: [10, 0, 2, 15], prefix: 24, gateway: [10, 0, 2, 2], counters: [0; COUNTERS] };
+            for (n, counter) in info.counters.iter_mut().enumerate() {
+                *counter = 1000 + n as u64;
+            }
+            let bytes = info.to_bytes();
+            assert_eq!(Info::from_bytes(&bytes), Some(info));
+            assert_eq!(Info::from_bytes(&bytes[1..]), None);
+            assert_eq!(bytes[15 + 8 * NOT_TAKEN..][..2], 1010u16.to_le_bytes());
         }
     }
 }
