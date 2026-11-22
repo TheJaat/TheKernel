@@ -155,8 +155,16 @@ pub mod startup {
     /// is at the other end - the screen, a file being written, another
     /// program - and the program prints the same way whichever it is.
     pub const STDOUT: u64 = 1 << 0;
-    /// A channel holding one message: the program's arguments, each
-    /// followed by a zero byte (see `arguments`).
+    /// A channel holding the program's command line, in two messages.
+    /// First its arguments, each followed by a zero byte (see
+    /// `arguments`) - perhaps none, an empty message. Then the program
+    /// itself, the same way: two words, the name it was started by (C's
+    /// argv[0]: "ls", "tools/given") and its file, as a path from the
+    /// root ("/ls", "/tools/given"), or nothing for a program built into
+    /// the kernel image - what Linux tells a program in /proc/self/exe,
+    /// so that it can find what it brings with it (clang its headers).
+    /// The second message may be missing: a program started by anything
+    /// but init has only the first.
     pub const ARGUMENTS: u64 = 1 << 1;
     /// The program's channel to the registry: where it asks, by name,
     /// for the services it was given - "files", say. Which names exist
@@ -272,7 +280,7 @@ pub mod arguments {
 /// Requests to init, from the shell: "start this program".
 ///
 ///   [kind] [flags] [name length] [name]
-///   [directory length] [directory] [arguments]
+///   [directory length] [directory] [file length] [file] [arguments]
 ///
 /// `kind` is BUILT_IN (a program in the kernel image, by name) or IMAGE
 /// (the first handle is a memory object holding the program's file).
@@ -284,6 +292,9 @@ pub mod arguments {
 /// `directory` is where the program is started: the caller's current
 /// directory, as a path from the root ("" is the root). init passes it
 /// on as it does the arguments, and does not look at it.
+/// `file` is the program's file, as a path from the root ("/ls"), for
+/// an IMAGE; for a program built in it is "". init tells the program
+/// its name and its file (startup::ARGUMENTS), and looks at neither.
 ///
 /// The reply: "ok" and a handle to the new process, or "error: ...".
 pub mod init {
@@ -295,6 +306,7 @@ pub mod init {
         pub flags: u8,
         pub name: &'a str,
         pub directory: &'a str,
+        pub file: &'a str,
         pub arguments: &'a [u8],
     }
 
@@ -302,29 +314,35 @@ pub mod init {
         /// Lays the request out in `out`; its length, or None if it
         /// does not fit.
         pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-            // Where the directory's length byte goes, and the arguments.
-            let middle = 3 + self.name.len();
-            let end = middle + 1 + self.directory.len();
-            let length = end + self.arguments.len();
-            if self.name.len() > 255 || self.directory.len() > 255 || length > out.len() {
+            let length = 2 + 3 + self.name.len() + self.directory.len() + self.file.len() + self.arguments.len();
+            if length > out.len() {
                 return None;
             }
-            out[..3].copy_from_slice(&[self.kind, self.flags, self.name.len() as u8]);
-            out[3..middle].copy_from_slice(self.name.as_bytes());
-            out[middle] = self.directory.len() as u8;
-            out[middle + 1..end].copy_from_slice(self.directory.as_bytes());
-            out[end..length].copy_from_slice(self.arguments);
+            out[..2].copy_from_slice(&[self.kind, self.flags]);
+            let mut at = 2;
+            // Each string after a byte saying how long it is.
+            for text in [self.name, self.directory, self.file] {
+                out[at] = u8::try_from(text.len()).ok()?;
+                out[at + 1..at + 1 + text.len()].copy_from_slice(text.as_bytes());
+                at += 1 + text.len();
+            }
+            out[at..length].copy_from_slice(self.arguments);
             Some(length)
         }
 
         pub fn decode(message: &'a [u8]) -> Option<Run<'a>> {
-            let (&[kind, flags, name_length], rest) = message.split_first_chunk::<3>()?;
-            let (name, rest) = rest.split_at_checked(name_length as usize)?;
-            let name = core::str::from_utf8(name).ok().filter(|name| !name.is_empty())?;
-            let (&directory_length, rest) = rest.split_first()?;
-            let (directory, arguments) = rest.split_at_checked(directory_length as usize)?;
-            let directory = core::str::from_utf8(directory).ok()?;
-            matches!(kind, BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, arguments })
+            let (&[kind, flags], mut rest) = message.split_first_chunk::<2>()?;
+            let mut text = || -> Option<&'a str> {
+                let (&length, after) = rest.split_first()?;
+                let (text, after) = after.split_at_checked(length as usize)?;
+                rest = after;
+                core::str::from_utf8(text).ok()
+            };
+            let name = text().filter(|name| !name.is_empty())?;
+            let directory = text()?;
+            let file = text()?;
+            let arguments = rest;
+            matches!(kind, BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
         }
     }
 }
@@ -1832,43 +1850,62 @@ mod tests {
 
     #[test]
     fn a_run_request_round_trips() {
-        let run = Run { kind: IMAGE, flags: 5, name: "cat", directory: "", arguments: b"notes welcome" };
+        let run = Run { kind: IMAGE, flags: 5, name: "cat", directory: "", file: "/cat", arguments: b"notes welcome" };
         let mut message = [0u8; 64];
         let length = run.encode(&mut message).unwrap();
-        assert_eq!(length, 3 + 3 + 1 + 13);
+        assert_eq!(length, 3 + 3 + 1 + 1 + 4 + 13);
         let back = Run::decode(&message[..length]).unwrap();
         assert_eq!((back.kind, back.flags, back.name, back.arguments), (IMAGE, 5, "cat", &b"notes welcome"[..]));
-        assert_eq!(back.directory, "");
+        assert_eq!((back.directory, back.file), ("", "/cat"));
         // No arguments is not the same as no request.
-        let length = Run { kind: BUILT_IN, flags: 0, name: "hello", directory: "", arguments: b"" }.encode(&mut message).unwrap();
+        let length = Run { kind: BUILT_IN, flags: 0, name: "hello", directory: "", file: "", arguments: b"" }
+            .encode(&mut message)
+            .unwrap();
         let back = Run::decode(&message[..length]).unwrap();
-        assert_eq!((back.name, back.arguments.len()), ("hello", 0));
+        assert_eq!((back.name, back.file, back.arguments.len()), ("hello", "", 0));
     }
 
     #[test]
     fn a_run_request_carries_the_directory() {
-        let run = Run { kind: IMAGE, flags: 5, name: "cat", directory: "docs/notes", arguments: b"today" };
+        let run = Run { kind: IMAGE, flags: 5, name: "cat", directory: "docs/notes", file: "/cat", arguments: b"today" };
         let mut message = [0u8; 64];
         let length = run.encode(&mut message).unwrap();
-        assert_eq!(length, 3 + 3 + 1 + 10 + 5);
+        assert_eq!(length, 3 + 3 + 1 + 10 + 1 + 4 + 5);
         let back = Run::decode(&message[..length]).unwrap();
-        assert_eq!((back.name, back.directory, back.arguments), ("cat", "docs/notes", &b"today"[..]));
+        assert_eq!((back.name, back.directory, back.file, back.arguments), ("cat", "docs/notes", "/cat", &b"today"[..]));
         // A directory and no arguments: the two are not confused.
-        let length = Run { kind: IMAGE, flags: 0, name: "ls", directory: "docs", arguments: b"" }.encode(&mut message).unwrap();
+        let run = Run { kind: IMAGE, flags: 0, name: "ls", directory: "docs", file: "/ls", arguments: b"" };
+        let length = run.encode(&mut message).unwrap();
         let back = Run::decode(&message[..length]).unwrap();
-        assert_eq!((back.directory, back.arguments.len()), ("docs", 0));
+        assert_eq!((back.directory, back.file, back.arguments.len()), ("docs", "/ls", 0));
         // Longer than its length byte can say.
         let long = "d".repeat(256);
-        assert_eq!(Run { kind: IMAGE, flags: 0, name: "ls", directory: &long, arguments: b"" }.encode(&mut [0u8; 512]), None);
+        let run = Run { kind: IMAGE, flags: 0, name: "ls", directory: &long, file: "", arguments: b"" };
+        assert_eq!(run.encode(&mut [0u8; 512]), None);
+        let run = Run { kind: IMAGE, flags: 0, name: "ls", directory: "", file: &long, arguments: b"" };
+        assert_eq!(run.encode(&mut [0u8; 512]), None);
+        // The file is where a path starting "tools/" leads, not a name
+        // to be taken apart again: kept whole, as long as it fits.
+        let run = Run { kind: IMAGE, flags: 0, name: "tools/given", directory: "docs", file: "/docs/tools/given", arguments: b"a\0" };
+        let length = run.encode(&mut message).unwrap();
+        let back = Run::decode(&message[..length]).unwrap();
+        assert_eq!((back.name, back.file, back.arguments), ("tools/given", "/docs/tools/given", &b"a\0"[..]));
     }
 
     #[test]
     fn a_run_request_that_does_not_fit_is_refused() {
-        let run = Run { kind: IMAGE, flags: 0, name: "cat", directory: "", arguments: b"notes" };
-        assert_eq!(run.encode(&mut [0u8; 11]), None);
-        assert_eq!(run.encode(&mut [0u8; 12]), Some(12));
+        let run = Run { kind: IMAGE, flags: 0, name: "cat", directory: "", file: "", arguments: b"notes" };
+        assert_eq!(run.encode(&mut [0u8; 12]), None);
+        assert_eq!(run.encode(&mut [0u8; 13]), Some(13));
         let long = "n".repeat(256);
-        assert_eq!(Run { kind: IMAGE, flags: 0, name: &long, directory: "", arguments: b"" }.encode(&mut [0u8; 512]), None);
+        let run = Run { kind: IMAGE, flags: 0, name: &long, directory: "", file: "", arguments: b"" };
+        assert_eq!(run.encode(&mut [0u8; 512]), None);
+        // A request cut off before its file is no request.
+        let mut message = [0u8; 64];
+        let run = Run { kind: IMAGE, flags: 0, name: "cat", directory: "d", file: "/d/cat", arguments: b"" };
+        let length = run.encode(&mut message).unwrap();
+        assert!(Run::decode(&message[..length - 1]).is_none());
+        assert!(Run::decode(&message[..2 + 4 + 2]).is_none());
     }
 
     #[test]
@@ -1883,12 +1920,15 @@ mod tests {
             b"\x01\x00\x03cat",         // no directory length (the request before directories)
             b"\x01\x00\x03cat\x04doc",  // the directory claims more than there is
             b"\x01\x00\x03cat\x02\xff\xfe", // a directory that is not text
+            b"\x01\x00\x03cat\x00",     // no file length (the request before files)
+            b"\x01\x00\x03cat\x00\x04/ca", // the file claims more than there is
+            b"\x01\x00\x03cat\x00\x02\xff\xfe", // a file that is not text
             b"\x03\x00\x03cat",         // no such kind
             b"\x01\x00\x02\xff\xfe",    // a name that is not text
             b"run hello",               // the old, text request
         ] {
             assert!(Run::decode(bad).is_none(), "{bad:?}");
         }
-        assert!(Run::decode(b"\x01\x00\x03cat\x00").is_some());
+        assert!(Run::decode(b"\x01\x00\x03cat\x00\x00").is_some());
     }
 }

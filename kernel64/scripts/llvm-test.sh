@@ -91,7 +91,7 @@ for tool in llvm-tblgen llc llvm-mc; do
 done
 
 # The code: cwords.c in LLVM's language for each machine, from the
-# host's clang, as clang -c on TheTaaJ will one day write it itself.
+# host's clang, as clang -c on TheTaaJ writes it too (clang-test.sh).
 # What the host's llc and llvm-mc make of it is what TheTaaJ's must.
 for machine in x86_64 aarch64; do
     "$HOST_BIN/clang" --target=$machine-unknown-none-elf -O2 -ffreestanding -nostdlibinc -isystem "$ROOT/libc/include" \
@@ -166,11 +166,10 @@ said '"llvm-tblgen" exited with code 1' "llvm-tblgen did not fail on bad.td"
 [ "$(grep -ac '"llc" exited with code 0' "$LOG")" -eq 2 ] || fail "llc did not compile both files with exit code 0"
 [ "$(grep -ac '"llvm-mc" exited with code 0' "$LOG")" -eq 3 ] \
     || fail "llvm-mc did not say its version and assemble both files with exit code 0"
-# Where the host's llc says "llc: error: llc: bad.ll...", TheTaaJ's says
-# "program: error: program: ...": a C program is not told its own name
-# yet (libc/src/lib.rs, NAME).
-said "error: [a-z]+: bad\.ll:2:7: error: value doesn't match function result type 'i32'" \
-    "llc did not say what is wrong in bad.ll, and where"
+# As the host's llc says it: "llc: error: llc: bad.ll:...", signed with
+# the name it was started by (argv[0], which TheTaaJ tells a program).
+said "^llc: error: llc: bad\.ll:2:7: error: value doesn't match function result type 'i32'" \
+    "llc did not say what is wrong in bad.ll, and where, signed with its name"
 said '"llc" exited with code 1' "llc did not fail on bad.ll"
 said "^bad\.s:2:2: error: invalid instruction mnemonic 'notaninstruction'" \
     "llvm-mc did not say what is wrong in bad.s, and where"
