@@ -34,6 +34,13 @@ NAMED = {
     "up": b"\x1b[A", "down": b"\x1b[B", "right": b"\x1b[C", "left": b"\x1b[D",
     "f11": b"\x1b[23~", "f12": b"\x1b[24~",
 }
+# The rest of a US keyboard's punctuation, as key-names.py names it, so
+# that anything it can spell can be typed here too: plain, and shifted.
+_PLAIN = {"equal": "=", "bracket_left": "[", "bracket_right": "]", "semicolon": ";", "grave_accent": "`"}
+_SHIFTED = {"1": "!", "2": "@", "3": "#", "4": "$", "6": "^", "8": "*", "9": "(", "0": ")", "equal": "+",
+            "bracket_left": "{", "bracket_right": "}", "semicolon": ":", "slash": "?", "grave_accent": "~"}
+NAMED.update({name: text.encode() for name, text in _PLAIN.items()})
+NAMED.update({"shift-" + name: text.encode() for name, text in _SHIFTED.items()})
 
 
 def key_bytes(key):

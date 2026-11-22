@@ -29,10 +29,10 @@ use crate::ipc::Object;
 use crate::memory_object::MemoryObject;
 use crate::{mm, threads};
 
-/// The user stack: 64 KiB just below this address. The page below it is
-/// left unmapped, so overflowing the stack faults.
+/// The user stack ends just below this address: 64 KiB of it, or what
+/// the program asked for (elf::STACK_MIN, elf::STACK_MAX). The page
+/// below it is left unmapped, so overflowing the stack faults.
 const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-const USER_STACK_PAGES: u64 = 16;
 
 /// Where memory objects are mapped: far from the program (which sits low,
 /// near 4 MiB) and the stack (at the very top).
@@ -212,7 +212,11 @@ pub static EXITS: threads::WaitQueue = threads::WaitQueue::new();
 /// put there. `elf::parse` checks all of it; a program must also lie
 /// below the mapping area, so no segment can sit where the kernel will
 /// later place a memory object, or on the stack.
-pub fn load(name: &str, file: &[u8]) -> Result<Loaded, LoadError> {
+///
+/// The file is read through `elf::Source`: a slice (the programs built
+/// into the kernel), or the pages of the memory object a program from
+/// the disk came in, read where they are.
+pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, LoadError> {
     let image = elf::parse(file, MAPPING_AREA.start).map_err(LoadError::Elf)?;
 
     // SAFETY: frames are reached through the direct map.
@@ -222,15 +226,21 @@ pub fn load(name: &str, file: &[u8]) -> Result<Loaded, LoadError> {
     .ok_or(LoadError::OutOfMemory)?;
 
     let loaded = mm::with_frames(|frames| -> Result<(), LoadError> {
-        let mut map_page = |virt: u64, flags: Flags, contents: &[(usize, &[u8])]| {
+        // A page at `virt`: zeroed, then `bytes` of the file from
+        // `from` written at `at` in it.
+        let mut map_page = |virt: u64, flags: Flags, at: usize, from: u64, bytes: usize| {
             let frame = frames.allocate().ok_or(LoadError::OutOfMemory)?;
             let page = phys_to_virt(frame).as_mut_ptr::<u8>();
-            // SAFETY: a fresh frame, reached through the direct map.
-            unsafe {
+            // SAFETY: a fresh frame, reached through the direct map, and
+            // nothing else refers to it yet.
+            let contents = unsafe {
                 page.write_bytes(0, PAGE_SIZE as usize);
-                for (offset, bytes) in contents {
-                    page.add(*offset).copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
-                }
+                core::slice::from_raw_parts_mut(page, PAGE_SIZE as usize)
+            };
+            // (A page past the file's bytes - .bss, the stack - reads
+            // nothing: its `from` may be past the end.)
+            if bytes > 0 {
+                file.read(from, &mut contents[at..at + bytes]);
             }
             // Instructions, written as data: some CPUs must be told
             // before they will run what was written.
@@ -255,18 +265,19 @@ pub fn load(name: &str, file: &[u8]) -> Result<Loaded, LoadError> {
             }
             // The file's bytes occupy virtual [start, start + file length).
             let start = segment.virtual_range.start;
-            let data = &file[segment.file_range.clone()];
+            let length = segment.file_range.len() as u64;
             let first = start & !(PAGE_SIZE - 1);
             for page in (first..segment.virtual_range.end).step_by(PAGE_SIZE as usize) {
-                // The slice of `data` that lands in this page, and where.
+                // The part of the file that lands in this page, and where.
                 let from = page.max(start);
-                let to = (page + PAGE_SIZE).min(start + data.len() as u64);
-                let piece: &[u8] = if from < to { &data[(from - start) as usize..(to - start) as usize] } else { &[] };
-                map_page(page, flags, &[((from - page) as usize, piece)])?;
+                let to = (page + PAGE_SIZE).min(start + length);
+                let bytes = to.saturating_sub(from) as usize;
+                let offset = segment.file_range.start as u64 + (from - start);
+                map_page(page, flags, (from - page) as usize, offset, bytes)?;
             }
         }
-        for n in 1..=USER_STACK_PAGES {
-            map_page(USER_STACK_TOP - n * PAGE_SIZE, Flags::WRITABLE | mm::no_execute(), &[])?;
+        for n in 1..=image.stack / PAGE_SIZE {
+            map_page(USER_STACK_TOP - n * PAGE_SIZE, Flags::WRITABLE | mm::no_execute(), 0, 0, 0)?;
         }
         Ok(())
     });

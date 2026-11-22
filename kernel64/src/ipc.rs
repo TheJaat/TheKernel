@@ -330,25 +330,44 @@ fn spawn_from(
         }
     }
     let name = core::str::from_utf8(&name).ok().filter(|name| !name.is_empty());
-    // The file: built in, or copied out of the caller's memory object -
-    // copied, once, so the caller cannot change it while it is checked.
-    let copied;
-    let (program, file): (&str, &[u8]) = match image {
-        None => name.and_then(crate::programs::find).ok_or(Error::NotFound)?,
+    // The file: built in, or in the caller's memory object.
+    //
+    // A program from the disk is read where it is, out of the object's
+    // pages, when nobody but the caller can change them: no mapping of
+    // the object and no other handle to it, anywhere. Each of those
+    // holds a reference, so the object's count is then exactly two -
+    // the caller's handle and the `Arc` taken here - and the caller is
+    // in this call, unable to make another. Otherwise it is copied
+    // first, into fresh frames, so that what is checked is what runs.
+    // Either way nothing goes through the kernel's heap, which never
+    // gives memory back: a 40 MB program would leave it 40 MB bigger.
+    let loaded = match image {
+        None => {
+            let (program, file) = name.and_then(crate::programs::find).ok_or(Error::NotFound)?;
+            process::load(program, file)
+        }
         Some(image) => {
             let object = match process.handles.lock().get(image, Rights(rights::READ))? {
                 Object::Memory(object) => Arc::clone(object),
                 _ => return Err(Error::WrongType),
             };
-            copied = object.contents(abi::PROGRAM_IMAGE_MAX)?;
-            (name.ok_or(Error::InvalidArgument)?, &copied)
+            if !object.owned() || object.size() > abi::PROGRAM_IMAGE_MAX {
+                return Err(Error::InvalidArgument);
+            }
+            let program = name.ok_or(Error::InvalidArgument)?;
+            if Arc::strong_count(&object) == 2 {
+                process::load(program, &*object)
+            } else {
+                let copy = object.copy().ok_or(Error::OutOfMemory)?;
+                process::load(program, &copy)
+            }
         }
     };
 
     // 2. Loading can still fail - a bad file, out of memory - so it comes
     //    before the handles move. The table is not locked meanwhile: only
     //    this process's own thread changes it, and it is here.
-    let loaded = process::load(program, file).map_err(|error| match error {
+    let loaded = loaded.map_err(|error| match error {
         process::LoadError::Elf(_) => Error::NotExecutable,
         process::LoadError::OutOfMemory => Error::OutOfMemory,
     })?;

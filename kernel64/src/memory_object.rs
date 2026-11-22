@@ -67,23 +67,28 @@ impl MemoryObject {
         MemoryObject { frames, owned: false, cache }
     }
 
-    /// A copy of everything in the object - for the kernel to read what
-    /// a process prepared (a program file) without the process changing
-    /// it meanwhile. Refused for device memory, and for more than `max`
-    /// bytes.
-    pub fn contents(&self, max: u64) -> Result<Vec<u8>, abi::Error> {
-        if !self.owned || self.size() > max {
-            return Err(abi::Error::InvalidArgument);
+    /// Whether the object's frames are its own (not a device's).
+    pub fn owned(&self) -> bool {
+        self.owned
+    }
+
+    /// A new object holding a copy of this one's bytes - for the kernel
+    /// to read what a process prepared (a program file) without anyone
+    /// changing it meanwhile, when someone else could. In fresh frames,
+    /// not the kernel's heap: they go back to the frame allocator when
+    /// the copy is dropped, however big it was. None if memory runs out.
+    pub fn copy(&self) -> Option<MemoryObject> {
+        let copy = MemoryObject::new(self.frames.len() as u64)?;
+        for (&from, &to) in self.frames.iter().zip(&copy.frames) {
+            // SAFETY: two frames, through the direct map: `to` is the
+            // copy's own and fresh; `from` is this object's.
+            unsafe {
+                phys_to_virt(to)
+                    .as_mut_ptr::<u8>()
+                    .copy_from_nonoverlapping(phys_to_virt(from).as_ptr::<u8>(), PAGE_SIZE as usize)
+            };
         }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(self.size() as usize).map_err(|_| abi::Error::OutOfMemory)?;
-        for &frame in &self.frames {
-            // SAFETY: a frame this object owns, through the direct map.
-            bytes.extend_from_slice(unsafe {
-                core::slice::from_raw_parts(phys_to_virt(frame).as_ptr::<u8>(), PAGE_SIZE as usize)
-            });
-        }
-        Ok(bytes)
+        Some(copy)
     }
 
     pub fn frames(&self) -> &[PhysAddr] {
@@ -92,6 +97,28 @@ impl MemoryObject {
 
     pub fn size(&self) -> u64 {
         self.frames.len() as u64 * PAGE_SIZE
+    }
+}
+
+/// A program file is read straight out of the object's pages.
+impl kernel64::elf::Source for MemoryObject {
+    fn file_size(&self) -> u64 {
+        self.size()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) {
+        let mut done = 0;
+        while done < out.len() {
+            let at = offset + done as u64;
+            let frame = self.frames[(at / PAGE_SIZE) as usize];
+            let within = (at % PAGE_SIZE) as usize;
+            let n = (PAGE_SIZE as usize - within).min(out.len() - done);
+            // SAFETY: a frame of this object, through the direct map;
+            // `within + n` stays inside the page.
+            let page = unsafe { core::slice::from_raw_parts(phys_to_virt(frame).as_ptr::<u8>(), PAGE_SIZE as usize) };
+            out[done..done + n].copy_from_slice(&page[within..within + n]);
+            done += n;
+        }
     }
 }
 

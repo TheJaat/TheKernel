@@ -146,13 +146,15 @@ steps="$(keys 'tcc hello.c -o hello') ret ~~ $(keys 'hello') ret ~"
 steps="$steps $(keys 'tcc chello.c -o chello2') ret ~~ $(keys 'chello2 one two') ret ~"
 steps="$steps $(keys 'tcc -c clib.c') ret ~~ $(keys 'tcc clib.o -o clib2') ret ~~"
 steps="$steps $(keys 'with files clib2') ret ~ $(keys 'tcc bad.c') ret ~~ $(keys 'source broken') ret ~~"
-# The build: one line for the shell, 15 commands, 31 files compiled.
-# Each "~~" waits up to ninety seconds; as many as it takes.
-steps="$steps $(keys 'time source /src/build') ret ~~ ~~ ~~ ~~ ~~ ~~"
+# The build: one line for the shell, 23 commands, 70 files compiled.
+# Each "~~" waits up to ninety seconds, and returns as soon as the
+# command is over, so a spare one costs nothing: with libm the build
+# took 640 s on the PC inside make test64, past six of them.
+steps="$steps $(keys 'time source /src/build') ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
 steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/libc/programs/clib') ret ~"
 steps="$steps $(keys 'src/libc/programs/cprimes 100') ret ~ $(keys 'src/libc/programs/chello built here') ret ~"
 # TCC builds itself: two compilations of tcc.c and TCC's library.
-steps="$steps $(keys 'time source /src/tcc/build') ret ~~ ~~ ~~ ~~"
+steps="$steps $(keys 'time source /src/tcc/build') ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
 steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/tcc/tcc3 hello.c -o hello3') ret ~~ $(keys 'hello3') ret ~"
 steps="$steps $(keys 'echo done') ret ~"
 
@@ -193,7 +195,8 @@ said '^first line' "source broken did not run its first command"
 said '^source: broken: stopped at line 3' "source did not stop at the command that failed"
 grep -aq '^never printed' "$LOG" && fail "source went on after a command failed"
 [ "$(grep -ac '^tcc exited with code' "$LOG")" -eq 2 ] || fail "tcc failed where it should not have"
-said '\[shell\] /src/build line 19: "tcc -c format\.c' "the build script did not start"
+said '\[shell\] /src/build line [0-9]+: "tcc -c __math_oflow\.c' "the build script did not start"
+said '\[shell\] /src/build line [0-9]+: "tcc -c format\.c' "the build script did not reach the C library's own files"
 said '^built: the C library and 11 programs' "the build script did not get to its end"
 grep -a "source: /src/build: stopped" "$LOG" && fail "the build script stopped part way"
 [ "$(grep -ac '^library: [0-9]* checks, all passed' "$LOG")" -eq 2 ] \
@@ -231,6 +234,8 @@ mkdir -p "$WORK/src/libc/c" "$WORK/src/libc/programs"
 for f in "$ROOT"/libc/c/*.c "$ROOT"/libc/c/*.h; do
     case $f in *_test.c) ;; *) cp "$f" "$WORK/src/libc/c/" ;; esac
 done
+mkdir -p "$WORK/src/libc/c/libm"
+cp "$ROOT"/libc/c/libm/*.c "$ROOT"/libc/c/libm/*.h "$WORK/src/libc/c/libm/"
 cp "$ROOT"/libc/programs/*.c "$WORK/src/libc/programs/"
 sed -e "s|^tcc |$TCC_DIR/cross/taaj-tcc |" -e "s|/src/|$WORK/src/|g" -e "s|/lib/libc-rust.o|$TCC_DIR/libc-rust.o|" \
     "$ROOT/libc/build.taaj" > "$WORK/build.sh"
@@ -256,7 +261,13 @@ cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was
 [ "$(cat "$WORK/hi.out")" = 0.125 ] || fail "the program typed in the editor printed $(cat "$WORK/hi.out"), not 0.125"
 
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
-for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit pthread emutls signal mmap users; do FILES="$FILES src/libc/c/$f.o"; done
+LIBC_OBJECTS=0
+for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit pthread emutls signal mmap users libm; do
+    FILES="$FILES src/libc/c/$f.o"
+    LIBC_OBJECTS=$((LIBC_OBJECTS + 1))
+done
+# libm.o, and the 39 objects of libc/c/libm it was joined from.
+for f in "$ROOT"/libc/c/libm/*.c; do FILES="$FILES src/libc/c/libm/$(basename "${f%.c}").o"; done
 for p in chello cmem cprint cfile cstdio cwords cask cprimes cnet cfloat clib; do FILES="$FILES src/libc/programs/$p"; done
 FILES="$FILES src/tcc/tcc2 src/tcc/tcc3 src/tcc/lib/libtcc1.a hello3"
 for o in "$TCC_DIR"/helpers/*.o; do FILES="$FILES src/tcc/lib/$(basename "$o")"; done
@@ -267,5 +278,5 @@ for file in $FILES; do
         || fail "$file, written by tcc on TheTaaJ, is not what the same tcc on the host writes (see $WORK)"
     count=$((count + 1))
 done
-echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a and its 20 objects) and 11 programs built by source /src/build, and tcc2, tcc3 (the same file: TCC compiled by itself), libtcc1.a and its objects, and hello3 built by source /src/tcc/build"
+echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a, its $LIBC_OBJECTS objects, and the 39 that libm.o joins) and 11 programs built by source /src/build, and tcc2, tcc3 (the same file: TCC compiled by itself), libtcc1.a and its objects, and hello3 built by source /src/tcc/build"
 exit 0

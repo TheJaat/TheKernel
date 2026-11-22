@@ -139,8 +139,12 @@ pub mod call {
 
 /// The u64s process_spawn_image's request holds.
 pub const SPAWN_REQUEST_WORDS: usize = 5;
-/// The largest program file process_spawn_image accepts: 4 MiB.
-pub const PROGRAM_IMAGE_MAX: u64 = 4 << 20;
+/// The largest program file process_spawn_image accepts: 128 MiB. The
+/// file is read where it lies, in the memory object (copied first only
+/// if someone else could change it), so the limit is a guard against a
+/// nonsense size, not a measure of the kernel's own memory. LLVM's
+/// tools are tens of megabytes.
+pub const PROGRAM_IMAGE_MAX: u64 = 128 << 20;
 
 /// What a program learns from its parent besides its handles: the
 /// argument of process_spawn, in RSI. Each flag says one more startup
@@ -361,9 +365,10 @@ pub const WAIT_HANDLES_MAX: u64 = 32;
 /// Longest program name.
 pub const PROGRAM_NAME_MAX: u64 = 64;
 
-/// Largest memory object: 16 MiB. (Per-process memory quotas come
-/// later; until then this bounds what one call can take.)
-pub const MEMORY_MAX: u64 = 16 << 20;
+/// Largest memory object: 128 MiB, as big as a program file may be
+/// (PROGRAM_IMAGE_MAX), which travels in one. (Per-process memory quotas
+/// come later; until then this bounds what one call can take.)
+pub const MEMORY_MAX: u64 = 128 << 20;
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Most handles one process may hold.

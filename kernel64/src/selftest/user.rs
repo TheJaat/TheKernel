@@ -46,7 +46,7 @@ pub fn user() {
     assert_eq!(mm::unused_frames(), frames, "processes leaked frames");
     // Files that are not programs - which the disk may now hold - are
     // refused, and cost nothing: text, and a program cut in half.
-    assert!(process::load("text", &[b'x'; 200]).is_err());
+    assert!(process::load("text", &[b'x'; 200][..]).is_err());
     assert!(process::load("half", &programs::HELLO[..programs::HELLO.len() / 2]).is_err());
     assert_eq!(mm::unused_frames(), frames, "refused programs leaked frames");
 

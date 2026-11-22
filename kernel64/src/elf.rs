@@ -15,8 +15,15 @@
 //!     gigabytes of zeroed memory, and loading it would take every frame
 //!     the machine has before failing.
 //!
+//! A program may say how big a stack it wants: the size of its
+//! PT_GNU_STACK header, which `ld.lld -z stack-size=N` writes. Between
+//! STACK_MIN and STACK_MAX, in whole pages; a program that says nothing
+//! gets STACK_MIN.
+//!
 //! This only parses and validates; the kernel does the copying and
-//! mapping (process.rs).
+//! mapping (process.rs). The file is read through `Source`, so that it
+//! need not be one slice in memory: a big program is read straight out
+//! of the pages of the memory object it came in.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -26,7 +33,37 @@ pub const PAGE: u64 = 4096;
 /// The lowest address a segment may use.
 pub const LOWEST_ADDRESS: u64 = 0x1_0000;
 /// The most memory one program's segments may take, in whole pages.
-pub const MEMORY_MAX: u64 = 64 << 20;
+pub const MEMORY_MAX: u64 = 256 << 20;
+/// The stack a program gets when it does not ask, and the least it gets
+/// when it does: 64 KiB.
+pub const STACK_MIN: u64 = 64 << 10;
+/// The most stack a program may ask for: 16 MiB. The stack's pages are
+/// all made when the program starts (nothing is mapped on demand yet),
+/// so this is memory taken at once.
+pub const STACK_MAX: u64 = 16 << 20;
+/// The most program headers a file may have. Real programs have fewer
+/// than a dozen; the limit keeps a hostile file from making the kernel
+/// read megabytes of them.
+pub const HEADERS_MAX: u64 = 128;
+
+/// Where a program file's bytes are read from: a slice, or the pages
+/// of a memory object.
+pub trait Source {
+    /// How many bytes the file has.
+    fn file_size(&self) -> u64;
+    /// Fills `out` with the bytes from `offset` on. The caller keeps
+    /// `offset + out.len()` within `file_size()`.
+    fn read(&self, offset: u64, out: &mut [u8]);
+}
+
+impl Source for [u8] {
+    fn file_size(&self) -> u64 {
+        self.len() as u64
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) {
+        out.copy_from_slice(&self[offset as usize..][..out.len()]);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
@@ -41,6 +78,8 @@ pub struct Segment {
 pub struct Image {
     pub entry: u64,
     pub segments: Vec<Segment>,
+    /// The stack's size in bytes: a whole number of pages.
+    pub stack: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +106,7 @@ impl fmt::Display for ElfError {
 }
 
 const PT_LOAD: u32 = 1;
+const PT_GNU_STACK: u32 = 0x6474_e551;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 /// The "machine" numbers of the two CPUs the kernel runs on: which
@@ -95,41 +135,58 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
 
 /// Checks `file` and describes what to load where. Segments must end at
 /// or below `user_end`. The program must be for this kernel's CPU.
-pub fn parse(file: &[u8], user_end: u64) -> Result<Image, ElfError> {
+pub fn parse(file: &(impl Source + ?Sized), user_end: u64) -> Result<Image, ElfError> {
     parse_for(file, user_end, NATIVE_MACHINE)
 }
 
 /// `parse`, for a program that must be for `machine`.
-pub fn parse_for(file: &[u8], user_end: u64, machine: u16) -> Result<Image, ElfError> {
-    if file.len() < 64 {
+pub fn parse_for(source: &(impl Source + ?Sized), user_end: u64, machine: u16) -> Result<Image, ElfError> {
+    let length = source.file_size();
+    if length < 64 {
         return Err(ElfError::TooShort);
     }
+    // Only the headers are read here, each once, into the kernel's own
+    // memory: what is checked is then what is used.
+    let mut file = [0u8; 64];
+    source.read(0, &mut file);
     if &file[0..4] != b"\x7FELF" {
         return Err(ElfError::NotElf);
     }
     if file[4] != 2 || file[5] != 1 {
         return Err(ElfError::Not64BitLittleEndian);
     }
-    if u16_at(file, 16) != ET_EXEC {
+    if u16_at(&file, 16) != ET_EXEC {
         return Err(ElfError::NotExecutable);
     }
-    if u16_at(file, 18) != machine {
+    if u16_at(&file, 18) != machine {
         return Err(ElfError::WrongMachine);
     }
-    let entry = u64_at(file, 24);
-    let header_offset = u64_at(file, 32);
-    let header_size = u16_at(file, 54) as u64;
-    let header_count = u16_at(file, 56) as u64;
+    let entry = u64_at(&file, 24);
+    let header_offset = u64_at(&file, 32);
+    let header_size = u16_at(&file, 54) as u64;
+    let header_count = u16_at(&file, 56) as u64;
     if header_size != 56
-        || header_offset.checked_add(header_size * header_count).is_none_or(|end| end > file.len() as u64)
+        || header_count > HEADERS_MAX
+        || header_offset.checked_add(header_size * header_count).is_none_or(|end| end > length)
     {
         return Err(ElfError::BadProgramHeaders);
     }
+    let mut headers = alloc::vec![0u8; (header_size * header_count) as usize];
+    source.read(header_offset, &mut headers);
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut memory = 0;
-    for n in 0..header_count {
-        let h = &file[(header_offset + n * header_size) as usize..][..56];
+    let mut stack = STACK_MIN;
+    for h in headers.as_chunks::<56>().0 {
+        if u32_at(h, 0) == PT_GNU_STACK {
+            // Its size, if it has one, is the stack the program wants.
+            let wanted = u64_at(h, 40);
+            if wanted > STACK_MAX {
+                return Err(ElfError::TooBig);
+            }
+            stack = stack.max((wanted + PAGE - 1) & !(PAGE - 1));
+            continue;
+        }
         if u32_at(h, 0) != PT_LOAD {
             continue;
         }
@@ -142,7 +199,7 @@ pub fn parse_for(file: &[u8], user_end: u64, machine: u16) -> Result<Image, ElfE
             continue;
         }
         if file_size > memory_size
-            || offset.checked_add(file_size).is_none_or(|end| end > file.len() as u64)
+            || offset.checked_add(file_size).is_none_or(|end| end > length)
         {
             return Err(ElfError::SegmentOutsideFile);
         }
@@ -182,7 +239,7 @@ pub fn parse_for(file: &[u8], user_end: u64, machine: u16) -> Result<Image, ElfE
     if !segments.iter().any(|s| s.executable && s.virtual_range.contains(&entry)) {
         return Err(ElfError::EntryNotExecutable);
     }
-    Ok(Image { entry, segments })
+    Ok(Image { entry, segments, stack })
 }
 
 #[cfg(test)]
@@ -238,7 +295,7 @@ mod tests {
 
     #[test]
     fn accepts_a_typical_program() {
-        let image = parse(&typical(), END).unwrap();
+        let image = parse(&*typical(), END).unwrap();
         assert_eq!(image.entry, 0x40_0010);
         assert_eq!(image.segments.len(), 3);
         let data = &image.segments[2];
@@ -249,27 +306,27 @@ mod tests {
 
     #[test]
     fn rejects_damaged_headers() {
-        assert_eq!(parse(&[0; 10], END), Err(ElfError::TooShort));
+        assert_eq!(parse(&[0u8; 10][..], END), Err(ElfError::TooShort));
         let mut f = typical();
         f[0] = 0;
-        assert_eq!(parse(&f, END), Err(ElfError::NotElf));
+        assert_eq!(parse(&*f, END), Err(ElfError::NotElf));
         let mut f = typical();
         f[4] = 1;
-        assert_eq!(parse(&f, END), Err(ElfError::Not64BitLittleEndian));
+        assert_eq!(parse(&*f, END), Err(ElfError::Not64BitLittleEndian));
         let mut f = typical();
         f[18] = 0xB7; // AArch64
-        assert_eq!(parse(&f, END), Err(ElfError::WrongMachine));
+        assert_eq!(parse(&*f, END), Err(ElfError::WrongMachine));
         let mut f = typical();
         f[56..58].copy_from_slice(&0xFFFFu16.to_le_bytes()); // headers past the end
-        assert_eq!(parse(&f, END), Err(ElfError::BadProgramHeaders));
+        assert_eq!(parse(&*f, END), Err(ElfError::BadProgramHeaders));
     }
 
     #[test]
     fn rejects_segments_pointing_outside_the_file() {
         let f = elf(0x40_0000, &[(RX, 0x1000, 0x40_0000, 0x10_0000, 0x10_0000)], 0x100);
-        assert_eq!(parse(&f, END), Err(ElfError::SegmentOutsideFile));
+        assert_eq!(parse(&*f, END), Err(ElfError::SegmentOutsideFile));
         let f = elf(0x40_0000, &[(RX, u64::MAX, 0x40_0000, 2, 2)], 0x100);
-        assert_eq!(parse(&f, END), Err(ElfError::SegmentOutsideFile));
+        assert_eq!(parse(&*f, END), Err(ElfError::SegmentOutsideFile));
     }
 
     #[test]
@@ -277,16 +334,16 @@ mod tests {
         for (address, size) in [(0, 0x100), (0x1000, 0x100), (0xFFFF_FFFF_8000_0000, 0x100), (END - 0x10, 0x100)]
         {
             let f = elf(address, &[(RX, 0x1000, address, 0x10, size)], 0x100);
-            assert_eq!(parse(&f, END), Err(ElfError::SegmentOutsideUserSpace), "{address:#x}");
+            assert_eq!(parse(&*f, END), Err(ElfError::SegmentOutsideUserSpace), "{address:#x}");
         }
         let f = elf(0x40_0000, &[(RX, 0x1000, u64::MAX - 0x10, 0x10, 0x100)], 0x100);
-        assert_eq!(parse(&f, END), Err(ElfError::SegmentOutsideUserSpace), "wraps around");
+        assert_eq!(parse(&*f, END), Err(ElfError::SegmentOutsideUserSpace), "wraps around");
     }
 
     #[test]
     fn enforces_w_xor_x() {
         let f = elf(0x40_0000, &[(7, 0x1000, 0x40_0000, 0x10, 0x10)], 0x100);
-        assert_eq!(parse(&f, END), Err(ElfError::WritableAndExecutable));
+        assert_eq!(parse(&*f, END), Err(ElfError::WritableAndExecutable));
     }
 
     #[test]
@@ -297,19 +354,19 @@ mod tests {
             &[(RX, 0x1000, 0x40_0000, 0x100, 0x100), (RW, 0x1100, 0x40_0800, 0x10, 0x10)],
             0x200,
         );
-        assert_eq!(parse(&f, END), Err(ElfError::SegmentsOverlap));
+        assert_eq!(parse(&*f, END), Err(ElfError::SegmentsOverlap));
     }
 
     #[test]
     fn limits_the_memory_a_program_may_ask_for() {
-        // 16 bytes of file, 64 MiB and a page of zeros: refused.
+        // 16 bytes of file, MEMORY_MAX and a page of zeros: refused.
         let f = elf(0x40_0000, &[(RX, 0x1000, 0x40_0000, 0x10, 0x10), (RW, 0x1010, 0x80_0000, 0x10, MEMORY_MAX)], 0x100);
-        assert_eq!(parse(&f, END), Err(ElfError::TooBig));
+        assert_eq!(parse(&*f, END), Err(ElfError::TooBig));
         // The limit is on the total, so many medium segments do not get around it.
-        let many: Vec<Header> = (0..5).map(|n| (RW, 0x1000, 0x1000_0000 * (n + 1), 0x10, 16 << 20)).collect();
-        assert_eq!(parse(&elf(0x1000_0000, &many, 0x100), END), Err(ElfError::TooBig));
+        let many: Vec<Header> = (0..5).map(|n| (RW, 0x1000, 0x1000_0000 * (n + 1), 0x10, MEMORY_MAX / 4)).collect();
+        assert_eq!(parse(&*elf(0x1000_0000, &many, 0x100), END), Err(ElfError::TooBig));
         let f = elf(0x40_0000, &[(RX, 0x1000, 0x40_0000, 0x10, 0x10), (RW, 0x1010, 0x80_0000, 0x10, MEMORY_MAX - 0x1000)], 0x100);
-        assert!(parse(&f, END).is_ok(), "exactly the limit is fine");
+        assert!(parse(&*f, END).is_ok(), "exactly the limit is fine");
     }
 
     #[test]
@@ -325,7 +382,7 @@ mod tests {
             for flip in [0x01, 0x80, 0xFF] {
                 let mut f = good.clone();
                 f[position] ^= flip;
-                if let Ok(image) = parse(&f, END) {
+                if let Ok(image) = parse(&*f, END) {
                     for s in &image.segments {
                         assert!(s.file_range.end <= f.len() && s.file_range.len() as u64 <= s.virtual_range.end - s.virtual_range.start);
                         assert!(s.virtual_range.start >= LOWEST_ADDRESS && s.virtual_range.end <= END);
@@ -335,12 +392,43 @@ mod tests {
         }
     }
 
+    /// `typical()` with a PT_GNU_STACK header asking for `size` bytes.
+    fn asking_for_a_stack(size: u64) -> Vec<u8> {
+        let mut f = elf(
+            0x40_0010,
+            &[(RX, 0x1000, 0x40_0000, 0x100, 0x100), (RW, 0, 0, 0, size)],
+            0x200,
+        );
+        f[64 + 56..][..4].copy_from_slice(&PT_GNU_STACK.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn a_program_gets_the_stack_it_asks_for() {
+        assert_eq!(parse(&*typical(), END).unwrap().stack, STACK_MIN, "not asked: the least");
+        assert_eq!(parse(&*asking_for_a_stack(0), END).unwrap().stack, STACK_MIN, "a header without a size");
+        assert_eq!(parse(&*asking_for_a_stack(1 << 20), END).unwrap().stack, 1 << 20);
+        assert_eq!(parse(&*asking_for_a_stack(1000), END).unwrap().stack, STACK_MIN, "never less than the least");
+        assert_eq!(parse(&*asking_for_a_stack(STACK_MIN + 1), END).unwrap().stack, STACK_MIN + PAGE, "whole pages");
+        assert_eq!(parse(&*asking_for_a_stack(STACK_MAX), END).unwrap().stack, STACK_MAX);
+        assert_eq!(parse(&*asking_for_a_stack(STACK_MAX + 1), END), Err(ElfError::TooBig));
+    }
+
+    #[test]
+    fn limits_how_many_headers_are_read() {
+        let headers: Vec<Header> = (0..HEADERS_MAX + 1).map(|_| (R, 0, 0, 0, 0)).collect();
+        let mut f = elf(0x40_0000, &headers, 0x2000);
+        assert_eq!(parse(&*f, END), Err(ElfError::BadProgramHeaders));
+        f[56..58].copy_from_slice(&(HEADERS_MAX as u16).to_le_bytes());
+        assert_eq!(parse(&*f, END), Err(ElfError::NothingToLoad), "the limit itself is read");
+    }
+
     #[test]
     fn the_entry_point_must_be_executable() {
         let f = elf(0x40_2000, &[(RX, 0x1000, 0x40_0000, 0x100, 0x100), (RW, 0x1100, 0x40_2000, 0x10, 0x10)], 0x200);
-        assert_eq!(parse(&f, END), Err(ElfError::EntryNotExecutable));
+        assert_eq!(parse(&*f, END), Err(ElfError::EntryNotExecutable));
         let f = elf(0x40_0000, &[], 0);
-        assert_eq!(parse(&f, END), Err(ElfError::NothingToLoad));
+        assert_eq!(parse(&*f, END), Err(ElfError::NothingToLoad));
     }
 
     #[test]
@@ -356,7 +444,7 @@ mod tests {
         ] {
             let mut f = typical();
             f[18..20].copy_from_slice(&written.to_le_bytes());
-            let result = parse_for(&f, END, asked);
+            let result = parse_for(&*f, END, asked);
             if good {
                 assert!(result.is_ok(), "{written} for {asked}");
             } else {
