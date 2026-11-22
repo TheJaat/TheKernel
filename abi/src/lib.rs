@@ -30,6 +30,11 @@
 #![no_std]
 
 /// System call numbers.
+/// How many ticks - what `call::TICKS` counts, and `call::SLEEP`
+/// waits for - make a second. A program needs it to turn ticks into
+/// time (the C library's `time` and `gettimeofday`).
+pub const TICKS_PER_SECOND: u64 = 100;
+
 pub mod call {
     /// exit(code) - ends the process. Never returns.
     pub const EXIT: u64 = 0;

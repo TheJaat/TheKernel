@@ -48,6 +48,7 @@ pub fn init_cpu() {
         percpu::install(percpu::boot(), gdt::boot_tables());
         idt::init();
         syscall::init();
+        context::enable_fpu();
     }
 }
 

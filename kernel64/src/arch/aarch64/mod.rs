@@ -49,8 +49,12 @@ pub fn console_write_bytes(bytes: &[u8]) {
 /// Points the CPU at the kernel's exception vectors: from here on a
 /// fault is a message rather than silence.
 pub fn init_cpu() {
-    // SAFETY: called once, from kernel_main, on the only CPU running.
-    unsafe { vectors::init() };
+    // SAFETY: called once, from kernel_main, on the only CPU running,
+    // before any thread exists.
+    unsafe {
+        vectors::init();
+        context::enable_fpu();
+    }
 }
 
 /// Raises a breakpoint exception, which the handler reports and

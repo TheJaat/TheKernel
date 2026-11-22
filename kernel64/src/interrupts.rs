@@ -9,8 +9,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::threads::WaitQueue;
 
-/// Timer interrupts per second.
-pub const HZ: u64 = 100;
+/// Timer interrupts per second: the one number programs are told, in
+/// the ABI.
+pub const HZ: u64 = abi::TICKS_PER_SECOND;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
