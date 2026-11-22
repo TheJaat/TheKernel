@@ -198,6 +198,8 @@ said '^built: the C library and 11 programs' "the build script did not get to it
 grep -a "source: /src/build: stopped" "$LOG" && fail "the build script stopped part way"
 [ "$(grep -ac '^library: [0-9]* checks, all passed' "$LOG")" -eq 2 ] \
     || fail "clib, with the C library built on TheTaaJ, did not pass its checks"
+[ "$(grep -ac '^library: atexit ran its handlers, newest first' "$LOG")" -eq 2 ] \
+    || fail "exit did not run clib's atexit handlers, newest first"
 said '^cprimes: 25 primes below 100' "cprimes, built on TheTaaJ, did not count"
 said '^argv\[2\] here' "chello, built on TheTaaJ, did not get its arguments"
 said '\[shell\] /src/tcc/build line [0-9]+: "tcc tcc\.c -o tcc2"' "the script in which tcc builds itself did not start"
@@ -254,7 +256,7 @@ cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was
 [ "$(cat "$WORK/hi.out")" = 0.125 ] || fail "the program typed in the editor printed $(cat "$WORK/hi.out"), not 0.125"
 
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
-for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128; do FILES="$FILES src/libc/c/$f.o"; done
+for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit; do FILES="$FILES src/libc/c/$f.o"; done
 for p in chello cmem cprint cfile cstdio cwords cask cprimes cnet cfloat clib; do FILES="$FILES src/libc/programs/$p"; done
 FILES="$FILES src/tcc/tcc2 src/tcc/tcc3 src/tcc/lib/libtcc1.a hello3"
 for o in "$TCC_DIR"/helpers/*.o; do FILES="$FILES src/tcc/lib/$(basename "$o")"; done
@@ -265,5 +267,5 @@ for file in $FILES; do
         || fail "$file, written by tcc on TheTaaJ, is not what the same tcc on the host writes (see $WORK)"
     count=$((count + 1))
 done
-echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a and its 11 objects) and 11 programs built by source /src/build, and tcc2, tcc3 (the same file: TCC compiled by itself), libtcc1.a and its objects, and hello3 built by source /src/tcc/build"
+echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a and its 15 objects) and 11 programs built by source /src/build, and tcc2, tcc3 (the same file: TCC compiled by itself), libtcc1.a and its objects, and hello3 built by source /src/tcc/build"
 exit 0
