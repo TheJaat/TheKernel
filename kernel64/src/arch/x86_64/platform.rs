@@ -4,7 +4,8 @@
 //!
 //!   0x00-0x1F  CPU exceptions (idt.rs)
 //!   0x20       local APIC timer
-//!   0x21       keyboard (ISA IRQ 1, through the I/O APIC)
+//!   0x21       the PS/2 controller: keyboard (ISA IRQ 1) and mouse
+//!              (ISA IRQ 12), both through the I/O APIC
 //!   0x30-0x3F  PCI devices' MSI-X messages, one vector per device line
 //!   0xE0-0xEF  the disabled 8259 PICs - only ever spurious
 //!   0xF0       "choose again": sent by one CPU to another (smp.rs)
@@ -47,6 +48,7 @@ pub struct Report {
     pub bus_hz: u64,
     pub tsc_hz: u64,
     pub keyboard_gsi: Option<u32>,
+    pub mouse_gsi: Option<u32>,
 }
 
 static IO_APICS: IrqLock<Vec<apic::IoApic>> = IrqLock::new(Vec::new());
@@ -80,6 +82,7 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
         bus_hz: 0,
         tsc_hz: 0,
         keyboard_gsi: None,
+        mouse_gsi: None,
     };
 
     {
@@ -98,6 +101,16 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
         if let Some(io) = io_apics.iter().find(|io| io.handles(route.gsi)) {
             io.route(route.gsi, KEYBOARD_VECTOR, route.polarity, route.trigger, cpu);
             report.keyboard_gsi = Some(route.gsi);
+        }
+        // And the mouse: ISA IRQ 12, on the same controller - to the
+        // same vector, and so the same interrupt line. Its driver is
+        // the keyboard's: both devices' bytes arrive at port 0x60, and
+        // the controller's status says whose each one is, so one wait
+        // and one read serve both.
+        let route = madt.isa_route(12);
+        if let Some(io) = io_apics.iter().find(|io| io.handles(route.gsi)) {
+            io.route(route.gsi, KEYBOARD_VECTOR, route.polarity, route.trigger, cpu);
+            report.mouse_gsi = Some(route.gsi);
         }
     }
 

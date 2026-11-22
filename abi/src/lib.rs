@@ -473,6 +473,57 @@ pub mod display {
     /// The size of the memory init keeps for the display's text, so
     /// that it outlives any one display process: 64 KiB.
     pub const KEPT_SIZE: u64 = 64 * 1024;
+    /// Followed by a `Pointer`: what a mouse or a tablet did. Sent by
+    /// the drivers of pointing devices (kbd for the PC's PS/2 mouse,
+    /// hid for virtio ones), on a send-only copy of this channel.
+    pub const POINTER: u8 = 4;
+
+    /// A pointer's report: moved by (x, y) pixels (`absolute` false,
+    /// right and down positive), or is at (x, y), each 0..=ABSOLUTE_MAX
+    /// across the screen (`absolute` true); and the buttons held, a bit
+    /// each (1 left, 2 right, 4 middle).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Pointer {
+        pub absolute: bool,
+        pub x: i32,
+        pub y: i32,
+        pub buttons: u8,
+    }
+
+    /// The range of an absolute position on each axis.
+    pub const ABSOLUTE_MAX: i32 = 0x7FFF;
+
+    impl Pointer {
+        /// The whole message: POINTER, then whether absolute (0 or 1),
+        /// x and y (i32 LE), the buttons.
+        pub const SIZE: usize = 1 + 1 + 4 + 4 + 1;
+
+        pub fn to_message(&self) -> [u8; Pointer::SIZE] {
+            let mut message = [0u8; Pointer::SIZE];
+            message[0] = POINTER;
+            message[1] = u8::from(self.absolute);
+            message[2..6].copy_from_slice(&self.x.to_le_bytes());
+            message[6..10].copy_from_slice(&self.y.to_le_bytes());
+            message[10] = self.buttons;
+            message
+        }
+
+        /// None unless `message` is a whole POINTER message, absolute
+        /// positions inside their range.
+        pub fn from_message(message: &[u8]) -> Option<Pointer> {
+            let message: &[u8; Pointer::SIZE] = message.try_into().ok()?;
+            if message[0] != POINTER || message[1] > 1 {
+                return None;
+            }
+            let x = i32::from_le_bytes([message[2], message[3], message[4], message[5]]);
+            let y = i32::from_le_bytes([message[6], message[7], message[8], message[9]]);
+            let absolute = message[1] == 1;
+            if absolute && !((0..=ABSOLUTE_MAX).contains(&x) && (0..=ABSOLUTE_MAX).contains(&y)) {
+                return None;
+            }
+            Some(Pointer { absolute, x, y, buttons: message[10] })
+        }
+    }
 }
 
 /// A ping: the one message a service's ping channel carries - this
@@ -1664,6 +1715,36 @@ pub mod net {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pointer_message_goes_there_and_back() {
+        use crate::display::{self, Pointer, ABSOLUTE_MAX};
+        for pointer in [
+            Pointer { absolute: false, x: -256, y: 255, buttons: 1 },
+            Pointer { absolute: false, x: i32::MIN, y: i32::MAX, buttons: 7 },
+            Pointer { absolute: true, x: 0, y: ABSOLUTE_MAX, buttons: 0 },
+        ] {
+            let message = pointer.to_message();
+            assert_eq!(message[0], display::POINTER);
+            assert_eq!(Pointer::from_message(&message), Some(pointer));
+        }
+        let good = Pointer { absolute: true, x: 5, y: 6, buttons: 2 }.to_message();
+        assert_eq!(Pointer::from_message(&good[..10]), None);
+        let mut longer = [0u8; 12];
+        longer[..11].copy_from_slice(&good);
+        assert_eq!(Pointer::from_message(&longer), None);
+        let mut wrong = good;
+        wrong[0] = display::TEXT;
+        assert_eq!(Pointer::from_message(&wrong), None);
+        let mut wrong = good;
+        wrong[1] = 2;
+        assert_eq!(Pointer::from_message(&wrong), None);
+        // Absolute, and off the range: refused. Relative: any number.
+        let outside = Pointer { absolute: true, x: ABSOLUTE_MAX + 1, y: 0, buttons: 0 }.to_message();
+        assert_eq!(Pointer::from_message(&outside), None);
+        let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0 }.to_message();
+        assert_eq!(Pointer::from_message(&outside), None);
+    }
     #[test]
     fn a_memory_mapped_device_survives_the_trip_through_bytes() {
         use super::{MmioDeviceInfo, PciDeviceInfo};

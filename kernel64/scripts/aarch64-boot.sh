@@ -32,6 +32,12 @@
 #              list the PC's boot test types, typed here as the bytes a
 #              terminal sends (serial-type.py, which also says what "/"
 #              and "~" in the list mean)
+#   SCREEN     "1" if the machine has a screen and a virtio keyboard
+#              (QEMU_ARGS gives them): KEYS are then typed on that
+#              keyboard, and pointers moved, through a QMP socket
+#              (qmp-type.py, which says what the tokens mean), once the
+#              keyboard's driver is ready; and the screen is saved to
+#              LOG.ppm at the end
 
 set -u
 
@@ -70,7 +76,14 @@ if [ -n "${UEFI:-}" ]; then
 else
     set -- -kernel "$IMAGE"
 fi
-if [ -n "$KEYS" ]; then
+SCREEN=${SCREEN:-}
+QMP="$LOG.qmp"
+if [ -n "$SCREEN" ]; then
+    rm -f "$QMP" "$LOG.ppm"
+    qemu-system-aarch64 -M "virt$MACHINE" -cpu "${CPU:-cortex-a72}" -m "${MEMORY:-512M}" \
+        -display none -no-reboot -serial "file:$LOG" -monitor none -qmp "unix:$QMP,server,nowait" \
+        "$@" ${QEMU_ARGS:-} 2> "$LOG.qemu" &
+elif [ -n "$KEYS" ]; then
     # The serial port both ways: out to the log, in from a pipe this
     # script keeps open (QEMU would see the end of input otherwise, as
     # soon as the first writer closed it).
@@ -103,7 +116,18 @@ done
 
 # The driver is a process that starts after the kernel goes idle: type
 # only once it says it is ready.
-if [ -n "$KEYS" ] && grep -aq "\[kernel\] idle" "$LOG"; then
+if [ -n "$SCREEN" ] && grep -aq "\[kernel\] idle" "$LOG"; then
+    ticks=0
+    until grep -aq "\[hid\] virtio keyboard" "$LOG" || [ $ticks -ge 50 ]; do
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    if [ $ticks -lt 50 ]; then
+        "$(dirname "$0")/qmp-type.py" "$LOG" "$QMP" "$LOG.ppm" $KEYS
+    else
+        echo "aarch64-boot: the virtio keyboard's driver never said it was ready - nothing typed" >&2
+    fi
+elif [ -n "$KEYS" ] && grep -aq "\[kernel\] idle" "$LOG"; then
     ticks=0
     until grep -aq "\[serial\] serial port ready" "$LOG" || [ $ticks -ge 50 ]; do
         sleep 0.1
@@ -118,7 +142,8 @@ fi
 
 kill $qemu 2>/dev/null
 wait $qemu 2>/dev/null
-[ -n "$KEYS" ] && { exec 9<&-; rm -f "$FIFO"; }
+[ -z "$SCREEN" ] && [ -n "$KEYS" ] && { exec 9<&-; rm -f "$FIFO"; }
+rm -f "$QMP"
 # QEMU's own remarks: only "terminating on signal 15" is expected.
 grep -v "terminating on signal" "$LOG.qemu" >&2
 

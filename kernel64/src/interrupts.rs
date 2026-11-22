@@ -143,7 +143,8 @@ impl InterruptLine {
     }
 }
 
-/// ISA IRQ 1.
+/// The PC's PS/2 controller: ISA IRQ 1 (the keyboard) and 12 (the
+/// mouse), which share a vector.
 pub static KEYBOARD: InterruptLine = InterruptLine::new();
 
 /// Lines for devices that interrupt with messages (MSI-X): one per

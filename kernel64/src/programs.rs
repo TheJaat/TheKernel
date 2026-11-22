@@ -45,6 +45,9 @@ pub static BLK: &[u8] = program!("blk");
 pub static NIC: &[u8] = program!("nic");
 /// The network service: the protocols, and who has which port.
 pub static NET: &[u8] = program!("net");
+/// The screen: the PC's framebuffer, or the one QEMU's AArch64 machine
+/// gets with `-device ramfb`.
+pub static DISPLAY: &[u8] = program!("display");
 
 /// The system's own programs: the first process, and what it starts.
 pub static INIT: &[u8] = program!("init");
@@ -58,7 +61,6 @@ mod pc {
     pub static GS: &[u8] = program!("gs");
     pub static PORT: &[u8] = program!("port");
     pub static KBD: &[u8] = program!("kbd");
-    pub static DISPLAY: &[u8] = program!("display");
 }
 #[cfg(target_arch = "x86_64")]
 pub use pc::*;
@@ -73,6 +75,11 @@ pub static BLKCHECK: &[u8] = program!("blkcheck");
 /// AArch64 only: the serial port's driver - keyboard and screen in one.
 #[cfg(target_arch = "aarch64")]
 pub static SERIAL: &[u8] = program!("serial");
+/// AArch64 only, so far: the virtio keyboards' and pointers' driver.
+/// (The PC's QEMU offers them only through the modern PCI interface,
+/// which no driver here speaks; its PS/2 mouse is kbd's.)
+#[cfg(target_arch = "aarch64")]
+pub static HID: &[u8] = program!("hid");
 
 /// The programs the user-mode self-test runs, and how each must end:
 /// with an exit code of its own, or killed for breaking a rule.
@@ -116,11 +123,13 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("peek", PEEK),
 ];
 
-/// On AArch64 the serial port's driver takes the place of the
-/// keyboard's and the display's.
+/// On AArch64 the serial port's driver is keyboard and screen in one -
+/// unless the machine has a screen, and virtio devices to type with.
 #[cfg(target_arch = "aarch64")]
 static PROGRAMS: &[(&str, &[u8])] = &[
     ("serial", SERIAL),
+    ("display", DISPLAY),
+    ("hid", HID),
     ("shell", SHELL),
     ("fs", FS),
     ("blk", BLK),

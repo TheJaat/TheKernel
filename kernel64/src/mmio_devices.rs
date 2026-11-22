@@ -33,7 +33,7 @@
 //! kernel that had to share a page between drivers would have to do
 //! the register accesses itself.
 //!
-//! Only legacy block devices are made ready so far.
+//! Legacy block, network and input devices are made ready.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -53,6 +53,12 @@ const BLOCK_DMA_PAGES: u64 = 16;
 /// And for a network card's: two queues, and forty buffers of a frame
 /// each (`user/src/bin/nic.rs` says where each lies).
 const NETWORK_DMA_PAGES: u64 = 40;
+/// And for an input device's: one small queue of events (two pages),
+/// and the events themselves (one).
+const INPUT_DMA_PAGES: u64 = 3;
+/// The most input devices made ready: a keyboard and a pointer, and
+/// room for one more of each.
+const INPUTS_MAX: usize = 4;
 
 /// A device made ready: its description, and the handles a driver is
 /// started with - registers, DMA memory, then the interrupt if there
@@ -68,6 +74,7 @@ pub fn prepare(found: &Found) -> Result<Ready, &'static str> {
     let dma_pages = match found.identity.device {
         mmio::DEVICE_BLOCK => BLOCK_DMA_PAGES,
         mmio::DEVICE_NETWORK => NETWORK_DMA_PAGES,
+        mmio::DEVICE_INPUT => INPUT_DMA_PAGES,
         _ => return Err("no driver for this kind of device yet"),
     };
     if found.identity.version != 1 {
@@ -120,6 +127,22 @@ pub fn first_disk(found: &[Found]) -> Option<Ready> {
 /// The same for the first network card.
 pub fn first_network(found: &[Found]) -> Option<Ready> {
     first(found, mmio::DEVICE_NETWORK)
+}
+
+/// Every input device among `found`, made ready - up to INPUTS_MAX.
+pub fn inputs(found: &[Found]) -> Vec<Ready> {
+    let mut ready = Vec::new();
+    for device in found.iter().filter(|device| device.identity.device == mmio::DEVICE_INPUT) {
+        if ready.len() == INPUTS_MAX {
+            kprintln!("[virtio] {:#x} input device: {INPUTS_MAX} are ready already - not this one", device.slot.registers.start);
+            continue;
+        }
+        match prepare(device) {
+            Ok(device) => ready.push(device),
+            Err(why) => kprintln!("[virtio] {:#x} input device: {why}", device.slot.registers.start),
+        }
+    }
+    ready
 }
 
 fn first(found: &[Found], kind: u32) -> Option<Ready> {

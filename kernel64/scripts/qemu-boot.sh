@@ -17,7 +17,10 @@
 #              the shell has run every line typed so far - for ten
 #              seconds at most; "~~" waits up to ninety, for a line that
 #              is meant to take a while. The script then waits
-#              for the shell to echo a line.
+#              for the shell to echo a line. A token starting with "!"
+#              is a monitor command, its commas standing for spaces:
+#              "!mouse_move,100,50" moves the PS/2 mouse, and
+#              "!mouse_button,1" holds its left button down (0 lets go).
 #   DISK       a raw disk image, attached as a virtio block device
 #   SMP        how many CPUs the machine has (default 4)
 
@@ -127,6 +130,15 @@ if [ $finished -eq 0 ]; then
                 done
                 continue
             fi
+            case $key in
+                !*)
+                    # Not a key: a command for the monitor. A pause after
+                    # it, so the mouse's packet is read before the next.
+                    echo "${key#!}" | tr ',' ' ' | nc -U -N "$MONITOR" > /dev/null
+                    sleep 0.2
+                    continue
+                    ;;
+            esac
             [ "$key" = "ret" ] && entered=$((entered + 1))
             echo "sendkey $key" | nc -U -N "$MONITOR" > /dev/null
             sleep 0.05

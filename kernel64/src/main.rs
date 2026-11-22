@@ -317,6 +317,8 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     kprintln!();
     let mut disk = None;
     let mut network = None;
+    let mut inputs = alloc::vec::Vec::new();
+    let mut screen = None;
     // SAFETY: once, on the only CPU running, interrupts still masked.
     let threads_run = match unsafe { arch::init_interrupts(&machine) } {
         Some(interrupts) => {
@@ -372,6 +374,14 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
             // someone on the wire to be tested against, which is a
             // test of the whole system's.
             network = mmio_devices::first_network(&devices);
+            // Keyboards, mice and tablets: each made ready for the one
+            // driver that serves them all.
+            inputs = mmio_devices::inputs(&devices);
+            // And a screen, if the machine was given one.
+            screen = match &tree {
+                Some(Ok(tree)) => ramfb(tree),
+                _ => None,
+            };
             true
         }
         None => {
@@ -428,7 +438,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 
     // The rest is programs: init, and what init starts. They need
     // threads, and a terminal to be of any use.
-    if threads_run && start_init(&machine, disk.into_iter().chain(network)) {
+    if threads_run && start_init(&machine, screen, disk.into_iter().chain(network).chain(inputs)) {
         idle()
     }
     kprintln!();
@@ -456,7 +466,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 /// False - and nothing started - if the device tree describes no
 /// serial port with an interrupt.
 #[cfg(target_arch = "aarch64")]
-fn start_init(machine: &kernel64::devicetree::Machine, devices: impl IntoIterator<Item = mmio_devices::Ready>) -> bool {
+fn start_init(
+    machine: &kernel64::devicetree::Machine,
+    screen: Option<(abi::FramebufferInfo, memory_object::MemoryObject)>,
+    devices: impl IntoIterator<Item = mmio_devices::Ready>,
+) -> bool {
     use ipc::Object;
     use kernel64::cap::Rights;
     use kernel64::paging::Flags;
@@ -478,8 +492,22 @@ fn start_init(machine: &kernel64::devicetree::Machine, devices: impl IntoIterato
     );
 
     let (from_kernel, to_init) = ipc::channel();
+    // The screen first, described as the PC's is: init cannot tell
+    // which kind of machine drew it.
+    if let Some((description, memory)) = screen {
+        let mut message = b"framebuffer".to_vec();
+        message.extend_from_slice(&description.to_bytes());
+        match ipc::kernel_send(&to_init, &message, alloc::vec![(Object::Memory(alloc::sync::Arc::new(memory)), Rights::ALL)]) {
+            Ok(()) => kprintln!("framebuffer: {}x{}, handed to init", description.width, description.height),
+            Err(error) => kprintln!("framebuffer: could not hand it to init: {error:?}"),
+        }
+    }
     for device in devices {
-        let what = if device.info.device == virtio::mmio::DEVICE_NETWORK { "network card" } else { "block device" };
+        let what = match device.info.device {
+            virtio::mmio::DEVICE_NETWORK => "network card",
+            virtio::mmio::DEVICE_INPUT => "input device",
+            _ => "block device",
+        };
         let mut message = b"mmio".to_vec();
         message.extend_from_slice(&device.info.to_bytes());
         match ipc::kernel_send(&to_init, &message, device.handles) {
@@ -499,6 +527,110 @@ fn start_init(machine: &kernel64::devicetree::Machine, devices: impl IntoIterato
     let (init, _) = process::spawn("init", programs::INIT, handles).expect("starting init");
     process::set_essential(&init);
     true
+}
+
+/// The screen's size. The PC's loader picks the same, so that both
+/// machines show the same console.
+#[cfg(target_arch = "aarch64")]
+const SCREEN: (u32, u32) = (1024, 768);
+
+/// A screen, if QEMU was asked for one (`-device ramfb`): memory for
+/// its pixels, and QEMU told where it is (kernel64::fwcfg says how).
+/// None, and a line saying why, if there is no fw_cfg device, no
+/// "etc/ramfb" in it, or no memory.
+#[cfg(target_arch = "aarch64")]
+fn ramfb(tree: &kernel64::devicetree::Tree) -> Option<(abi::FramebufferInfo, memory_object::MemoryObject)> {
+    use core::sync::atomic::{fence, Ordering};
+    use kernel64::fwcfg;
+    use kernel64::memory::addr::{phys_to_virt, PhysAddr};
+    use memory_object::MemoryObject;
+
+    let registers = tree.compatible("qemu,fw-cfg-mmio")?.reg().next()?;
+    if registers.size < fwcfg::DMA_ADDRESS + 8 {
+        kprintln!("[screen] the fw_cfg device at {:#x} is too small to be one", registers.start);
+        return None;
+    }
+    let base = mm::map_mmio(registers.start, registers.size);
+    // SAFETY (the three closures): registers of the fw_cfg device,
+    // mapped as device memory just above; volatile, because each access
+    // is an instruction to the device.
+    let select = |selector: u16| unsafe { ((base + fwcfg::SELECTOR) as *mut u16).write_volatile(selector.to_be()) };
+    let byte = || unsafe { ((base + fwcfg::DATA) as *const u8).read_volatile() };
+    let dma = |half: u64, value: u32| unsafe { ((base + fwcfg::DMA_ADDRESS + half) as *mut u32).write_volatile(value.to_be()) };
+
+    // The directory: a count, then an entry per file. Read whole (it is
+    // a few kilobytes), with a limit on what a broken count can ask.
+    select(fwcfg::FILE_DIR);
+    let mut directory = alloc::vec::Vec::new();
+    directory.extend((0..4).map(|_| byte()));
+    let count = u32::from_be_bytes([directory[0], directory[1], directory[2], directory[3]]).min(1024) as usize;
+    directory.extend((0..count * fwcfg::DIR_ENTRY).map(|_| byte()));
+    let Some((selector, size)) = fwcfg::find(&directory, "etc/ramfb") else {
+        kprintln!("[screen] none: QEMU has no ramfb device (fw_cfg lists {count} files)");
+        return None;
+    };
+    if size as usize != fwcfg::RAMFB_CONFIG {
+        kprintln!("[screen] etc/ramfb is {size} bytes, not the {} it should be: not used", fwcfg::RAMFB_CONFIG);
+        return None;
+    }
+
+    let (width, height) = SCREEN;
+    let stride = width * 4;
+    let pages = (u64::from(stride) * u64::from(height)).div_ceil(4096);
+    let Some((pixels, physical)) = MemoryObject::contiguous(pages) else {
+        kprintln!("[screen] no {} KiB of contiguous memory for the pixels", pages * 4);
+        return None;
+    };
+    // The request and the description it carries, in one page of its
+    // own: QEMU reads both by their physical addresses.
+    let (page, page_physical) = MemoryObject::contiguous(1)?;
+    let config = fwcfg::ramfb_config(physical, width, height, stride);
+    let request = fwcfg::dma_write(selector, config.len() as u32, page_physical + 64);
+    let window = phys_to_virt(PhysAddr::new(page_physical)).as_mut_ptr::<u8>();
+    // SAFETY: the fresh page, through the direct map, ours alone.
+    unsafe {
+        window.add(64).copy_from_nonoverlapping(config.as_ptr(), config.len());
+        window.copy_from_nonoverlapping(request.as_ptr(), request.len());
+    }
+    // Everything in memory before the device is told where to look.
+    fence(Ordering::SeqCst);
+    dma(0, (page_physical >> 32) as u32);
+    dma(4, page_physical as u32);
+    fence(Ordering::SeqCst);
+    // QEMU does it at once; the wait is for a device that does not.
+    let done = (0..1_000_000).find_map(|_| {
+        // SAFETY: the request's first field, in the page above.
+        let control = u32::from_be(unsafe { (window as *const u32).read_volatile() });
+        fwcfg::dma_done(control)
+    });
+    match done {
+        Some(Ok(())) => drop(page),
+        Some(Err(())) => {
+            kprintln!("[screen] fw_cfg refused the ramfb description");
+            return None;
+        }
+        None => {
+            // The device may still read the request, and write its
+            // answer into it, later: the page must never be reused.
+            core::mem::forget(page);
+            kprintln!("[screen] fw_cfg did not finish writing the ramfb description");
+            return None;
+        }
+    }
+    kprintln!("[screen] ramfb: {width}x{height}, 32 bits a pixel, {} KiB at {physical:#x}", pages * 4);
+    let description = abi::FramebufferInfo {
+        width,
+        height,
+        pitch: stride,
+        bpp: 32,
+        red_size: 8,
+        red_shift: 16,
+        green_size: 8,
+        green_shift: 8,
+        blue_size: 8,
+        blue_shift: 0,
+    };
+    Some((description, pixels))
 }
 
 /// Prints what the device tree said about the machine.
@@ -641,6 +773,10 @@ fn report_platform(p: &arch::platform::Report) {
     match p.keyboard_gsi {
         Some(gsi) => kprintln!("[irq] PS/2 keyboard on GSI {gsi}"),
         None => kprintln!("[irq] no PS/2 keyboard"),
+    }
+    match p.mouse_gsi {
+        Some(gsi) => kprintln!("[irq] PS/2 mouse on GSI {gsi}, sharing the keyboard's vector"),
+        None => kprintln!("[irq] no PS/2 mouse"),
     }
 }
 
