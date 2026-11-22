@@ -2,7 +2,7 @@
 # tcc-test.sh - a C compiler running on TheTaaJ: TCC compiles C
 # programs there, which then run there - a few on their own, then the C
 # library and all of TheTaaJ's C programs by a build script, then a
-# program typed into the editor. Afterwards, on the host, each file it
+# program typed into the editor, and TCC building itself. Afterwards, on the host, each file it
 # wrote is compared, byte for byte, with what the same TCC built to run
 # on the host (the cross compiler) writes from the same sources.
 #
@@ -21,7 +21,7 @@
 # the script that builds them (tools/put-sources.sh); and hello.c
 # (printf, a double, a struct, a loop), chello.c and clib.c from
 # libc/programs, bad.c (a mistake), and welcome and docs/, which clib
-# reads. The steps:
+# reads; and TCC's own sources in /src/tcc. The steps:
 #
 #   tcc hello.c -o hello       compile and link in one go
 #   hello                      "hello from tcc: 6 * 7 = 42, 1/8 = 0.125"
@@ -43,6 +43,13 @@
 #                              clib again, now with a C library TCC
 #                              compiled too
 #   src/libc/programs/cprimes 100, src/libc/programs/chello built here
+#   time source /src/tcc/build TCC builds itself (ports/tcc-ARCH.taaj):
+#                              /tcc compiles tcc.c into tcc2, tcc2
+#                              compiles it into tcc3, tcc3 compiles
+#                              TCC's library, libtcc1.a
+#   cd /, then with files src/tcc/tcc3 hello.c -o hello3, and hello3
+#                              the third generation compiles and links
+#                              a program, which runs
 #   echo done
 #
 # and then, booted again with the same disk:
@@ -51,6 +58,11 @@
 #   tcc hi.c -o hi             compiled
 #   hi > hi.out                run: hi.out, read on the host, is "0.125"
 #   echo done
+#
+# On the host, tcc2 and tcc3 must both be the file the cross compiler
+# makes of tcc.c - the compiler compiled by itself is the same as the
+# compiler compiled by the one before it - and libtcc1.a, its objects
+# and hello3 must be the ones TheTaaJ was given and built before.
 #
 # The second boot types into the window system's terminal, as a person
 # would, so the editor gets the keys too: on AArch64 that machine has a
@@ -118,9 +130,9 @@ put() {
 }
 
 rm -f "$DISK"
-"$TFSTOOL" mkfs "$DISK" 2048 > /dev/null && truncate -s 8M "$DISK" || fail "cannot make the disk"
+"$TFSTOOL" mkfs "$DISK" 4096 > /dev/null && truncate -s 16M "$DISK" || fail "cannot make the disk"
 TFSTOOL="$TFSTOOL" "$ROOT/tools/put-tcc.sh" "$DISK" "$TCC_DIR" "$LIBC_A" || fail "cannot put tcc on the disk"
-TFSTOOL="$TFSTOOL" "$ROOT/tools/put-sources.sh" "$DISK" || fail "cannot put the sources on the disk"
+TFSTOOL="$TFSTOOL" "$ROOT/tools/put-sources.sh" "$DISK" "$ARCH" "$TCC_DIR" || fail "cannot put the sources on the disk"
 for file in hello.c chello.c clib.c bad.c welcome broken; do put "$file" "$WORK/$file"; done
 put edit "$EDIT"
 "$TFSTOOL" mkdir "$DISK" docs > /dev/null || fail "cannot make docs on the disk"
@@ -139,6 +151,9 @@ steps="$steps $(keys 'with files clib2') ret ~ $(keys 'tcc bad.c') ret ~~ $(keys
 steps="$steps $(keys 'time source /src/build') ret ~~ ~~ ~~ ~~ ~~ ~~"
 steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/libc/programs/clib') ret ~"
 steps="$steps $(keys 'src/libc/programs/cprimes 100') ret ~ $(keys 'src/libc/programs/chello built here') ret ~"
+# TCC builds itself: two compilations of tcc.c and TCC's library.
+steps="$steps $(keys 'time source /src/tcc/build') ret ~~ ~~ ~~ ~~"
+steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/tcc/tcc3 hello.c -o hello3') ret ~~ $(keys 'hello3') ret ~"
 steps="$steps $(keys 'echo done') ret ~"
 
 # The editor: Ctrl+J, not Enter, for the new line - the boot scripts
@@ -185,6 +200,12 @@ grep -a "source: /src/build: stopped" "$LOG" && fail "the build script stopped p
     || fail "clib, with the C library built on TheTaaJ, did not pass its checks"
 said '^cprimes: 25 primes below 100' "cprimes, built on TheTaaJ, did not count"
 said '^argv\[2\] here' "chello, built on TheTaaJ, did not get its arguments"
+said '\[shell\] /src/tcc/build line [0-9]+: "tcc tcc\.c -o tcc2"' "the script in which tcc builds itself did not start"
+said '\[shell\] /src/tcc/build line [0-9]+: "with files \.\./tcc3 -ar rcs libtcc1\.a' "tcc3 did not get to building TCC's library"
+said '^built: tcc by tcc, tcc by itself, and its library' "the script in which tcc builds itself did not get to its end"
+grep -a "source: /src/tcc/build: stopped" "$LOG" && fail "tcc did not build itself: the script stopped part way"
+[ "$(grep -ac '^hello from tcc: 6 \* 7 = 42, 1/8 = 0\.125' "$LOG")" -eq 2 ] \
+    || fail "hello3, compiled by the tcc that tcc compiled on TheTaaJ, did not print its line"
 said '\[shell\] line: "echo done"' "the shell did not get its keys back"
 grep -a 'has not answered for' "$LOG" && fail "a service stopped answering during the test"
 grep -aEq '\[edit\] saved hi\.c: 74 bytes, 2 lines' "$EDIT_LOG" || fail "the program typed in the editor was not saved (log: $EDIT_LOG)"
@@ -212,6 +233,18 @@ cp "$ROOT"/libc/programs/*.c "$WORK/src/libc/programs/"
 sed -e "s|^tcc |$TCC_DIR/cross/taaj-tcc |" -e "s|/src/|$WORK/src/|g" -e "s|/lib/libc-rust.o|$TCC_DIR/libc-rust.o|" \
     "$ROOT/libc/build.taaj" > "$WORK/build.sh"
 (sh -e "$WORK/build.sh" > "$WORK/build.out" 2>&1) || fail "the build script failed on the host (see $WORK/build.out)"
+# TCC's sources as put-sources.sh puts them (more of them: the others
+# are not read), compiled here once: tcc2 and tcc3 on the disk must
+# both be this.
+mkdir -p "$WORK/src/tcc"
+cp "$ROOT"/ports/tcc/*.c "$ROOT"/ports/tcc/*.h "$ROOT"/ports/tcc/*.def "$WORK/src/tcc/"
+case $ARCH in aarch64) TARGET=TCC_TARGET_ARM64 ;; *) TARGET=TCC_TARGET_X86_64 ;; esac
+{ cat "$TCC_DIR/native/config.h"; echo "#define $TARGET 1"; } > "$WORK/src/tcc/config.h"
+(cd "$WORK/src/tcc" && "$TCC_DIR/cross/taaj-tcc" tcc.c -o tcc2) || fail "the cross compiler on the host failed on tcc.c"
+cp "$WORK/src/tcc/tcc2" "$WORK/src/tcc/tcc3"
+mkdir -p "$WORK/src/tcc/lib"
+cp "$TCC_DIR/lib/tcc/libtcc1.a" "$TCC_DIR"/helpers/*.o "$WORK/src/tcc/lib/"
+cp "$WORK/hello" "$WORK/hello3"
 # What was typed into the editor, and that, compiled here.
 printf '#include <stdio.h>\nint main(void) { printf("%%.3f\\n", 1.0 / 8); return 0; }' > "$WORK/hi.c.typed"
 "$TFSTOOL" get "$DISK" hi.c > "$WORK/hi.c" || fail "hi.c cannot be read off the disk"
@@ -223,6 +256,8 @@ cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
 for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128; do FILES="$FILES src/libc/c/$f.o"; done
 for p in chello cmem cprint cfile cstdio cwords cask cprimes cnet cfloat clib; do FILES="$FILES src/libc/programs/$p"; done
+FILES="$FILES src/tcc/tcc2 src/tcc/tcc3 src/tcc/lib/libtcc1.a hello3"
+for o in "$TCC_DIR"/helpers/*.o; do FILES="$FILES src/tcc/lib/$(basename "$o")"; done
 count=0
 for file in $FILES; do
     "$TFSTOOL" get "$DISK" "$file" > "$WORK/got" || fail "$file cannot be read off the disk"
@@ -230,5 +265,5 @@ for file in $FILES; do
         || fail "$file, written by tcc on TheTaaJ, is not what the same tcc on the host writes (see $WORK)"
     count=$((count + 1))
 done
-echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a and its 11 objects) and 11 programs built by source /src/build"
+echo "tcc on TheTaaJ wrote all $count files byte for byte as tcc on the host does: hello, chello2, clib.o, clib2, hi, and the C library (libc.a and its 11 objects) and 11 programs built by source /src/build, and tcc2, tcc3 (the same file: TCC compiled by itself), libtcc1.a and its objects, and hello3 built by source /src/tcc/build"
 exit 0
