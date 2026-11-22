@@ -21,6 +21,9 @@
 #              is a monitor command, its commas standing for spaces:
 #              "!mouse_move,100,50" moves the PS/2 mouse, and
 #              "!mouse_button,1" holds its left button down (0 lets go).
+#              "see:TEXT" waits (ten seconds at most) until TEXT is in
+#              the log, its commas standing for spaces - for something
+#              a program says when it is ready for the next key.
 #   DISK       a raw disk image, attached as a virtio block device
 #   SMP        how many CPUs the machine has (default 4)
 
@@ -131,6 +134,16 @@ if [ $finished -eq 0 ]; then
                 continue
             fi
             case $key in
+                see:*)
+                    want=$(echo "${key#see:}" | tr ',' ' ')
+                    ticks=100
+                    until grep -aqF -- "$want" "$LOG" || [ $ticks -le 0 ]; do
+                        sleep 0.1
+                        ticks=$((ticks - 1))
+                    done
+                    [ $ticks -gt 0 ] || echo "qemu-boot: never saw \"$want\"" >&2
+                    continue
+                    ;;
                 !*)
                     # Not a key: a command for the monitor. A pause after
                     # it, so the mouse's packet is read before the next.

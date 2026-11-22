@@ -21,6 +21,15 @@ device, so keys go in as QEMU's own key events (the monitor's
        across the screen, as QEMU counts
   @btn,BUTTON
        press and let go BUTTON (left, right or middle)
+  @press,BUTTON and @release,BUTTON
+       only press it, or only let it go - a drag is a press, moves,
+       and a release
+  @at,X,Y
+       put the tablet's pointer on pixel (X, Y) of a 1024x768 screen:
+       the position in 0..32767 that the display turns into that pixel
+  see:TEXT
+       wait (ten seconds at most) until TEXT is in the log, its commas
+       standing for spaces
 
 Why QMP and not the monitor alone: the monitor's `mouse_move` moves
 only relative pointers, so a tablet cannot be moved with it; QMP's
@@ -119,8 +128,29 @@ def pointer(qmp, token):
         for down in (True, False):
             qmp.events([{"type": "btn", "data": {"down": down, "button": values[0]}}])
             time.sleep(0.1)
+    elif what in ("press", "release") and len(values) == 1:
+        qmp.events([{"type": "btn", "data": {"down": what == "press", "button": values[0]}}])
+    elif what == "at" and len(values) == 2:
+        x, y = absolute(int(values[0]), SCREEN[0]), absolute(int(values[1]), SCREEN[1])
+        qmp.events([
+            {"type": "abs", "data": {"axis": "x", "value": x}},
+            {"type": "abs", "data": {"axis": "y", "value": y}},
+        ])
     else:
         sys.exit(f"qmp-type: '{token}' is not a pointer token")
+
+
+# The screen the "@at" positions are on.
+SCREEN = (1024, 768)
+ABSOLUTE_MAX = 32767
+
+
+def absolute(pixel, size):
+    """The smallest tablet position the display maps to `pixel`: it
+    computes position * (size - 1) // ABSOLUTE_MAX."""
+    position = -(-pixel * ABSOLUTE_MAX // (size - 1))
+    assert position * (size - 1) // ABSOLUTE_MAX == pixel, (pixel, size)
+    return position
 
 
 def main():
@@ -130,6 +160,10 @@ def main():
     for token in tokens:
         if token in ("~", "~~"):
             wait_until(lambda: count(log, RAN) >= entered, 90 if token == "~~" else 10)
+        elif token.startswith("see:"):
+            want = token[4:].replace(",", " ").encode()
+            if not wait_until(lambda: count(log, want) > 0, 10):
+                print(f"qmp-type: never saw {want.decode()!r}", file=sys.stderr)
         elif token.startswith("!"):
             qmp.monitor(token[1:].replace(",", " "))
             time.sleep(0.2)
