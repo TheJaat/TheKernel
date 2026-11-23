@@ -297,9 +297,16 @@ pub mod arguments {
 /// its name and its file (startup::ARGUMENTS), and looks at neither.
 ///
 /// The reply: "ok" and a handle to the new process, or "error: ...".
+/// It goes back on the channel the request came on - unless `kind` has
+/// REPLY in it: then the last handle is a channel of the asker's own,
+/// and the reply goes there. The shell is the one asker on its channel;
+/// programs that start programs share theirs, and each asks with a new
+/// channel, so that one never reads another's reply.
 pub mod init {
     pub const BUILT_IN: u8 = 1;
     pub const IMAGE: u8 = 2;
+    /// Added to `kind`: reply on the last handle (see above).
+    pub const REPLY: u8 = 0x80;
 
     pub struct Run<'a> {
         pub kind: u8,
@@ -311,6 +318,17 @@ pub mod init {
     }
 
     impl<'a> Run<'a> {
+        /// The kind without REPLY: BUILT_IN or IMAGE.
+        pub fn what(&self) -> u8 {
+            self.kind & !REPLY
+        }
+
+        /// Whether the reply goes on a channel of the asker's own, the
+        /// last handle.
+        pub fn replies_apart(&self) -> bool {
+            self.kind & REPLY != 0
+        }
+
         /// Lays the request out in `out`; its length, or None if it
         /// does not fit.
         pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
@@ -342,7 +360,7 @@ pub mod init {
             let directory = text()?;
             let file = text()?;
             let arguments = rest;
-            matches!(kind, BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
+            matches!(kind & !REPLY, BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
         }
     }
 }
@@ -1821,7 +1839,7 @@ mod tests {
         assert_eq!(SystemInfo::from_words(words), info);
     }
 
-    use super::init::{Run, BUILT_IN, IMAGE};
+    use super::init::{Run, BUILT_IN, IMAGE, REPLY};
 
     #[test]
     fn arguments_round_trip() {
@@ -1863,6 +1881,21 @@ mod tests {
             .unwrap();
         let back = Run::decode(&message[..length]).unwrap();
         assert_eq!((back.name, back.file, back.arguments.len()), ("hello", "", 0));
+    }
+
+    #[test]
+    fn a_run_request_may_ask_for_its_reply_apart() {
+        let run = Run { kind: IMAGE | REPLY, flags: 0, name: "ld.lld", directory: "", file: "/ld.lld", arguments: b"" };
+        let mut message = [0u8; 64];
+        let length = run.encode(&mut message).unwrap();
+        let back = Run::decode(&message[..length]).unwrap();
+        assert_eq!((back.what(), back.replies_apart(), back.name), (IMAGE, true, "ld.lld"));
+        let run = Run { kind: BUILT_IN, flags: 0, name: "hello", directory: "", file: "", arguments: b"" };
+        let length = run.encode(&mut message).unwrap();
+        let back = Run::decode(&message[..length]).unwrap();
+        assert_eq!((back.what(), back.replies_apart()), (BUILT_IN, false));
+        // REPLY alone is no kind.
+        assert!(Run::decode(b"\x80\x00\x03cat\x00\x00").is_none());
     }
 
     #[test]

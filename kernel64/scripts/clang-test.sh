@@ -42,7 +42,11 @@
 #   /ldflags                   the options TheTaaJ's build links its C
 #                              programs with (the Makefile's TAAJ_LDFLAGS
 #                              or TAAJ_A64_LDFLAGS)
+#   /lflags                    the same, as clang takes them when it
+#                              links (clang @cflags @lflags x.c -o x)
 #   /bin                       where the programs go
+#   /tmp                       where clang puts the object it compiles
+#                              on the way to a program
 #
 # The steps:
 #
@@ -70,6 +74,19 @@
 #                                       (not with @ldflags: --gc-sections
 #                                       with no _start leaves nothing to
 #                                       miss, and only warns)
+#   clang @cflags @lflags libc/programs/chello.c lib/libc.a -o bin/chello2
+#                                       compiled and linked in one: clang
+#                                       starts ld.lld (posix_spawn), as it
+#                                       does on the host, and the program
+#                                       is the build's chello
+#   bin/chello2 one two                 run
+#   clang @cflags -nostdlib libc/programs/cwords.c -o bin/y
+#                                       without the C library: ld.lld's
+#                                       errors, then clang's "ld.lld
+#                                       command failed", exit 1
+#   with files clang ... -o bin/z       given the files but not the right
+#                                       to start programs: clang cannot
+#                                       start ld.lld (EPERM)
 #   echo done
 #
 # The programs are compared with the build's own: its linker script
@@ -151,7 +168,7 @@ put_tree() { # put_tree FROM TO: every file under FROM, at TO on the disk
         "$TFSTOOL" put "$DISK" "$2/$file" "$1/$file" > /dev/null || fail "cannot put $2/$file on the disk"
     done
 }
-for directory in lib lib/clang lib/clang/18 lib/clang/18/include include libc libc/programs bin; do
+for directory in lib lib/clang lib/clang/18 lib/clang/18/include include libc libc/programs bin tmp; do
     "$TFSTOOL" mkdir "$DISK" $directory > /dev/null || fail "cannot make $directory on the disk"
 done
 put_tree "$RESOURCE" lib/clang/18/include
@@ -174,6 +191,9 @@ echo "$sources" > "$WORK/sources"
 echo "-static -nostdlib --gc-sections -s -T user.ld" > "$WORK/ldflags"
 [ "$ARCH" = aarch64 ] && echo "-z max-page-size=4096" >> "$WORK/ldflags"
 "$TFSTOOL" put "$DISK" ldflags "$WORK/ldflags" > /dev/null || fail "cannot put ldflags on the disk"
+echo "-static -nostdlib -Wl,--gc-sections -s -T user.ld" > "$WORK/lflags"
+[ "$ARCH" = aarch64 ] && echo "-Wl,-z,max-page-size=4096" >> "$WORK/lflags"
+"$TFSTOOL" put "$DISK" lflags "$WORK/lflags" > /dev/null || fail "cannot put lflags on the disk"
 "$TFSTOOL" put "$DISK" user.ld "$ROOT/user/user.ld" > /dev/null || fail "cannot put user.ld on the disk"
 "$TFSTOOL" put "$DISK" lib/libc.a "$C_BIN/libc.a" > /dev/null || fail "cannot put libc.a on the disk"
 printf 'int f(void) {\n    return x;\n}\n' > "$WORK/bad.c"
@@ -206,6 +226,10 @@ for program in $PROGRAMS; do
 done
 steps="$steps $(keys 'bin/chello one two') ret ~~"
 steps="$steps $(keys 'with files ld.lld cwords.o -o bin/x') ret ~~ ~~ ~~ ~~"
+steps="$steps $(keys 'with programs clang @cflags @lflags libc/programs/chello.c lib/libc.a -o bin/chello2') ret ~~ ~~ ~~ ~~ ~~"
+steps="$steps $(keys 'bin/chello2 one two') ret ~~"
+steps="$steps $(keys 'with programs clang @cflags -nostdlib libc/programs/cwords.c -o bin/y') ret ~~ ~~ ~~ ~~ ~~"
+steps="$steps $(keys 'with files clang @cflags @lflags libc/programs/cwords.c lib/libc.a -o bin/z') ret ~~ ~~"
 steps="$steps $(keys 'echo done') ret ~"
 
 echo "Booting $ARCH to compile and link TheTaaJ's C programs with clang and lld there (log: $LOG)..."
@@ -223,12 +247,13 @@ said '^TheTaaJ clang version 18\.1\.3' "clang did not say its version"
 said "^Target: $ARCH-unknown-taaj" "clang did not say it is for TheTaaJ on $ARCH"
 # Found from the file it was started from: /clang, so /lib/clang/18.
 said '^/lib/clang/18[[:space:]]*$' "clang did not find its headers from its own file (-print-resource-dir)"
-[ "$(grep -ac '"clang" exited with code 0' "$LOG")" -eq 6 ] \
-    || fail "clang did not finish all six of its jobs with exit code 0"
+[ "$(grep -ac '"clang" exited with code 0' "$LOG")" -eq 7 ] \
+    || fail "clang did not finish all seven of its jobs with exit code 0"
 said "^bad\.c:2:12: error: use of undeclared identifier 'x'" "clang did not say what is wrong in bad.c, and where"
 # argv[0] is the name clang was started by, as on the host: "clang:".
 said "^clang: error: no such file or directory: 'nothere\.c'" "clang did not sign its complaint about nothere.c with its name"
-[ "$(grep -ac '"clang" exited with code 1' "$LOG")" -eq 2 ] || fail "clang did not fail on bad.c and on nothere.c"
+[ "$(grep -ac '"clang" exited with code 1' "$LOG")" -eq 4 ] \
+    || fail "clang did not fail on bad.c, on nothere.c, linking without the C library and without the right to start ld.lld"
 said '\[shell\] line: "echo done"' "the shell did not get its keys back"
 said '^TheTaaJ LLD 18\.1\.3 \(compatible with GNU linkers\)' "ld.lld did not say its version"
 [ "$(grep -ac '"ld.lld" exited with code 0' "$LOG")" -eq 12 ] \
@@ -239,7 +264,19 @@ said '^argv\[2\] two' "chello did not get its arguments"
 said '"bin/chello" exited with code 0' "chello, linked on TheTaaJ, did not end well"
 said "^ld\.lld: error: undefined symbol: [a-z_]+" "ld.lld did not say which symbols are missing without the C library"
 said '"ld.lld" exited with code 1' "ld.lld did not fail without the C library"
-grep -aE '"(clang|ld\.lld)" killed' "$LOG" && fail "clang or ld.lld was killed"
+# clang starting ld.lld itself: the program it was asked for, run.
+said '\[init\] started /ld\.lld for a program, from a file' "clang did not start ld.lld"
+[ "$(grep -ac '"/ld.lld" exited with code 0' "$LOG")" -eq 1 ] || fail "the ld.lld clang started did not link chello2"
+said '"bin/chello2" exited with code 0' "chello2, compiled and linked by clang on TheTaaJ, did not run"
+said '"/ld.lld" exited with code 1' "the ld.lld clang started did not fail without the C library"
+# Twice: the link without the C library, and the one clang was not let
+# start (clang says "exit code 1" for that too). An exit code read wrong
+# would make the first "failed due to signal".
+[ "$(grep -ac '^clang: error: ld\.lld command failed with exit code 1' "$LOG")" -eq 2 ] \
+    || fail "clang did not say its linker failed with exit code 1, the code ld.lld exited with"
+said '^clang: error: unable to execute command: posix_spawn failed: not permitted' \
+    "clang, not given the right to start programs, was not refused"
+grep -aE '"/?(clang|ld\.lld)" killed' "$LOG" && fail "clang or ld.lld was killed"
 grep -a 'has not answered for' "$LOG" && fail "a service stopped answering during the test"
 
 same=""
@@ -249,6 +286,9 @@ for output in $(for program in $PROGRAMS; do echo $program.o; done) other.o cwor
         || fail "$output, written by clang on TheTaaJ, is not what the host's clang writes"
     same="$same $output"
 done
+"$TFSTOOL" get "$DISK" bin/chello2 > "$WORK/got-chello2" 2> /dev/null || fail "clang on TheTaaJ wrote no bin/chello2"
+cmp -s "$C_BIN/chello" "$WORK/got-chello2" || fail "bin/chello2, made by clang and ld.lld on TheTaaJ, is not the build's chello"
+"$TFSTOOL" get "$DISK" bin/z > /dev/null 2>&1 && fail "clang without the right to start programs still made bin/z"
 linked=""
 for program in $PROGRAMS; do
     "$TFSTOOL" get "$DISK" "bin/$program" > "$WORK/got-$program" 2> /dev/null || fail "ld.lld on TheTaaJ wrote no bin/$program"
@@ -259,6 +299,7 @@ done
 times=$(grep -aEo '^took [0-9.]+ s' "$LOG" | sed 's/took //' | tr '\n' ' ')
 echo "clang on TheTaaJ ($ARCH) wrote, byte for byte as the host's:$same"
 echo "ld.lld on TheTaaJ ($ARCH) linked, byte for byte as the build's own programs:$linked"
+echo "clang on TheTaaJ ($ARCH) compiled and linked chello in one, starting ld.lld itself: the build's chello, byte for byte"
 echo "the timed steps took (s): $times"
 [ -s "$WORK/left-out" ] && echo "clang's headers not on the disk (names over 27 bytes): $(tr '\n' ' ' < "$WORK/left-out")"
 exit 0
