@@ -264,7 +264,7 @@ cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was
 
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
 LIBC_OBJECTS=0
-for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit pthread emutls signal mmap users libm; do
+for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit pthread emutls signal mmap users unix libm; do
     FILES="$FILES src/libc/c/$f.o"
     LIBC_OBJECTS=$((LIBC_OBJECTS + 1))
 done
