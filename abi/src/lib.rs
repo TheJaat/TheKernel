@@ -913,8 +913,10 @@ pub mod block {
     /// request and keeps nothing: any client, any buffer, any time.
     pub const READ_MANY: u8 = 4;
     pub const WRITE_MANY: u8 = 5;
-    /// Most sectors one READ_MANY or WRITE_MANY moves: 16 KiB.
-    pub const SECTORS_MAX: u32 = 32;
+    /// Most sectors one READ_MANY or WRITE_MANY moves: 128 KiB. (It was
+    /// 16 KiB; a program of 80 MB took 20,000 requests to load - journal
+    /// entry 080.)
+    pub const SECTORS_MAX: u32 = 256;
     pub const MANY_REQUEST_SIZE: usize = 1 + 8 + 4;
     /// Payload: a number of ticks (u64 LE, at most STALL_MAX). A test:
     /// answered, and then the driver does nothing for that long.

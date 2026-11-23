@@ -226,11 +226,11 @@ boot() {
             ;;
         written | untouched)
             if [ "$DISK_TEST" = written ]; then
-                did="33 written at 100 and the last one"; mode=""; checks=348
+                did="257 written at 1400 and the last one"; mode=""; checks=348
             else
                 did="read-only - every write refused"; mode=", read-only"; checks=340
             fi
-            need "$log" "\[virtio\] 0xa003e00 block device: registers in the page at 0xa003000, 64 KiB DMA at 0x4[0-9a-f]+000, interrupt 79, off until its driver waits - ready for a driver"
+            need "$log" "\[virtio\] 0xa003e00 block device: registers in the page at 0xa003000, 192 KiB DMA at 0x4[0-9a-f]+000, interrupt 79, off until its driver waits - ready for a driver"
             need "$log" "\[blk\] virtio disk at 0xa003e00: 6143 sectors \(3071 KiB\)$mode, queue of 1024, interrupts"
             need "$log" "\[blkcheck\] $checks checks, all passed: 6143 sectors, $did"
             # Twice: the second driver takes over the device the first left.

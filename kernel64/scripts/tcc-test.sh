@@ -148,15 +148,24 @@ steps="$steps $(keys 'tcc -c clib.c') ret ~~ $(keys 'tcc clib.o -o clib2') ret ~
 steps="$steps $(keys 'with files clib2') ret ~ $(keys 'tcc bad.c') ret ~~ $(keys 'source broken') ret ~~"
 # The build: one line for the shell, 23 commands, 70 files compiled.
 # Each "~~" waits up to ninety seconds, and returns as soon as the
-# command is over, so a spare one costs nothing: with libm the build
-# took 640 s on the PC inside make test64, past six of them.
-steps="$steps $(keys 'time source /src/build') ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
+# command is over, so a spare one costs nothing - and once the keys run
+# out the boot ends. The build took 1404 s on AArch64 beside the rest of
+# make test64, past the twelve it had then: forty, an hour.
+long() { # long N: N "~~"
+    n=0; while [ $n -lt "$1" ]; do printf ' ~~'; n=$((n + 1)); done
+}
+steps="$steps $(keys 'time source /src/build') ret$(long 40)"
 steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/libc/programs/clib') ret ~"
 steps="$steps $(keys 'src/libc/programs/cprimes 100') ret ~ $(keys 'src/libc/programs/chello built here') ret ~"
-# TCC builds itself: two compilations of tcc.c and TCC's library.
-steps="$steps $(keys 'time source /src/tcc/build') ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
-steps="$steps $(keys 'cd /') ret ~ $(keys 'with files src/tcc/tcc3 hello.c -o hello3') ret ~~ $(keys 'hello3') ret ~"
 steps="$steps $(keys 'echo done') ret ~"
+
+# TCC builds itself: two compilations of tcc.c and TCC's library. It
+# needs nothing the steps above make (it links with /lib/libc.a, not the
+# one /src/build makes), so it is a boot of its own, on a copy of the
+# disk, at the same time.
+self="$(keys 'time source /src/tcc/build') ret$(long 20)"
+self="$self $(keys 'cd /') ret ~ $(keys 'with files src/tcc/tcc3 hello.c -o hello3') ret ~~ $(keys 'hello3') ret ~"
+self="$self $(keys 'echo done') ret ~"
 
 # The editor: Ctrl+J, not Enter, for the new line - the boot scripts
 # count every Enter as a line for the shell. It is window 2, the first
@@ -166,24 +175,37 @@ edit="$edit $(keys 'int main(void) { printf("%.3f\n", 1.0 / 8); return 0; }') ct
 edit="$edit ctrl-q see:window,2,closed $(keys 'tcc hi.c -o hi') ret ~~ $(keys 'hi > hi.out') ret ~"
 edit="$edit $(keys 'echo done') ret ~"
 
-echo "Booting $ARCH to compile C programs with tcc, there (log: $LOG)..."
+# Three boots, each on its own copy of the disk, side by side: the
+# build, TCC building itself, and the editor. Each holds its own boot
+# slots (qemu-boot.sh), so they share the host's CPUs fairly with
+# whatever else is running.
+SELF_LOG=$LOG.self
+EDIT_LOG=$LOG.edit
+cp "$DISK" "$DISK.self" && cp "$DISK" "$DISK.edit" || fail "cannot copy the disk"
+
+# boot NAME LOG DISK KEYS [SCREEN]: boots ARCH with the disk, typing KEYS.
 # Three slots for two CPUs: the third is for QEMU's disk thread, which
 # reading these big programs keeps busy (qemu-boot.sh, SLOTS).
-if [ "$ARCH" = aarch64 ]; then
-    KEYS="$steps" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
-        "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 40
-else
-    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 40
-fi
-EDIT_LOG=$LOG.edit
-echo "Booting $ARCH again, to type a program into the editor and compile it (log: $EDIT_LOG)..."
-if [ "$ARCH" = aarch64 ]; then
-    SCREEN=1 KEYS="$edit" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 \
--device ramfb -device virtio-keyboard-device -device virtio-tablet-device" \
-        "$HERE/aarch64-boot.sh" "$IMAGE" "$EDIT_LOG" 40
-else
-    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$edit" "$HERE/qemu-boot.sh" "$IMAGE" "$EDIT_LOG" 40
-fi
+boot() {
+    echo "Booting $ARCH $1 (log: $2)..."
+    if [ "$ARCH" = aarch64 ]; then
+        devices="-smp 2 -drive file=$3,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0"
+        [ -n "${5:-}" ] && devices="$devices -device ramfb -device virtio-keyboard-device -device virtio-tablet-device"
+        SCREEN=${5:-} KEYS="$4" SLOTS=3 QEMU_ARGS="$devices" "$HERE/aarch64-boot.sh" "$IMAGE" "$2" 40
+    else
+        DISK="$3" SMP=2 SLOTS=3 KEYS="$4" "$HERE/qemu-boot.sh" "$IMAGE" "$2" 40
+    fi > "$2.out" 2>&1
+}
+boot "to compile C programs with tcc, there" "$LOG" "$DISK" "$steps" &
+boot "for TCC to build itself" "$SELF_LOG" "$DISK.self" "$self" &
+boot "to type a program into the editor and compile it" "$EDIT_LOG" "$DISK.edit" "$edit" 1 &
+wait
+cat "$LOG.out" "$SELF_LOG.out" "$EDIT_LOG.out"
+
+# saidin LOG PATTERN WHY
+saidin() {
+    grep -aEq "$2" "$1" || fail "$3 (log: $1)"
+}
 
 said '\[shell\] line: "tcc hello.c -o hello"' "the keys did not reach the shell"
 said '^hello from tcc: 6 \* 7 = 42, 1/8 = 0\.125' "the program tcc compiled on TheTaaJ did not print its line"
@@ -207,14 +229,16 @@ grep -a "source: /src/build: stopped" "$LOG" && fail "the build script stopped p
     || fail "exit did not run clib's atexit handlers, newest first"
 said '^cprimes: 25 primes below 100' "cprimes, built on TheTaaJ, did not count"
 said '^argv\[2\] here' "chello, built on TheTaaJ, did not get its arguments"
-said '\[shell\] /src/tcc/build line [0-9]+: "tcc tcc\.c -o tcc2"' "the script in which tcc builds itself did not start"
-said '\[shell\] /src/tcc/build line [0-9]+: "with files \.\./tcc3 -ar rcs libtcc1\.a' "tcc3 did not get to building TCC's library"
-said '^built: tcc by tcc, tcc by itself, and its library' "the script in which tcc builds itself did not get to its end"
-grep -a "source: /src/tcc/build: stopped" "$LOG" && fail "tcc did not build itself: the script stopped part way"
-[ "$(grep -ac '^hello from tcc: 6 \* 7 = 42, 1/8 = 0\.125' "$LOG")" -eq 2 ] \
-    || fail "hello3, compiled by the tcc that tcc compiled on TheTaaJ, did not print its line"
 said '\[shell\] line: "echo done"' "the shell did not get its keys back"
 grep -a 'has not answered for' "$LOG" && fail "a service stopped answering during the test"
+saidin "$SELF_LOG" '\[shell\] /src/tcc/build line [0-9]+: "tcc tcc\.c -o tcc2"' "the script in which tcc builds itself did not start"
+saidin "$SELF_LOG" '\[shell\] /src/tcc/build line [0-9]+: "with files \.\./tcc3 -ar rcs libtcc1\.a' "tcc3 did not get to building TCC's library"
+saidin "$SELF_LOG" '^built: tcc by tcc, tcc by itself, and its library' "the script in which tcc builds itself did not get to its end"
+grep -a "source: /src/tcc/build: stopped" "$SELF_LOG" && fail "tcc did not build itself: the script stopped part way (log: $SELF_LOG)"
+saidin "$SELF_LOG" '^hello from tcc: 6 \* 7 = 42, 1/8 = 0\.125' \
+    "hello3, compiled by the tcc that tcc compiled on TheTaaJ, did not print its line"
+saidin "$SELF_LOG" '\[shell\] line: "echo done"' "the shell did not get its keys back after tcc built itself"
+grep -a 'has not answered for' "$SELF_LOG" && fail "a service stopped answering while tcc built itself (log: $SELF_LOG)"
 grep -aEq '\[edit\] saved hi\.c: 74 bytes, 2 lines' "$EDIT_LOG" || fail "the program typed in the editor was not saved (log: $EDIT_LOG)"
 grep -aEq '\[process\] [0-9]+ "hi" exited with code 0' "$EDIT_LOG" || fail "the program typed in the editor did not run (log: $EDIT_LOG)"
 grep -aEq '\[shell\] line: "echo done"' "$EDIT_LOG" || fail "the shell did not get its keys back after the editor (log: $EDIT_LOG)"
@@ -256,10 +280,10 @@ cp "$TCC_DIR/lib/tcc/libtcc1.a" "$TCC_DIR"/helpers/*.o "$WORK/src/tcc/lib/"
 cp "$WORK/hello" "$WORK/hello3"
 # What was typed into the editor, and that, compiled here.
 printf '#include <stdio.h>\nint main(void) { printf("%%.3f\\n", 1.0 / 8); return 0; }' > "$WORK/hi.c.typed"
-"$TFSTOOL" get "$DISK" hi.c > "$WORK/hi.c" || fail "hi.c cannot be read off the disk"
+"$TFSTOOL" get "$DISK.edit" hi.c > "$WORK/hi.c" || fail "hi.c cannot be read off the disk"
 cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was typed (see $WORK/hi.c)"
 (cd "$WORK" && "$TCC_DIR/cross/taaj-tcc" hi.c -o hi) || fail "the cross compiler on the host failed on hi.c"
-"$TFSTOOL" get "$DISK" hi.out > "$WORK/hi.out" || fail "hi.out cannot be read off the disk"
+"$TFSTOOL" get "$DISK.edit" hi.out > "$WORK/hi.out" || fail "hi.out cannot be read off the disk"
 [ "$(cat "$WORK/hi.out")" = 0.125 ] || fail "the program typed in the editor printed $(cat "$WORK/hi.out"), not 0.125"
 
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
@@ -275,7 +299,13 @@ FILES="$FILES src/tcc/tcc2 src/tcc/tcc3 src/tcc/lib/libtcc1.a hello3"
 for o in "$TCC_DIR"/helpers/*.o; do FILES="$FILES src/tcc/lib/$(basename "$o")"; done
 count=0
 for file in $FILES; do
-    "$TFSTOOL" get "$DISK" "$file" > "$WORK/got" || fail "$file cannot be read off the disk"
+    # Each file from the disk of the boot that wrote it.
+    case $file in
+        hi) from=$DISK.edit ;;
+        src/tcc/* | hello3) from=$DISK.self ;;
+        *) from=$DISK ;;
+    esac
+    "$TFSTOOL" get "$from" "$file" > "$WORK/got" || fail "$file cannot be read off the disk"
     cmp -s "$WORK/$file" "$WORK/got" \
         || fail "$file, written by tcc on TheTaaJ, is not what the same tcc on the host writes (see $WORK)"
     count=$((count + 1))

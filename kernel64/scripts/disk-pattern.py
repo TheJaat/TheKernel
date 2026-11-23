@@ -9,7 +9,7 @@ make: byte i of sector s is original(s, i) - every sector different
 from every other, so that one read from the wrong place shows.
 
 check: after a boot. "written" - blkcheck wrote written(s, i) to
-sectors 100 to 132 and to the last one, and nothing else may differ
+sectors 1400 to 1656 and to the last one, and nothing else may differ
 from the original; "untouched" - nothing at all may (a read-only disk,
 or one no driver was started for).
 
@@ -37,7 +37,7 @@ def main():
             for s in range(sectors):
                 image.write(original(s))
         return
-    changed = set(range(100, 133)) | {sectors - 1} if sys.argv[4] == "written" else set()
+    changed = set(range(1400, 1657)) | {sectors - 1} if sys.argv[4] == "written" else set()
     data = open(path, "rb").read()
     if len(data) != sectors * SECTOR:
         sys.exit(f"disk-pattern: the image is {len(data)} bytes, not {sectors} sectors")

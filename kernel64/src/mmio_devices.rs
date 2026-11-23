@@ -48,8 +48,10 @@ use crate::ipc::Object;
 use crate::memory_object::MemoryObject;
 use crate::{arch, mm};
 
-/// DMA memory for a block driver: its virtqueue and request buffers.
-const BLOCK_DMA_PAGES: u64 = 16;
+/// DMA memory for a block driver: its virtqueue and request buffers -
+/// 36 KiB, then room for abi::block::SECTORS_MAX sectors (128 KiB;
+/// `user/src/bin/blk.rs` says where each lies).
+const BLOCK_DMA_PAGES: u64 = 48;
 /// And for a network card's: two queues, and forty buffers of a frame
 /// each (`user/src/bin/nic.rs` says where each lies).
 const NETWORK_DMA_PAGES: u64 = 40;
