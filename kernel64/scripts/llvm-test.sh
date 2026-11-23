@@ -149,11 +149,13 @@ steps="$steps $(keys 'with files llvm-mc -triple=x86_64-unknown-none-elf -filety
 steps="$steps $(keys 'echo done') ret ~"
 
 echo "Booting $ARCH to run llvm-tblgen on $count .td files, and llc and llvm-mc on cwords.c (log: $LOG)..."
+# Three slots for two CPUs: the third is for QEMU's disk thread, which
+# reading these big programs keeps busy (qemu-boot.sh, SLOTS).
 if [ "$ARCH" = aarch64 ]; then
-    KEYS="$steps" SLOTS=2 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
+    KEYS="$steps" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 60
 else
-    DISK="$DISK" SMP=2 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
+    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
 fi
 
 said '\[shell\] line: "with readonly llvm-tblgen --version"' "the keys did not reach the shell"

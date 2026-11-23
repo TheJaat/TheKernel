@@ -1,16 +1,20 @@
 #!/bin/sh
-# clang-test.sh - Clang on TheTaaJ: clang, cross-compiled from
-# ports/llvm by tools/build-llvm.py, compiles C there and writes byte for
-# byte what the host's clang of the same release (18.1.3) writes from the
-# same files with the same options.
+# clang-test.sh - Clang and lld on TheTaaJ: clang and ld.lld,
+# cross-compiled from ports/llvm by tools/build-llvm.py, build TheTaaJ's
+# C programs there. clang writes byte for byte what the host's clang of
+# the same release (18.1.3) writes from the same files with the same
+# options, and ld.lld links them into the very programs TheTaaJ's own
+# build makes on the host - and one of them runs.
 #
-#   usage: clang-test.sh ARCH IMAGE DISK LOG BIN_DIR
+#   usage: clang-test.sh ARCH IMAGE DISK LOG BIN_DIR C_BIN
 #
 #   ARCH     x86_64 or aarch64
 #   IMAGE    the ISO (x86_64) or the kernel image (aarch64)
 #   DISK     the disk to make and boot with
 #   BIN_DIR  where the LLVM tools for ARCH were built (BIN_DIR/../lib
 #            holds the headers clang brings with it)
+#   C_BIN    where the build put this machine's C library (libc.a) and
+#            its C programs, linked on the host: what TheTaaJ's must be
 #
 # LLVM_TBLGEN in the environment names the host's LLVM directory, as for
 # llvm-test.sh: the host's clang is taken from beside it, and must be
@@ -23,31 +27,53 @@
 #                              intrinsics), found from /clang's own
 #                              file: TheTaaJ tells a program which it is
 #   /include                   the C library's headers
-#   /src/*.c                   TheTaaJ's eleven C programs
+#   /libc/programs/*.c         TheTaaJ's eleven C programs, under the
+#                              names the build compiles them by: assert
+#                              writes the file's name into the program
 #   /cflags, /oflags           the options for this machine and the
 #                              other, in response files (clang @cflags):
 #                              they would not fit on a line the shell
 #                              takes, 256 bytes
+#   /sources                   the eleven names, another response file
 #   /bad.c                     a mistake
+#   /ld.lld                    lld, named for the linker it is to be (as
+#                              on the host, it decides by its name)
+#   /lib/libc.a, /user.ld      the C library and the linker script
+#   /ldflags                   the options TheTaaJ's build links its C
+#                              programs with (the Makefile's TAAJ_LDFLAGS
+#                              or TAAJ_A64_LDFLAGS)
+#   /bin                       where the programs go
 #
 # The steps:
 #
 #   clang --version                     "TheTaaJ clang version 18.1.3"
 #   clang -print-resource-dir           "/lib/clang/18"
-#   clang @cflags -c src/*.c            all eleven programs, with the
+#   clang @cflags -c @sources                     all eleven programs, with the
 #                                       options TheTaaJ's own build gives
 #                                       them (the Makefile's TAAJ_CFLAGS
 #                                       for this machine), in one run of
 #                                       clang: eleven objects
-#   clang @oflags -c src/cwords.c       and for the other machine
-#   clang @cflags -S src/cwords.c       assembly language
-#   clang @cflags -E -P src/cstdio.c    the C after the preprocessor:
+#   clang @oflags -c libc/programs/cwords.c       and for the other machine
+#   clang @cflags -S libc/programs/cwords.c       assembly language
+#   clang @cflags -E -P libc/programs/cstdio.c    the C after the preprocessor:
 #                                       every header, as it was read
 #   clang -c bad.c                      a mistake: where, what, exit 1
 #   clang -c nothere.c                  no such file: "clang: error: ...",
 #                                       signed with the name it was
 #                                       started by (argv[0])
+#   ld.lld --version                    "TheTaaJ LLD 18.1.3"
+#   ld.lld @ldflags NAME.o lib/libc.a -o bin/NAME
+#                                       each of the eleven, linked
+#   bin/chello one two                  one of them, run
+#   ld.lld cwords.o -o bin/x            without the C library: undefined
+#                                       symbols, "ld.lld: error: ...", exit 1
+#                                       (not with @ldflags: --gc-sections
+#                                       with no _start leaves nothing to
+#                                       miss, and only warns)
 #   echo done
+#
+# The programs are compared with the build's own: its linker script
+# leaves .comment out, so a program says nothing of who linked it.
 #
 # -fno-ident: an object says in .comment which compiler wrote it -
 # "TheTaaJ clang version 18.1.3" or "Ubuntu clang version 18.1.3
@@ -60,6 +86,7 @@ IMAGE=$2
 DISK=$3
 LOG=$4
 BIN_DIR=$5
+C_BIN=$6
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 TFSTOOL=${TFSTOOL:-$ROOT/tools/tfstool-rs/target/release/tfstool}
@@ -97,7 +124,7 @@ OTHER=aarch64
 [ "$ARCH" = aarch64 ] && OTHER=x86_64
 
 rm -rf "$WORK" "$DISK"
-mkdir -p "$WORK/src"
+mkdir -p "$WORK/libc/programs"
 "$HOST_BIN/clang" --version 2>/dev/null | grep -q 'version 18\.1\.3' \
     || fail "the host's clang (in $HOST_BIN) is not 18.1.3, so its output is not what TheTaaJ's must match"
 [ -d "$RESOURCE" ] || fail "no headers for clang in $RESOURCE (tools/build-llvm.py puts them there)"
@@ -105,6 +132,7 @@ mkdir -p "$WORK/src"
 # 49152 blocks, 192 MiB: clang alone is 82 MB (the PC's) or 72 MB (AArch64's).
 "$TFSTOOL" mkfs "$DISK" 49152 > /dev/null || fail "cannot make the disk"
 "$TFSTOOL" put "$DISK" clang "$BIN_DIR/clang" > /dev/null || fail "cannot put clang on the disk"
+"$TFSTOOL" put "$DISK" ld.lld "$BIN_DIR/lld" > /dev/null || fail "cannot put ld.lld on the disk"
 put_tree() { # put_tree FROM TO: every file under FROM, at TO on the disk
     for directory in $(cd "$1" && find . -type d | sort); do
         directory=${directory#./}
@@ -123,21 +151,31 @@ put_tree() { # put_tree FROM TO: every file under FROM, at TO on the disk
         "$TFSTOOL" put "$DISK" "$2/$file" "$1/$file" > /dev/null || fail "cannot put $2/$file on the disk"
     done
 }
-for directory in lib lib/clang lib/clang/18 lib/clang/18/include include src; do
+for directory in lib lib/clang lib/clang/18 lib/clang/18/include include libc libc/programs bin; do
     "$TFSTOOL" mkdir "$DISK" $directory > /dev/null || fail "cannot make $directory on the disk"
 done
 put_tree "$RESOURCE" lib/clang/18/include
 put_tree "$ROOT/libc/include" include
 sources=""
 for program in $PROGRAMS; do
-    cp "$ROOT/libc/programs/$program.c" "$WORK/src/"
-    "$TFSTOOL" put "$DISK" src/$program.c "$WORK/src/$program.c" > /dev/null || fail "cannot put $program.c on the disk"
-    sources="$sources src/$program.c"
+    cp "$ROOT/libc/programs/$program.c" "$WORK/libc/programs/"
+    "$TFSTOOL" put "$DISK" libc/programs/$program.c "$WORK/libc/programs/$program.c" > /dev/null \
+        || fail "cannot put $program.c on the disk"
+    sources="$sources libc/programs/$program.c"
 done
 flags "$ARCH" /include > "$WORK/cflags"
 flags "$OTHER" /include > "$WORK/oflags"
 "$TFSTOOL" put "$DISK" cflags "$WORK/cflags" > /dev/null || fail "cannot put cflags on the disk"
 "$TFSTOOL" put "$DISK" oflags "$WORK/oflags" > /dev/null || fail "cannot put oflags on the disk"
+echo "$sources" > "$WORK/sources"
+"$TFSTOOL" put "$DISK" sources "$WORK/sources" > /dev/null || fail "cannot put sources on the disk"
+# The build's linker options (TAAJ_LDFLAGS, and for AArch64 the 4 KiB
+# pages of TAAJ_A64_LDFLAGS), and what they name.
+echo "-static -nostdlib --gc-sections -s -T user.ld" > "$WORK/ldflags"
+[ "$ARCH" = aarch64 ] && echo "-z max-page-size=4096" >> "$WORK/ldflags"
+"$TFSTOOL" put "$DISK" ldflags "$WORK/ldflags" > /dev/null || fail "cannot put ldflags on the disk"
+"$TFSTOOL" put "$DISK" user.ld "$ROOT/user/user.ld" > /dev/null || fail "cannot put user.ld on the disk"
+"$TFSTOOL" put "$DISK" lib/libc.a "$C_BIN/libc.a" > /dev/null || fail "cannot put libc.a on the disk"
 printf 'int f(void) {\n    return x;\n}\n' > "$WORK/bad.c"
 "$TFSTOOL" put "$DISK" bad.c "$WORK/bad.c" > /dev/null || fail "cannot put bad.c on the disk"
 
@@ -146,27 +184,38 @@ printf 'int f(void) {\n    return x;\n}\n' > "$WORK/bad.c"
 (
     cd "$WORK" || exit 1
     "$HOST_BIN/clang" $(flags "$ARCH" "$ROOT/libc/include") -c $sources || exit 1
-    "$HOST_BIN/clang" $(flags "$OTHER" "$ROOT/libc/include") -c src/cwords.c -o other.o || exit 1
-    "$HOST_BIN/clang" $(flags "$ARCH" "$ROOT/libc/include") -S src/cwords.c -o cwords.s || exit 1
-    "$HOST_BIN/clang" $(flags "$ARCH" "$ROOT/libc/include") -E -P src/cstdio.c -o cstdio.i || exit 1
+    "$HOST_BIN/clang" $(flags "$OTHER" "$ROOT/libc/include") -c libc/programs/cwords.c -o other.o || exit 1
+    "$HOST_BIN/clang" $(flags "$ARCH" "$ROOT/libc/include") -S libc/programs/cwords.c -o cwords.s || exit 1
+    "$HOST_BIN/clang" $(flags "$ARCH" "$ROOT/libc/include") -E -P libc/programs/cstdio.c -o cstdio.i || exit 1
 ) || fail "the host's clang failed on TheTaaJ's C programs"
 
 steps="$(keys 'with readonly clang --version') ret ~~"
 steps="$steps $(keys 'with readonly clang -print-resource-dir') ret ~~"
-steps="$steps $(keys "time with files clang @cflags -c$sources") ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
-steps="$steps $(keys "time with files clang @oflags -c src/cwords.c -o other.o") ret ~~ ~~"
-steps="$steps $(keys "with files clang @cflags -S src/cwords.c -o cwords.s") ret ~~ ~~"
-steps="$steps $(keys "with files clang @cflags -E -P src/cstdio.c -o cstdio.i") ret ~~"
+steps="$steps $(keys "time with files clang @cflags -c @sources") ret ~~ ~~ ~~ ~~ ~~ ~~ ~~ ~~"
+steps="$steps $(keys "time with files clang @oflags -c libc/programs/cwords.c -o other.o") ret ~~ ~~"
+steps="$steps $(keys "with files clang @cflags -S libc/programs/cwords.c -o cwords.s") ret ~~ ~~"
+steps="$steps $(keys "with files clang @cflags -E -P libc/programs/cstdio.c -o cstdio.i") ret ~~"
 steps="$steps $(keys 'with files clang -c bad.c') ret ~~"
 steps="$steps $(keys 'with files clang -c nothere.c') ret ~~"
+steps="$steps $(keys 'with readonly ld.lld --version') ret ~~"
+# Up to six minutes each: on AArch64 one link has taken 59 to 141 s
+# alone (on the PC 7.5 s, nearly all of it loading ld.lld). Each wait
+# ends as soon as the link does.
+for program in $PROGRAMS; do
+    steps="$steps $(keys "with files ld.lld @ldflags $program.o lib/libc.a -o bin/$program") ret ~~ ~~ ~~ ~~"
+done
+steps="$steps $(keys 'bin/chello one two') ret ~~"
+steps="$steps $(keys 'with files ld.lld cwords.o -o bin/x') ret ~~ ~~ ~~ ~~"
 steps="$steps $(keys 'echo done') ret ~"
 
-echo "Booting $ARCH to compile TheTaaJ's C programs with clang there (log: $LOG)..."
+echo "Booting $ARCH to compile and link TheTaaJ's C programs with clang and lld there (log: $LOG)..."
+# Three slots for two CPUs: the third is for QEMU's disk thread, which
+# reading these big programs keeps busy (qemu-boot.sh, SLOTS).
 if [ "$ARCH" = aarch64 ]; then
-    KEYS="$steps" SLOTS=2 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
+    KEYS="$steps" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 60
 else
-    DISK="$DISK" SMP=2 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
+    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
 fi
 
 said '\[shell\] line: "with readonly clang --version"' "the keys did not reach the shell"
@@ -181,7 +230,16 @@ said "^bad\.c:2:12: error: use of undeclared identifier 'x'" "clang did not say 
 said "^clang: error: no such file or directory: 'nothere\.c'" "clang did not sign its complaint about nothere.c with its name"
 [ "$(grep -ac '"clang" exited with code 1' "$LOG")" -eq 2 ] || fail "clang did not fail on bad.c and on nothere.c"
 said '\[shell\] line: "echo done"' "the shell did not get its keys back"
-grep -a '"clang" killed' "$LOG" && fail "clang was killed"
+said '^TheTaaJ LLD 18\.1\.3 \(compatible with GNU linkers\)' "ld.lld did not say its version"
+[ "$(grep -ac '"ld.lld" exited with code 0' "$LOG")" -eq 12 ] \
+    || fail "ld.lld did not say its version and link all eleven programs with exit code 0"
+# The program linked on TheTaaJ, run there.
+said '^Hello from C' "chello, linked on TheTaaJ, did not run"
+said '^argv\[2\] two' "chello did not get its arguments"
+said '"bin/chello" exited with code 0' "chello, linked on TheTaaJ, did not end well"
+said "^ld\.lld: error: undefined symbol: [a-z_]+" "ld.lld did not say which symbols are missing without the C library"
+said '"ld.lld" exited with code 1' "ld.lld did not fail without the C library"
+grep -aE '"(clang|ld\.lld)" killed' "$LOG" && fail "clang or ld.lld was killed"
 grep -a 'has not answered for' "$LOG" && fail "a service stopped answering during the test"
 
 same=""
@@ -191,8 +249,16 @@ for output in $(for program in $PROGRAMS; do echo $program.o; done) other.o cwor
         || fail "$output, written by clang on TheTaaJ, is not what the host's clang writes"
     same="$same $output"
 done
+linked=""
+for program in $PROGRAMS; do
+    "$TFSTOOL" get "$DISK" "bin/$program" > "$WORK/got-$program" 2> /dev/null || fail "ld.lld on TheTaaJ wrote no bin/$program"
+    cmp -s "$C_BIN/$program" "$WORK/got-$program" \
+        || fail "bin/$program, linked by ld.lld on TheTaaJ, is not the program the build links on the host ($C_BIN/$program)"
+    linked="$linked $program"
+done
 times=$(grep -aEo '^took [0-9.]+ s' "$LOG" | sed 's/took //' | tr '\n' ' ')
 echo "clang on TheTaaJ ($ARCH) wrote, byte for byte as the host's:$same"
+echo "ld.lld on TheTaaJ ($ARCH) linked, byte for byte as the build's own programs:$linked"
 echo "the timed steps took (s): $times"
 [ -s "$WORK/left-out" ] && echo "clang's headers not on the disk (names over 27 bytes): $(tr '\n' ' ' < "$WORK/left-out")"
 exit 0

@@ -26,14 +26,18 @@
 #              a program says when it is ready for the next key.
 #   DISK       a raw disk image, attached as a virtio block device
 #   SMP        how many CPUs the machine has (default 4)
+#   SLOTS      how many host CPUs the boot keeps busy (default: SMP). A
+#              boot that reads a lot from its disk asks for one more:
+#              QEMU does the disk's work in a thread of its own, and a
+#              disk driver kept waiting is stopped by init's watchdog
 
 set -u
 
 # Boots are timed, so no more of them may run at once than the host has
 # CPUs for: wait for a slot first (boot-slots.sh, which then runs this
-# script again). One slot for each CPU of the machine.
+# script again). One slot for each CPU of the machine, unless SLOTS says.
 if [ -z "${TAAJ_BOOT_HELD:-}" ]; then
-    exec "$(dirname "$0")/boot-slots.sh" "${SMP:-4}" "$0" "$@"
+    exec "$(dirname "$0")/boot-slots.sh" "${SLOTS:-${SMP:-4}}" "$0" "$@"
 fi
 
 ISO=$1

@@ -26,7 +26,9 @@
 #              tables, as it would by default - it then hands a loader
 #              no device tree. Only with UEFI; otherwise off.
 #   SLOTS      how many host CPUs the machine can keep busy (default 1):
-#              say as many as it has CPUs
+#              say as many as it has CPUs, and one more for a boot that
+#              reads a lot from its disk (QEMU's thread for the disk; see
+#              qemu-boot.sh)
 #   KEYS       keys to type at the serial port once its driver is ready,
 #              by the names QEMU's monitor uses ("shift-h i ret") - the
 #              list the PC's boot test types, typed here as the bytes a

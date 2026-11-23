@@ -167,20 +167,22 @@ edit="$edit ctrl-q see:window,2,closed $(keys 'tcc hi.c -o hi') ret ~~ $(keys 'h
 edit="$edit $(keys 'echo done') ret ~"
 
 echo "Booting $ARCH to compile C programs with tcc, there (log: $LOG)..."
+# Three slots for two CPUs: the third is for QEMU's disk thread, which
+# reading these big programs keeps busy (qemu-boot.sh, SLOTS).
 if [ "$ARCH" = aarch64 ]; then
-    KEYS="$steps" SLOTS=2 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
+    KEYS="$steps" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 40
 else
-    DISK="$DISK" SMP=2 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 40
+    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 40
 fi
 EDIT_LOG=$LOG.edit
 echo "Booting $ARCH again, to type a program into the editor and compile it (log: $EDIT_LOG)..."
 if [ "$ARCH" = aarch64 ]; then
-    SCREEN=1 KEYS="$edit" SLOTS=2 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 \
+    SCREEN=1 KEYS="$edit" SLOTS=3 QEMU_ARGS="-smp 2 -drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 \
 -device ramfb -device virtio-keyboard-device -device virtio-tablet-device" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$EDIT_LOG" 40
 else
-    DISK="$DISK" SMP=2 KEYS="$edit" "$HERE/qemu-boot.sh" "$IMAGE" "$EDIT_LOG" 40
+    DISK="$DISK" SMP=2 SLOTS=3 KEYS="$edit" "$HERE/qemu-boot.sh" "$IMAGE" "$EDIT_LOG" 40
 fi
 
 said '\[shell\] line: "tcc hello.c -o hello"' "the keys did not reach the shell"
