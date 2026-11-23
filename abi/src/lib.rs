@@ -307,6 +307,27 @@ pub mod init {
     pub const IMAGE: u8 = 2;
     /// Added to `kind`: reply on the last handle (see above).
     pub const REPLY: u8 = 0x80;
+    /// Added to `kind`: `arguments` carries the new program's
+    /// environment too - `NAME=value` words, each ending in a zero byte,
+    /// as the arguments do - laid out by `pack`. init sends it to the
+    /// program after its command line (startup::ARGUMENTS).
+    pub const ENVIRONMENT: u8 = 0x40;
+
+    /// `arguments` and `environment` as one Run's `arguments`, for a
+    /// `kind` with ENVIRONMENT: the arguments' length in two bytes
+    /// (little-endian), the arguments, the environment. Its length, or
+    /// None if it does not fit in `out`.
+    pub fn pack(arguments: &[u8], environment: &[u8], out: &mut [u8]) -> Option<usize> {
+        let length = 2 + arguments.len() + environment.len();
+        let said = u16::try_from(arguments.len()).ok()?;
+        if length > out.len() {
+            return None;
+        }
+        out[..2].copy_from_slice(&said.to_le_bytes());
+        out[2..2 + arguments.len()].copy_from_slice(arguments);
+        out[2 + arguments.len()..length].copy_from_slice(environment);
+        Some(length)
+    }
 
     pub struct Run<'a> {
         pub kind: u8,
@@ -318,9 +339,19 @@ pub mod init {
     }
 
     impl<'a> Run<'a> {
-        /// The kind without REPLY: BUILT_IN or IMAGE.
+        /// The kind without REPLY and ENVIRONMENT: BUILT_IN or IMAGE.
         pub fn what(&self) -> u8 {
-            self.kind & !REPLY
+            self.kind & !(REPLY | ENVIRONMENT)
+        }
+
+        /// The arguments and the environment (none, without
+        /// ENVIRONMENT in `kind`).
+        pub fn parts(&self) -> (&'a [u8], &'a [u8]) {
+            if self.kind & ENVIRONMENT == 0 {
+                return (self.arguments, &[]);
+            }
+            let Some((said, rest)) = self.arguments.split_first_chunk::<2>() else { return (&[], &[]) };
+            rest.split_at_checked(usize::from(u16::from_le_bytes(*said))).unwrap_or((&[], &[]))
         }
 
         /// Whether the reply goes on a channel of the asker's own, the
@@ -360,7 +391,12 @@ pub mod init {
             let directory = text()?;
             let file = text()?;
             let arguments = rest;
-            matches!(kind & !REPLY, BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
+            // With an environment, the arguments' length must be right.
+            if kind & ENVIRONMENT != 0 {
+                let (said, rest) = arguments.split_first_chunk::<2>()?;
+                rest.split_at_checked(usize::from(u16::from_le_bytes(*said)))?;
+            }
+            matches!(kind & !(REPLY | ENVIRONMENT), BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
         }
     }
 }
@@ -1881,6 +1917,28 @@ mod tests {
             .unwrap();
         let back = Run::decode(&message[..length]).unwrap();
         assert_eq!((back.name, back.file, back.arguments.len()), ("hello", "", 0));
+    }
+
+    #[test]
+    fn a_run_request_may_carry_an_environment() {
+        use super::init::{pack, Run, ENVIRONMENT, IMAGE, REPLY};
+        let mut packed = [0u8; 64];
+        let length = pack(b"x.c\0-o\0x\0", b"CC=tcc\0MAKEFLAGS=-s\0", &mut packed).unwrap();
+        let run = Run { kind: IMAGE | REPLY | ENVIRONMENT, flags: 0, name: "make", directory: "", file: "/make", arguments: &packed[..length] };
+        let mut message = [0u8; 128];
+        let n = run.encode(&mut message).unwrap();
+        let back = Run::decode(&message[..n]).unwrap();
+        assert_eq!(back.what(), IMAGE);
+        assert!(back.replies_apart());
+        assert_eq!(back.parts(), (&b"x.c\0-o\0x\0"[..], &b"CC=tcc\0MAKEFLAGS=-s\0"[..]));
+        // Without ENVIRONMENT, all of it is arguments, as before.
+        let plain = Run { kind: IMAGE, flags: 0, name: "ls", directory: "", file: "/ls", arguments: b"a\0" };
+        assert_eq!(plain.parts(), (&b"a\0"[..], &b""[..]));
+        // A length that says more than there is: not a request.
+        let bad = Run { kind: IMAGE | ENVIRONMENT, flags: 0, name: "ls", directory: "", file: "/ls", arguments: b"\x09\0ab" };
+        let n = bad.encode(&mut message).unwrap();
+        assert!(Run::decode(&message[..n]).is_none());
+        assert!(pack(&[0; 40], b"", &mut [0u8; 16]).is_none(), "too big for the message");
     }
 
     #[test]
