@@ -26,6 +26,7 @@ pub mod devicetree;
 pub mod elf;
 pub mod fwcfg;
 pub mod gic;
+pub mod hypervisor;
 pub mod ioports;
 pub mod logmerge;
 pub mod logring;

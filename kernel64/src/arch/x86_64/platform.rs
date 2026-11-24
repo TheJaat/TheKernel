@@ -47,6 +47,9 @@ pub struct Report {
     pub timer_hz: u64,
     pub bus_hz: u64,
     pub tsc_hz: u64,
+    /// When the frequencies were stated by a hypervisor: what the PIT
+    /// measured (timer, TSC), for comparison.
+    pub measured: Option<(u64, u64)>,
     pub keyboard_gsi: Option<u32>,
     pub mouse_gsi: Option<u32>,
 }
@@ -81,6 +84,7 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
         timer_hz: hz,
         bus_hz: 0,
         tsc_hz: 0,
+        measured: None,
         keyboard_gsi: None,
         mouse_gsi: None,
     };
@@ -114,7 +118,12 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
         }
     }
 
-    let (bus_hz, tsc_hz) = apic::calibrate();
+    // What the hypervisor states, if it states it; else measured. The
+    // PIT is still read either way, so the log can show both.
+    let measured = apic::calibrate();
+    let stated = apic::stated_frequencies();
+    report.measured = stated.map(|_| measured);
+    let (bus_hz, tsc_hz) = stated.unwrap_or(measured);
     report.bus_hz = bus_hz;
     report.tsc_hz = tsc_hz;
     TSC_HZ.store(tsc_hz, core::sync::atomic::Ordering::Relaxed);

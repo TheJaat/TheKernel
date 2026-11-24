@@ -5,12 +5,16 @@
 #   usage: usb-test.sh ISO DISK LOG
 #
 # Five machines, booted at once:
-#   pc      QEMU's PC (BIOS) with qemu-xhci (MSI-X only), a USB keyboard,
+#   pc      QEMU's PC (BIOS) with qemu-xhci (MSI-X only; 16 ports, so that
+#           QEMU puts no hub of its own in), a USB keyboard,
 #           a USB mouse and a USB stick. A line is typed on the keyboard;
 #           a key is held down for a second, and must repeat; the mouse
 #           is moved and clicked, and the display must see the clicks
 #           where the pointer is; the stick must be started (the system's
-#           disk is the virtio one, so it is not used).
+#           disk is the virtio one, so it is not used). A tablet (an
+#           absolute pointer without the boot protocol, as VMware's mouse
+#           is) and a hub are there too: not driven, and each named once -
+#           not again on every port event, as VMware showed they were.
 #   q35     the q35 under UEFI, with NEC's controller (MSI and MSI-X:
 #           MSI is used), and a stick on it. The firmware drives both
 #           before the kernel starts, and the driver must take them over.
@@ -86,7 +90,7 @@ HELD="$(keys 'echo ') !sendkey,a,1000 ret ~"
 # which qemu-boot.sh adds without one too.)
 HOTPLUG="!device_add,usb-kbd see:keyboard,(0627:0001 $(keys 'echo the late one') ret ~ !device_del,/machine/peripheral-anon/device[1] see:unplugged $(keys 'echo ps2 again') ret ~"
 boot pc "$TYPED $HELD $MOUSE" \
-    "-device qemu-xhci,id=xhci $KBD -device usb-mouse,bus=xhci.0 -drive if=none,id=stick,format=raw,file=$DISK.stick -device usb-storage,bus=xhci.0,drive=stick" &
+    "-device qemu-xhci,id=xhci,p2=8,p3=8 $KBD -device usb-mouse,bus=xhci.0 -drive if=none,id=stick,format=raw,file=$DISK.stick -device usb-storage,bus=xhci.0,drive=stick -device usb-tablet,bus=xhci.0 -device usb-hub,bus=xhci.0" &
 boot q35 "$TYPED" "-machine q35 -bios $OVMF -device nec-usb-xhci,id=xhci $KBD -drive if=none,id=stick,format=raw,file=$DISK.q35stick -device usb-storage,bus=xhci.0,drive=stick" &
 boot polled "$TYPED" "-device nec-usb-xhci,id=xhci,msi=off,msix=off $KBD" no-disk &
 boot hot "$HOTPLUG" "-device qemu-xhci,id=xhci" &
@@ -129,6 +133,11 @@ text "$LOG.pc" | grep -aEq '^a{10,}$' || fail "$LOG.pc: a held key did not repea
 has "$LOG.pc" '^\[usb\] port [0-9]+: mouse \(0627:0001, [a-zA-Z ]+\) ready$' "the mouse was not enumerated"
 got=$(grep -aoE '\[display\] [a-z]+ button at \([0-9]+, [0-9]+\)' "$LOG.pc" | sed -e 's/\[display\] //' -e 's/ button at//' | paste -sd ';')
 [ "$got" = "left (512, 384);right (612, 434);middle (492, 314)" ] || fail "$LOG.pc: the clicks were seen at: $got"
+# The devices not driven: named, once each.
+for what in 'an input device without the boot protocol \(class 0x03\)' 'a hub \(class 0x09\)'; do
+    count=$(text "$LOG.pc" | grep -acE "^\[usb\] port [0-9]+: [0-9a-f]{4}:[0-9a-f]{4}, [a-z ]+, $what - not driven$")
+    [ "$count" = 1 ] || fail "$LOG.pc: \"$what - not driven\" was logged $count times, not once"
+done
 # The stick: started, though the system's disk is the virtio one.
 for machine in pc q35; do
     has "$LOG.$machine" '^\[usb\] port [0-9]+: disk "QEMU QEMU HARDDISK" \(46f4:0001, [a-zA-Z ]+\), 8192 sectors \(4 MiB\) ready$' "the USB stick was not started"

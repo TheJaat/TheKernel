@@ -766,8 +766,16 @@ fn report_platform(p: &arch::platform::Report) {
     for &(id, address, gsi_base, inputs) in &p.io_apics {
         kprintln!("[irq] I/O APIC {id} at {address:#x}: GSIs {gsi_base}-{}", gsi_base + inputs - 1);
     }
+    let source = match p.measured {
+        Some((bus, tsc)) => alloc::format!(
+            "stated by the hypervisor (the PIT measured {} and {} MHz)",
+            bus / 1_000_000,
+            tsc / 1_000_000
+        ),
+        None => String::from("measured against the PIT"),
+    };
     kprintln!(
-        "[irq] APIC timer at {} Hz (bus clock {} MHz), TSC {} MHz",
+        "[irq] APIC timer at {} Hz (bus clock {} MHz), TSC {} MHz: {source}",
         p.timer_hz,
         p.bus_hz / 1_000_000,
         p.tsc_hz / 1_000_000

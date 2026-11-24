@@ -131,6 +131,32 @@ pub unsafe fn calibrate() -> (u64, u64) {
     (per_window * 1_000_000 / WINDOW_US, (tsc_end - tsc_start) * 1_000_000 / WINDOW_US)
 }
 
+/// The same two numbers, when a hypervisor states them: VMware answers
+/// CPUID leaf 0x4000_0010 with the TSC's frequency and the APIC timer's
+/// input clock (`kernel64::hypervisor`, which decodes it). Linux reads
+/// it too.
+///
+/// Why not just measure: under VMware the PIT is a poor ruler. Its
+/// countdown, read back through port 0x61, ends early or late depending
+/// on when the virtual CPU happens to run: two boots of one machine
+/// measured the TSC at 3075 and at 11122 MHz. The hypervisor's number
+/// is the one its virtual clocks actually run at.
+pub fn stated_frequencies() -> Option<(u64, u64)> {
+    use core::arch::x86_64::__cpuid;
+    use kernel64::hypervisor::{self, Answer};
+    let ask = |leaf| {
+        let r = __cpuid(leaf); // CPUID exists on every x86_64 CPU
+        Answer { eax: r.eax, ebx: r.ebx, ecx: r.ecx, edx: r.edx }
+    };
+    if !hypervisor::has_timing(ask(1).ecx, ask(0x4000_0000)) {
+        return None;
+    }
+    let (tsc_hz, bus_hz) = hypervisor::timing(ask(hypervisor::TIMING_LEAF))?;
+    // The timer counts the bus clock divided by 16 (`calibrate`,
+    // `start_timer`): that is the rate its ticks are given in.
+    Some((bus_hz / 16, tsc_hz))
+}
+
 /// Starts the timer raising `vector` `hz` times a second.
 pub fn start_timer(vector: u8, ticks_per_second: u64, hz: u64) {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
