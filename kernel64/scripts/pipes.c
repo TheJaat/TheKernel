@@ -318,7 +318,22 @@ static void shell(void)
     check(system("[ -f in.txt ] && test -d sub && ! test -d in.txt") == 0, "test and [");
     check(system("exit 7") == 7 << 8, "exit");
     check(system("nothing && pipes emit x") == 127 << 8, "a command not found in a list: 127");
-    check(system("if true; then pipes emit x; fi") == 2 << 8, "if: not in this shell yet, 2");
+    check(system("cat << END") == 2 << 8, "a here-document: not in this shell yet, 2");
+    check(system("for w in a b c; do pipes emit $w; done > for.txt") == 0 && strcmp(contents("for.txt"), "a\nb\nc\n") == 0,
+          "for, its output a file");
+    check(system("if [ -f in.txt ]; then pipes emit yes > if.txt; else pipes emit no > if.txt; fi") == 0
+              && strcmp(contents("if.txt"), "yes\n") == 0, "if and else");
+    check(system("n=0; while [ $n -lt 3 ]; do n=$((n + 1)); done; pipes emit $n > while.txt") == 0
+              && strcmp(contents("while.txt"), "3\n") == 0, "while, and $((...))");
+    check(system("pipes emit one two | while read a b; do pipes emit \"$b-$a\"; done > read.txt") == 0
+              && strcmp(contents("read.txt"), "two-one\n") == 0, "a loop in a pipeline, reading its input");
+    check(system("f() { pipes emit \"f:$1\"; }; f x > fn.txt") == 0 && strcmp(contents("fn.txt"), "f:x\n") == 0,
+          "a function, with a redirection");
+    check(system("case main.c in *.h) exit 3;; *.c) exit 4;; esac") == 4 << 8, "case");
+    check(system("f=a/b.txt; pipes emit ${f##*/} ${f%.txt} > strip.txt") == 0 && strcmp(contents("strip.txt"), "b.txt a/b\n") == 0,
+          "${f##*/} and ${f%.txt}");
+    check(system("(cd sub && pipes emit inside) > paren.txt") == 0 && strcmp(contents("paren.txt"), "inside\n") == 0
+              && strcmp(contents("sub/paren.txt"), "(none)") == 0, "a subshell, its output a file here");
     FILE *stream = popen("pipes emit one; pipes emit two", "r");
     char line[64] = "", second[64] = "";
     check(stream != NULL && fgets(line, sizeof line, stream) && fgets(second, sizeof second, stream)

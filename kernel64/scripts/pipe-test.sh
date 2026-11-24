@@ -20,9 +20,11 @@
 #   with programs sh -c '...'    a list, typed
 #   with programs sh script.sh one 'two words'
 #                            a script: its arguments, cd, $(...), test,
-#                            a wildcard, ${...}, set -e
-#   with programs sh -c 'if x'   refused: not in this shell yet
-#   with programs make       three recipes with <, >, |, 2>&1, ; and $(...)
+#                            a wildcard, ${...}, if, for, while read,
+#                            case, a function, $((...)), set -e
+#   with programs sh -c 'cat << x'   refused: not in this shell yet
+#   with programs make       four recipes with <, >, |, 2>&1, ;, $(...)
+#                            and a for loop
 #   with programs make       again: nothing to do
 #   with files make refused  no right to start programs: refused
 #
@@ -55,7 +57,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 cat > "$WORK/Makefile" <<'EOF'
 # Recipes that need pipes and redirections.
-all: made-count.txt made-both.txt made-shell.txt
+all: made-count.txt made-both.txt made-shell.txt made-loop.txt
 
 made-count.txt: in.txt
 	pipes count < in.txt > made-count.txt
@@ -66,6 +68,9 @@ made-both.txt: in.txt
 
 made-shell.txt: in.txt
 	N=$$(pipes count < in.txt); test -n "$$N" && echo "counted: $$N" > made-shell.txt
+
+made-loop.txt: in.txt
+	for w in a b; do echo $$w; done > made-loop.txt
 
 refused:
 	pipes emit not run
@@ -83,6 +88,18 @@ test -d in.txt || echo "in.txt is not a directory"
 echo *.mk
 pipes emit one two | pipes count
 CC=tcc; echo "${CC:-none} ${LD:-none} ${#CC}"
+for f in in.txt env.mk none; do
+    if [ -f "$f" ]; then echo "$f: there"; else echo "$f: missing"; fi
+done
+count() { echo "$# arguments"; }
+count a "b c"
+echo "sum: $((6 * 7))"
+f=script.sh; echo "${f%.sh}"
+pipes emit x y | while read a b; do echo "read: $b $a"; done
+case "$1" in
+    one) echo "first is one" ;;
+    *) echo "first is not" ;;
+esac
 set -e
 pipes exit 3
 echo "not reached"
@@ -106,7 +123,7 @@ steps="$(keys 'cd t') ret ~"
 steps="$steps $(keys 'echo == checks ==') ret ~ $(keys 'with programs pipes') ret ~~ ~~ ~~"
 steps="$steps $(keys 'echo == typed ==') ret ~ $(keys "with programs sh -c 'echo a && echo b; false || echo c'") ret ~"
 steps="$steps $(keys 'echo == script ==') ret ~ $(keys "with programs sh script.sh one 'two words'") ret ~~"
-steps="$steps $(keys 'echo == missing ==') ret ~ $(keys "with programs sh -c 'if x'") ret ~"
+steps="$steps $(keys 'echo == missing ==') ret ~ $(keys "with programs sh -c 'cat << x'") ret ~"
 steps="$steps $(keys 'echo == make ==') ret ~ $(keys 'with programs make') ret ~~"
 steps="$steps $(keys 'echo == again ==') ret ~ $(keys 'with programs make') ret ~"
 steps="$steps $(keys 'echo == refused ==') ret ~ $(keys 'with files make refused') ret ~"
@@ -141,17 +158,18 @@ has typed '^b$' "sh -c did not run the command after &&"
 has typed '^c$' "sh -c did not run the command after ||"
 has typed '"sh" exited with code 0' "sh -c did not exit with code 0"
 for line in 'args: 2 \[one\] \[two words\] script\.sh' '/t/sub' 'counted: 5000 bytes' 'in\.txt is a file' \
-    'in\.txt is not a directory' 'env\.mk' '8 bytes' 'tcc none 3'; do
+    'in\.txt is not a directory' 'env\.mk' '8 bytes' 'tcc none 3' 'in\.txt: there' 'env\.mk: there' 'none: missing' \
+    '2 arguments' 'sum: 42' 'script' 'read: y x' 'first is one'; do
     has script "^$line\$" "the script did not say: $line"
 done
 has script '"sh" exited with code 3' "set -e did not stop the script at pipes exit 3"
 part script | grep -aq 'not reached' && fail "the script went on after a failure, with set -e"
-has missing '^sh: if is not in this shell yet$' "sh did not refuse if"
-has missing '"sh" exited with code 2' "sh did not exit with code 2 for if"
+has missing '^sh: a here-document, <<, is not in this shell yet$' "sh did not refuse a here-document"
+has missing '"sh" exited with code 2' "sh did not exit with code 2 for a here-document"
 has make '"make" exited with code 0' "make did not exit with code 0"
 [ "$(part make | grep -ac '\[init\] started pipes')" -eq 5 ] || fail "make did not start exactly the five commands of its recipes"
 has again '^make: nothing to be done for all$' "a second make did something"
-has refused "^make: \(Makefile:15\): couldn't execute 'pipes emit not run'$" \
+has refused "^make: \(Makefile:18\): couldn't execute 'pipes emit not run'$" \
     "make, not given the right to start programs, ran a recipe"
 grep -aE '"(pipes|make|cat|sh)" killed' "$WORK/log" && fail "a program was killed"
 grep -a 'has not answered for' "$WORK/log" && fail "a service stopped answering during the test"
@@ -165,5 +183,7 @@ part refused | grep -aq '^not run$' && fail "make, not given the right to start 
 [ "$(cat "$WORK/counted.txt")" = "5000 bytes" ] || fail "t/made-count.txt is not what the recipe wrote"
 "$TFSTOOL" get "$DISK" t/made-shell.txt > "$WORK/shell.txt" || fail "t/made-shell.txt cannot be read off the disk"
 [ "$(cat "$WORK/shell.txt")" = "counted: 5000 bytes" ] || fail "t/made-shell.txt is not what the recipe wrote: $(cat "$WORK/shell.txt")"
+"$TFSTOOL" get "$DISK" t/made-loop.txt > "$WORK/loop.txt" || fail "t/made-loop.txt cannot be read off the disk"
+printf 'a\nb\n' | cmp -s - "$WORK/loop.txt" || fail "t/made-loop.txt is not what the recipe's loop wrote: $(cat "$WORK/loop.txt")"
 
-echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script; make ran recipes with <, >, |, 2>&1 and \$(...)"
+echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script with if, for, while read, case and a function; make ran recipes with <, >, |, 2>&1, \$(...) and a loop"
