@@ -1073,6 +1073,9 @@ pub mod block {
     pub const OUT_OF_RANGE: u8 = 2;
     pub const READ_ONLY: u8 = 3;
     pub const BAD_REQUEST: u8 = 4;
+    /// Nothing in the drive: a driver for removable disks (USB sticks)
+    /// with none plugged in.
+    pub const NO_MEDIUM: u8 = 5;
 
     pub const REQUEST_SIZE: usize = 1 + 8;
 
@@ -1087,6 +1090,7 @@ pub mod block {
             IO_ERROR => "the disk reported an error",
             OUT_OF_RANGE => "no such sector",
             READ_ONLY => "the disk is read-only",
+            NO_MEDIUM => "nothing in the drive",
             _ => "the disk service did not understand",
         }
     }

@@ -65,9 +65,11 @@ const INTEL_DMA_PAGES: u64 = 2 + (32 + 16) / 2;
 /// And for an xHCI controller's: five pages of its own (the device
 /// context array, the command and event rings, the event ring's table,
 /// a page for control transfers), four for each of 8 devices, and up
-/// to 32 scratchpad pages the controller may ask for
-/// (`usb/src/xhci.rs`, `layout`).
-const XHCI_DMA_PAGES: u64 = 5 + 8 * 4 + 32;
+/// to 32 scratchpad pages the controller may ask for; then a USB
+/// stick's: a page for its commands and statuses, and 32 for its data
+/// (128 KiB, abi::block::SECTORS_MAX sectors) - `usb/src/xhci.rs`,
+/// `layout`.
+const XHCI_DMA_PAGES: u64 = 5 + 8 * 4 + 32 + 1 + 32;
 /// The most memory a BAR of registers is taken to be: AHCI's is 4 or
 /// 8 KiB, NVMe's 8 or 16. More is a BAR this kernel does not understand.
 const REGISTERS_MAX: u64 = 1 << 20;
