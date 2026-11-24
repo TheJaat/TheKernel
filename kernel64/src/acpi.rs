@@ -34,6 +34,8 @@ pub enum AcpiError {
     BadChecksum(u64),
     BadLength(u64),
     NotFound([u8; 4]),
+    /// A table this kernel reads, describing something it cannot use.
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for AcpiError {
@@ -43,6 +45,7 @@ impl fmt::Display for AcpiError {
             AcpiError::BadSignature(a) => write!(f, "bad signature at {a:#x}"),
             AcpiError::BadChecksum(a) => write!(f, "bad checksum at {a:#x}"),
             AcpiError::BadLength(a) => write!(f, "implausible length at {a:#x}"),
+            AcpiError::Unsupported(what) => write!(f, "{what}"),
             AcpiError::NotFound(s) => {
                 write!(f, "no {} table", core::str::from_utf8(s).unwrap_or("????"))
             }
@@ -86,7 +89,9 @@ impl Table {
     }
 }
 
-fn read_table(memory: &impl PhysicalMemory, address: u64) -> Result<Table, AcpiError> {
+/// The table at `address`, checked: a plausible length, its checksum.
+/// (For a table the root does not list, such as the DSDT.)
+pub fn read_table(memory: &impl PhysicalMemory, address: u64) -> Result<Table, AcpiError> {
     let mut header = [0u8; HEADER_LENGTH];
     if !memory.read(address, &mut header) {
         return Err(AcpiError::Unreadable(address));
@@ -289,6 +294,111 @@ impl Madt {
     }
 }
 
+// ---- the FADT ---------------------------------------------------------
+
+/// What the FADT (signature "FACP", the "fixed ACPI description table")
+/// says about switching the machine off and resetting it: which I/O
+/// ports do it. The values to write to switch off are not here - they
+/// are in the DSDT's AML (`\_S5`), which is not the kernel's to read;
+/// the kernel only finds the DSDT and hands it on.
+///
+/// The FADT has grown with each ACPI version. Version 1's is 116 bytes,
+/// with 32-bit addresses. Version 2 added the reset register (at 116)
+/// and 64-bit "X_" addresses, each a generic address structure (GAS:
+/// which address space, then the address), which take precedence when
+/// they are there and not zero. Only I/O-space registers are taken: on
+/// a PC the PM1 registers are always I/O ports, and a machine that has
+/// them in memory (or none at all: "hardware-reduced" ACPI, as on most
+/// ARM servers) is one this kernel does not switch off this way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fadt {
+    /// The DSDT's physical address.
+    pub dsdt: u64,
+    /// The port that switches the chipset into ACPI mode, and the value
+    /// to write (0, 0: already in ACPI mode, always).
+    pub smi_command: u16,
+    pub acpi_enable: u8,
+    /// The PM1 control registers (PM1b: 0 if none), and their width in
+    /// bytes.
+    pub pm1a_control: u16,
+    pub pm1b_control: u16,
+    pub pm1_control_length: u8,
+    /// The reset register, if the FADT names one in I/O space: its port
+    /// and the value that resets.
+    pub reset: Option<(u16, u8)>,
+}
+
+/// FADT flags: the reset register is there and works.
+const FADT_RESET_REGISTER: u32 = 1 << 10;
+/// And: "hardware-reduced ACPI" - no PM1 registers at all.
+const FADT_HARDWARE_REDUCED: u32 = 1 << 20;
+/// A generic address structure's address space: I/O ports.
+const GAS_IO: u8 = 1;
+
+impl Fadt {
+    pub fn parse(table: &Table) -> Result<Fadt, AcpiError> {
+        let b = &table.bytes;
+        let length = b.len();
+        if &table.signature() != b"FACP" {
+            return Err(AcpiError::BadSignature(table.address));
+        }
+        if length < 116 {
+            return Err(AcpiError::BadLength(table.address));
+        }
+        let flags = u32_at(b, 112);
+        if flags & FADT_HARDWARE_REDUCED != 0 {
+            return Err(AcpiError::Unsupported("hardware-reduced ACPI: no PM1 registers"));
+        }
+        // A generic address at `at`, if the table is long enough to have
+        // it and it is not zero: (address space, address).
+        let gas = |at: usize| -> Option<(u8, u64)> {
+            (length >= at + 12).then(|| (b[at], u64_at(b, at + 4))).filter(|&(_, address)| address != 0)
+        };
+        // A port: an I/O-space address that fits in 16 bits.
+        let port = |(space, address): (u8, u64), what: &'static str| -> Result<u16, AcpiError> {
+            if space != GAS_IO {
+                return Err(AcpiError::Unsupported(what));
+            }
+            u16::try_from(address).map_err(|_| AcpiError::Unsupported(what))
+        };
+        let dsdt = match (length >= 148).then(|| u64_at(b, 140)).filter(|&a| a != 0) {
+            Some(wide) => wide,
+            None => u64::from(u32_at(b, 40)),
+        };
+        if dsdt == 0 {
+            return Err(AcpiError::Unsupported("the FADT names no DSDT"));
+        }
+        let pm1a_control = match gas(172) {
+            Some(address) => port(address, "the PM1a control register is not an I/O port")?,
+            None => port((GAS_IO, u64::from(u32_at(b, 64))), "the PM1a control register is not an I/O port")?,
+        };
+        if pm1a_control == 0 {
+            return Err(AcpiError::Unsupported("the FADT names no PM1a control register"));
+        }
+        let pm1b_control = match gas(184) {
+            Some(address) => port(address, "the PM1b control register is not an I/O port")?,
+            None => port((GAS_IO, u64::from(u32_at(b, 68))), "the PM1b control register is not an I/O port")?,
+        };
+        let smi_command = port((GAS_IO, u64::from(u32_at(b, 48))), "the SMI command port is past 0xFFFF")?;
+        let reset = if length >= 129 && flags & FADT_RESET_REGISTER != 0 {
+            // A reset register in memory or PCI space: not taken. 0xCF9
+            // does the same on any PC.
+            gas(116).and_then(|address| port(address, "").ok()).map(|p| (p, b[128]))
+        } else {
+            None
+        };
+        Ok(Fadt {
+            dsdt,
+            smi_command,
+            acpi_enable: b[52],
+            pm1a_control,
+            pm1b_control,
+            pm1_control_length: match b[89] { 0 => 2, n => n },
+            reset,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +559,93 @@ mod tests {
         let bytes = table(b"APIC", &body);
         let t = Table { address: 0x300, bytes };
         assert_eq!(Madt::parse(&t).err(), Some(AcpiError::BadLength(0x300)));
+    }
+
+    /// A FADT `length` bytes long (header included), with QEMU's PC
+    /// values: DSDT, SMI command 0xB2 (ACPI enable 0xF1), PM1a control
+    /// at 0x604, 2 bytes wide.
+    fn fadt(length: usize) -> Table {
+        let mut b = vec![0u8; length];
+        b[0..4].copy_from_slice(b"FACP");
+        b[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        b[40..44].copy_from_slice(&0x7FE0_0040u32.to_le_bytes());
+        b[48..52].copy_from_slice(&0xB2u32.to_le_bytes());
+        b[52] = 0xF1;
+        b[64..68].copy_from_slice(&0x604u32.to_le_bytes());
+        b[89] = 2;
+        Table { address: 0x1000, bytes: b }
+    }
+
+    /// A generic address: I/O space (1) or memory (0), at `address`.
+    fn put_gas(t: &mut Table, at: usize, space: u8, address: u64) {
+        t.bytes[at] = space;
+        t.bytes[at + 1] = 16;
+        t.bytes[at + 4..at + 12].copy_from_slice(&address.to_le_bytes());
+    }
+
+    #[test]
+    fn a_version_1_fadt_gives_its_ports() {
+        let f = Fadt::parse(&fadt(116)).unwrap();
+        assert_eq!(f, Fadt {
+            dsdt: 0x7FE0_0040,
+            smi_command: 0xB2,
+            acpi_enable: 0xF1,
+            pm1a_control: 0x604,
+            pm1b_control: 0,
+            pm1_control_length: 2,
+            reset: None,
+        });
+    }
+
+    #[test]
+    fn the_wide_fields_win_and_the_reset_register_is_taken() {
+        let mut t = fadt(244); // ACPI 5's length
+        t.bytes[112..116].copy_from_slice(&FADT_RESET_REGISTER.to_le_bytes());
+        put_gas(&mut t, 116, GAS_IO, 0xCF9);
+        t.bytes[128] = 0x0F;
+        t.bytes[140..148].copy_from_slice(&0x1_0000_2000u64.to_le_bytes()); // X_DSDT
+        put_gas(&mut t, 172, GAS_IO, 0x1804); // X_PM1a_CNT
+        put_gas(&mut t, 184, GAS_IO, 0x1904); // X_PM1b_CNT
+        let f = Fadt::parse(&t).unwrap();
+        assert_eq!((f.dsdt, f.pm1a_control, f.pm1b_control), (0x1_0000_2000, 0x1804, 0x1904));
+        assert_eq!(f.reset, Some((0xCF9, 0x0F)));
+        // The reset register without the flag that says it works: not taken.
+        t.bytes[112..116].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Fadt::parse(&t).unwrap().reset, None);
+        // In memory: not taken either (0xCF9 will do).
+        t.bytes[112..116].copy_from_slice(&FADT_RESET_REGISTER.to_le_bytes());
+        put_gas(&mut t, 116, 0, 0xFED0_0000);
+        assert_eq!(Fadt::parse(&t).unwrap().reset, None);
+        // Zero wide fields: the 32-bit ones count.
+        let mut t = fadt(244);
+        put_gas(&mut t, 172, GAS_IO, 0);
+        assert_eq!(Fadt::parse(&t).unwrap().pm1a_control, 0x604);
+        assert_eq!(Fadt::parse(&t).unwrap().dsdt, 0x7FE0_0040);
+    }
+
+    #[test]
+    fn what_cannot_be_switched_off_this_way_is_refused() {
+        let mut t = fadt(244);
+        t.bytes[112..116].copy_from_slice(&FADT_HARDWARE_REDUCED.to_le_bytes());
+        assert_eq!(Fadt::parse(&t), Err(AcpiError::Unsupported("hardware-reduced ACPI: no PM1 registers")));
+        // In memory - at an address small enough to pass for a port, so
+        // that only the address space can be what refuses it.
+        let mut t = fadt(244);
+        put_gas(&mut t, 172, 0, 0x1804);
+        assert_eq!(Fadt::parse(&t), Err(AcpiError::Unsupported("the PM1a control register is not an I/O port")));
+        let mut t = fadt(116);
+        t.bytes[64..68].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Fadt::parse(&t), Err(AcpiError::Unsupported("the FADT names no PM1a control register")));
+        let mut t = fadt(116);
+        t.bytes[40..44].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Fadt::parse(&t), Err(AcpiError::Unsupported("the FADT names no DSDT")));
+        assert_eq!(Fadt::parse(&fadt(100)), Err(AcpiError::BadLength(0x1000)));
+        let mut t = fadt(116);
+        t.bytes[0..4].copy_from_slice(b"APIC");
+        assert_eq!(Fadt::parse(&t), Err(AcpiError::BadSignature(0x1000)));
+        // A width of 0 in a version 1 table: 2, the size every PC has.
+        let mut t = fadt(116);
+        t.bytes[89] = 0;
+        assert_eq!(Fadt::parse(&t).unwrap().pm1_control_length, 2);
     }
 }

@@ -54,6 +54,11 @@ pub enum Object {
     Process(Arc<process::Process>),
     /// The right to look at the whole system: memory, processes.
     System,
+    /// The right to ask the firmware to switch the machine off or reset
+    /// it (AArch64's PSCI; power.rs). Only init is given one. (A PC
+    /// has none: its power is ACPI's ports.)
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    Power,
 }
 
 /// A handle in flight: the object and the rights it travels with.
@@ -534,6 +539,13 @@ pub fn object_wait_until(handles: u64, count: u64, deadline: Option<u64>) -> Res
         crate::threads::Waited::TimedOut => return Err(Error::TimedOut),
     }
     Ok(waitables.iter().position(Waitable::ready).unwrap_or(0) as u64)
+}
+
+pub fn require_power(handle: Handle) -> Result<(), Error> {
+    match me()?.handles.lock().get(handle, Rights(0))? {
+        Object::Power => Ok(()),
+        _ => Err(Error::WrongType),
+    }
 }
 
 fn require_system(handle: Handle) -> Result<(), Error> {

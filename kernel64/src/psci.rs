@@ -26,6 +26,10 @@ pub const VERSION: u64 = 0x8400_0000;
 /// parts that are a name), x2 is the physical address it begins to run
 /// at, x3 a number it finds in x0 when it does.
 pub const CPU_ON: u64 = 0xC400_0003;
+/// SYSTEM_OFF: switch the whole machine off. Does not return.
+pub const SYSTEM_OFF: u64 = 0x8400_0008;
+/// SYSTEM_RESET: reset the whole machine. Does not return.
+pub const SYSTEM_RESET: u64 = 0x8400_0009;
 
 /// Why a CPU could not be switched on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

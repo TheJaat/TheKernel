@@ -52,6 +52,7 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::PROCESS_KILL => ipc::kill(args[0]),
         call::MEMORY_SIZE => ipc::memory_size(args[0]),
         call::OBJECT_WAIT_UNTIL => ipc::object_wait_until(args[0], args[1], Some(args[2])),
+        call::POWER => crate::power::system_power(args[0], args[1]),
         _ => Err(Error::UnknownCall),
     };
     // The way back to user mode: where a process someone asked to end,

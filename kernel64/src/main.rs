@@ -44,6 +44,7 @@ mod lastwords;
 mod ipc;
 mod memory_object;
 mod mm;
+mod power;
 mod process;
 #[cfg(target_arch = "aarch64")]
 mod mmio_devices;
@@ -515,6 +516,7 @@ fn start_init(
             Err(error) => kprintln!("[virtio] {:#x} {what}: could not hand it to init: {error:?}", device.info.registers),
         }
     }
+    power::offer(&to_init, machine.firmware_call);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![
@@ -699,7 +701,7 @@ fn report_machine(address: u64, tree: &kernel64::devicetree::Tree, machine: &ker
     }
 }
 
-/// Only in a `big-image` build: the kernel carries 768 KiB it does not
+/// Only in a `big-image` build: the kernel carries 512 KiB it does not
 /// need, which pushes its end above 2 MiB - where the BIOS loader used
 /// to refuse it. If the loader copied all of it to the right place,
 /// every byte is what the build script wrote.
@@ -837,6 +839,7 @@ fn start_init(info: &BootInfo) {
         kprintln!("framebuffer: none");
     }
     devices::offer(&to_init);
+    power::offer(&to_init, info.acpi_rsdp);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![

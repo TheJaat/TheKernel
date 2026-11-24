@@ -135,6 +135,13 @@ pub mod call {
     /// `deadline`. A deadline that has passed - 0, say - asks without
     /// waiting: "is any of these ready now?"
     pub const OBJECT_WAIT_UNTIL: u64 = 24;
+    /// power(handle, action) - asks the firmware to switch the machine
+    /// off (power::OFF) or reset it (power::RESET), through a power
+    /// handle (a kind of object only the kernel makes: on AArch64, the
+    /// right to make PSCI's SYSTEM_OFF and SYSTEM_RESET calls). Returns
+    /// only if the firmware refused. On a PC the same is done in user
+    /// space, through ACPI's I/O ports - there is no such handle there.
+    pub const POWER: u64 = 25;
 }
 
 /// The u64s process_spawn_image's request holds.
@@ -851,6 +858,113 @@ impl PciDeviceInfo {
             registers_size: u64_at(39),
             msi: b[47] != 0,
         })
+    }
+}
+
+/// Switching the machine off and resetting it.
+///
+/// The kernel describes the machine's way to `power` (the program) as a
+/// "power" message to init: these bytes, a `PowerInfo`, and handles.
+/// init asks `power` with one byte on a channel only init holds:
+/// OFF or RESET. `power` answers only if it could not - with why.
+///
+/// The shell (anyone holding init's request channel) asks init with
+/// ASK_OFF or ASK_RESET; init stops the services first, so that nothing
+/// is half-written on the disk, then asks `power`.
+pub mod power {
+    /// Switch the machine off (ACPI's sleep state S5; PSCI SYSTEM_OFF).
+    pub const OFF: u8 = 1;
+    /// Reset it (ACPI's reset register, or port 0xCF9; PSCI
+    /// SYSTEM_RESET).
+    pub const RESET: u8 = 2;
+    /// To init, on its request channel: "switch the machine off".
+    pub const ASK_OFF: &[u8] = b"power off";
+    /// To init: "reset the machine".
+    pub const ASK_RESET: &[u8] = b"reboot";
+
+    /// PowerInfo::kind: ACPI, through I/O ports. The handles: the DSDT
+    /// (read-only memory, `dsdt` into its first page), then I/O ports -
+    /// PM1a's control register, then PM1b's if `pm1b_control` is not 0,
+    /// then the SMI command port if `smi_command` is not 0, then the
+    /// reset port.
+    pub const ACPI: u8 = 1;
+    /// PowerInfo::kind: PSCI firmware calls. One handle: the power
+    /// handle (call::POWER).
+    pub const PSCI: u8 = 2;
+}
+
+/// How this machine is switched off and reset, as the kernel found it
+/// (sent to init as b"power" and these bytes; see `power`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PowerInfo {
+    /// power::ACPI or power::PSCI.
+    pub kind: u8,
+    /// Where the DSDT is (physical) and how long: ACPI's table of AML,
+    /// in which `\_S5` says what to write to switch off.
+    pub dsdt: u64,
+    pub dsdt_length: u32,
+    /// The PM1 control registers' ports (PM1b: 0 if there is none),
+    /// and how many bytes wide each is.
+    pub pm1a_control: u16,
+    pub pm1b_control: u16,
+    pub pm1_control_length: u8,
+    /// The port that switches the chipset into ACPI mode, and the value
+    /// that does (0: the machine is always in ACPI mode).
+    pub smi_command: u16,
+    pub acpi_enable: u8,
+    /// The port a reset is written to, and the value.
+    pub reset_port: u16,
+    pub reset_value: u8,
+    /// Whether the reset port is the one the FADT names (true), or
+    /// 0xCF9, the PC's reset control register, because it names none.
+    pub reset_from_fadt: bool,
+}
+
+impl PowerInfo {
+    pub const SIZE: usize = 25;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0; Self::SIZE];
+        b[0] = self.kind;
+        b[1..9].copy_from_slice(&self.dsdt.to_le_bytes());
+        b[9..13].copy_from_slice(&self.dsdt_length.to_le_bytes());
+        b[13..15].copy_from_slice(&self.pm1a_control.to_le_bytes());
+        b[15..17].copy_from_slice(&self.pm1b_control.to_le_bytes());
+        b[17] = self.pm1_control_length;
+        b[18..20].copy_from_slice(&self.smi_command.to_le_bytes());
+        b[20] = self.acpi_enable;
+        b[21..23].copy_from_slice(&self.reset_port.to_le_bytes());
+        b[23] = self.reset_value;
+        b[24] = u8::from(self.reset_from_fadt);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<PowerInfo> {
+        if b.len() != Self::SIZE {
+            return None;
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        Some(PowerInfo {
+            kind: b[0],
+            dsdt: u64::from_le_bytes(b[1..9].try_into().unwrap_or([0; 8])),
+            dsdt_length: u32::from_le_bytes(b[9..13].try_into().unwrap_or([0; 4])),
+            pm1a_control: u16_at(13),
+            pm1b_control: u16_at(15),
+            pm1_control_length: b[17],
+            smi_command: u16_at(18),
+            acpi_enable: b[20],
+            reset_port: u16_at(21),
+            reset_value: b[23],
+            reset_from_fadt: b[24] != 0,
+        })
+    }
+
+    /// How many handles come with it.
+    pub fn handles(&self) -> usize {
+        match self.kind {
+            power::ACPI => 3 + usize::from(self.pm1b_control != 0) + usize::from(self.smi_command != 0),
+            _ => 1,
+        }
     }
 }
 
@@ -1859,6 +1973,30 @@ mod tests {
         let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
     }
+
+    #[test]
+    fn power_info_survives_the_trip_through_bytes() {
+        use crate::{power, PowerInfo};
+        let info = PowerInfo {
+            kind: power::ACPI,
+            dsdt: 0x1_FFE0_0040,
+            dsdt_length: 0x1F3A,
+            pm1a_control: 0x604,
+            pm1b_control: 0,
+            pm1_control_length: 2,
+            smi_command: 0xB2,
+            acpi_enable: 0xF1,
+            reset_port: 0xCF9,
+            reset_value: 0x0F,
+            reset_from_fadt: true,
+        };
+        assert_eq!(PowerInfo::from_bytes(&info.to_bytes()), Some(info));
+        assert_eq!(info.handles(), 4, "DSDT, PM1a, SMI, reset");
+        assert_eq!(PowerInfo { pm1b_control: 0x704, smi_command: 0, ..info }.handles(), 4);
+        assert_eq!(PowerInfo { kind: power::PSCI, ..PowerInfo::default() }.handles(), 1);
+        assert_eq!(PowerInfo::from_bytes(&[0; PowerInfo::SIZE + 1]), None);
+    }
+
     #[test]
     fn a_pci_device_survives_the_trip_through_bytes() {
         use super::{MmioDeviceInfo, PciDeviceInfo};

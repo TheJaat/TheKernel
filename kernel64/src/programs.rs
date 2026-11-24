@@ -53,6 +53,9 @@ pub static DISPLAY: &[u8] = program!("display");
 pub static INIT: &[u8] = program!("init");
 pub static SHELL: &[u8] = program!("shell");
 pub static REGISTRY: &[u8] = program!("registry");
+/// Switches the machine off and resets it, when init asks: ACPI's ports
+/// on a PC, the POWER call (PSCI) on AArch64 (src/power.rs).
+pub static POWER: &[u8] = program!("power");
 
 /// PC only: they use I/O ports, a segment register, or devices only
 /// the PC kernel knows how to hand out so far.
@@ -124,6 +127,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("nic", NIC),
     ("net", NET),
     ("registry", REGISTRY),
+    ("power", POWER),
     ("echod", ECHOD),
     ("echoc", ECHOC),
     ("hello", HELLO),
@@ -143,6 +147,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("nic", NIC),
     ("net", NET),
     ("registry", REGISTRY),
+    ("power", POWER),
     ("echod", ECHOD),
     ("echoc", ECHOC),
     ("hello", HELLO),

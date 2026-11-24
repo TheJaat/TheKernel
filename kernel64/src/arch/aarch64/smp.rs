@@ -135,6 +135,14 @@ unsafe fn firmware(call: FirmwareCall, function: u64, first: u64, second: u64, t
     answer
 }
 
+/// PSCI's SYSTEM_OFF or SYSTEM_RESET. Returns only if the firmware
+/// refused; its answer.
+pub fn system_power(call: FirmwareCall, reset: bool) -> u64 {
+    let function = if reset { psci::SYSTEM_RESET } else { psci::SYSTEM_OFF };
+    // SAFETY: a PSCI function that takes no arguments.
+    unsafe { firmware(call, function, 0, 0, 0) }
+}
+
 /// Starts every other CPU the device tree lists, one after another,
 /// and reports. Returns once each has either said it is awake or been
 /// given up on.
