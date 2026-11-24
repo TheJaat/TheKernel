@@ -71,6 +71,9 @@ mod pc {
     pub static NVME: &[u8] = program!("nvme");
     /// The Intel Ethernet card's driver, the same way.
     pub static E1000: &[u8] = program!("e1000");
+    /// The USB driver (an xHCI controller, its keyboards and mice), the
+    /// same way.
+    pub static USB: &[u8] = program!("usb");
 }
 #[cfg(target_arch = "x86_64")]
 pub use pc::*;
@@ -127,6 +130,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("ahci", AHCI),
     ("nvme", NVME),
     ("e1000", E1000),
+    ("usb", USB),
     ("nic", NIC),
     ("net", NET),
     ("registry", REGISTRY),

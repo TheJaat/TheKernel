@@ -62,6 +62,12 @@ const NVME_DMA_PAGES: u64 = 5 + 32;
 /// each), 32 receive and 16 transmit buffers of 2048 bytes
 /// (`e1000/src/lib.rs`, `layout`).
 const INTEL_DMA_PAGES: u64 = 2 + (32 + 16) / 2;
+/// And for an xHCI controller's: five pages of its own (the device
+/// context array, the command and event rings, the event ring's table,
+/// a page for control transfers), four for each of 8 devices, and up
+/// to 32 scratchpad pages the controller may ask for
+/// (`usb/src/xhci.rs`, `layout`).
+const XHCI_DMA_PAGES: u64 = 5 + 8 * 4 + 32;
 /// The most memory a BAR of registers is taken to be: AHCI's is 4 or
 /// 8 KiB, NVMe's 8 or 16. More is a BAR this kernel does not understand.
 const REGISTERS_MAX: u64 = 1 << 20;
@@ -80,6 +86,9 @@ const NVME_BAR: u8 = 0;
 /// registers are in BAR 0, 128 KiB.
 const INTEL_VENDOR: u16 = 0x8086;
 const INTEL_NICS: [u16; 4] = [0x100E, 0x100F, 0x1004, 0x10D3];
+/// The PCI class of an xHCI (USB 3) host controller: serial bus, USB,
+/// xHCI. Its registers are in BAR 0.
+const XHCI_CLASS: (u8, u8, u8) = (0x0C, 0x03, 0x30);
 /// An NVMe driver needs the registers (a page) and the doorbells of two
 /// queue pairs after them: two pages when the doorbells are 4 bytes
 /// apart, as nearly always. (Wider, and the driver finds them out of
@@ -101,6 +110,15 @@ enum Kind {
     /// (IVAR), which `e1000` does not set up; with MSI it behaves as the
     /// 82540EM does.
     Intel,
+    /// Registers in memory (BAR 0); MSI, else MSI-X, else polled. MSI
+    /// first: an xHCI controller's MSI-X table is usually in BAR 0 among
+    /// its registers, and with MSI-X never turned on the table is inert
+    /// (writing it makes no interrupt and no memory write), so the
+    /// whole BAR can be the driver's. Only a controller without MSI
+    /// (QEMU's `qemu-xhci`) gets MSI-X, and the BAR cut short at the
+    /// table as an NVMe controller's is; the driver checks that its
+    /// registers are all before the cut.
+    Xhci,
 }
 
 /// What a device this kernel can hand on is called, how, and how much
@@ -114,6 +132,9 @@ fn offered(device: &Device) -> Option<(&'static str, Kind, u64)> {
     }
     if device.vendor == INTEL_VENDOR && INTEL_NICS.contains(&device.device) {
         return Some(("Intel Ethernet card", Kind::Intel, INTEL_DMA_PAGES));
+    }
+    if (device.class, device.subclass, device.prog_if) == XHCI_CLASS {
+        return Some(("USB controller", Kind::Xhci, XHCI_DMA_PAGES));
     }
     if device.vendor != virtio::PCI_VENDOR {
         return None;
@@ -190,6 +211,12 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
         interface: device.prog_if,
         ..PciDeviceInfo::default()
     };
+    // Whether MSI-X is the device's interrupt (see Kind).
+    let use_msix = match kind {
+        Kind::Intel => false,
+        Kind::Xhci => pci::msi(config, address).is_none(),
+        _ => true,
+    };
     // The registers, as a capability.
     let registers = match kind {
         Kind::VirtioLegacy => {
@@ -203,10 +230,11 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
             info.io_size = size as u16;
             Object::IoPorts(base..base + size)
         }
-        Kind::Ahci | Kind::Nvme | Kind::Intel => {
+        Kind::Ahci | Kind::Nvme | Kind::Intel | Kind::Xhci => {
             let (bar, missing) = match kind {
                 Kind::Nvme => (NVME_BAR, "BAR 0 is not memory (no NVMe registers)"),
                 Kind::Intel => (0, "BAR 0 is not memory (no e1000 registers)"),
+                Kind::Xhci => (0, "BAR 0 is not memory (no xHCI registers)"),
                 _ => (AHCI_BAR, "BAR 5 is not memory (no AHCI registers)"),
             };
             let Some(Bar::Memory { base, mut size, .. }) = pci::bar(config, address, bar) else {
@@ -221,7 +249,8 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
             // likes - an interrupt message is a memory write. So the
             // driver gets the BAR up to the first MSI-X structure in it,
             // whole pages only (the page is what a mapping protects).
-            if let Some(start) = pci::msix(config, address).and_then(|msix| msix.first_in(bar)) {
+            // Not where MSI-X stays off (an xHCI controller with MSI).
+            if let Some(start) = pci::msix(config, address).and_then(|msix| msix.first_in(bar)).filter(|_| use_msix) {
                 size = size.min(u64::from(start) & !0xFFF);
             }
             if matches!(kind, Kind::Nvme) && size < NVME_REGISTERS_MIN {
@@ -251,17 +280,15 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
 
     // A legacy virtio device is told which MSI-X entry to use, and has
     // no other way; AHCI and NVMe controllers take whichever they have;
-    // an Intel card gets MSI or nothing (see Kind::Intel).
-    let msix = match kind {
-        Kind::Intel => None,
-        _ => msix_to_new_line(config, device),
-    };
+    // an Intel card gets MSI or nothing, a USB controller MSI first (see
+    // Kind::Intel and Kind::Xhci).
+    let msix = if use_msix { msix_to_new_line(config, device) } else { None };
     let line = match msix {
         Some(line) => {
             info.msix = true;
             Some(line)
         }
-        None if matches!(kind, Kind::Ahci | Kind::Nvme | Kind::Intel) => {
+        None if matches!(kind, Kind::Ahci | Kind::Nvme | Kind::Intel | Kind::Xhci) => {
             let line = msi_to_new_line(config, device);
             info.msi = line.is_some();
             line
