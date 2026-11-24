@@ -768,7 +768,8 @@ impl ProcessEntry {
 
 /// A PCI device the kernel set up for a driver, as described to init:
 /// sent as b"pci" and these bytes, with handles to its resources -
-/// its I/O ports, DMA memory and, if `msix`, its interrupt.
+/// its registers (I/O ports, or the memory they are in), DMA memory
+/// and, if `msix` or `msi`, its interrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PciDeviceInfo {
     pub bus: u8,
@@ -776,7 +777,8 @@ pub struct PciDeviceInfo {
     pub function: u8,
     pub vendor_id: u16,
     pub device_id: u16,
-    /// The I/O port BAR: first port, and how many.
+    /// The I/O port BAR: first port, and how many. Zero for a device
+    /// whose registers are in memory.
     pub io_base: u16,
     pub io_size: u16,
     /// Physically contiguous memory for the device to read and write:
@@ -785,10 +787,28 @@ pub struct PciDeviceInfo {
     pub dma_size: u64,
     /// MSI-X is on, with message 0 going to the interrupt handle.
     pub msix: bool,
+    /// What kind of device, by the PCI standard's numbering: class,
+    /// subclass, programming interface (01.06.01 is an AHCI controller).
+    pub class: u8,
+    pub subclass: u8,
+    pub interface: u8,
+    /// For a device whose registers are in memory: the memory BAR's
+    /// physical address and size. The registers handle (the first) is
+    /// then a memory object of it, mapped uncached. Zero otherwise.
+    pub registers: u64,
+    pub registers_size: u64,
+    /// MSI (the older, simpler kind: one message, in configuration
+    /// space) is on, going to the interrupt handle.
+    pub msi: bool,
 }
 
 impl PciDeviceInfo {
-    pub const SIZE: usize = 28;
+    pub const SIZE: usize = 48;
+
+    /// Whether the registers handle is memory (not I/O ports).
+    pub const fn registers_in_memory(&self) -> bool {
+        self.registers_size != 0
+    }
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0; Self::SIZE];
@@ -800,6 +820,10 @@ impl PciDeviceInfo {
         b[11..19].copy_from_slice(&self.dma_physical.to_le_bytes());
         b[19..27].copy_from_slice(&self.dma_size.to_le_bytes());
         b[27] = u8::from(self.msix);
+        b[28..31].copy_from_slice(&[self.class, self.subclass, self.interface]);
+        b[31..39].copy_from_slice(&self.registers.to_le_bytes());
+        b[39..47].copy_from_slice(&self.registers_size.to_le_bytes());
+        b[47] = u8::from(self.msi);
         b
     }
 
@@ -820,6 +844,12 @@ impl PciDeviceInfo {
             dma_physical: u64_at(11),
             dma_size: u64_at(19),
             msix: b[27] != 0,
+            class: b[28],
+            subclass: b[29],
+            interface: b[30],
+            registers: u64_at(31),
+            registers_size: u64_at(39),
+            msi: b[47] != 0,
         })
     }
 }
@@ -1829,6 +1859,41 @@ mod tests {
         let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
     }
+    #[test]
+    fn a_pci_device_survives_the_trip_through_bytes() {
+        use super::{MmioDeviceInfo, PciDeviceInfo};
+        // Every field different, and bigger than a byte where it can
+        // be, so that swapped or cut-off ones would show.
+        let info = PciDeviceInfo {
+            bus: 1,
+            device: 2,
+            function: 3,
+            vendor_id: 0x8086,
+            device_id: 0x2922,
+            io_base: 0xC040,
+            io_size: 0x20,
+            dma_physical: 0x1122_3344_5566_7000,
+            dma_size: 0x2_1000,
+            msix: true,
+            class: 0x01,
+            subclass: 0x06,
+            interface: 0x01,
+            registers: 0x0000_0012_FEBD_1000,
+            registers_size: 0x1000,
+            msi: true,
+        };
+        let bytes = info.to_bytes();
+        assert_eq!(PciDeviceInfo::from_bytes(&bytes), Some(info));
+        assert!(info.registers_in_memory());
+        assert!(!PciDeviceInfo { registers_size: 0, ..info }.registers_in_memory());
+        for flags in [(false, false), (true, false), (false, true)] {
+            let one = PciDeviceInfo { msix: flags.0, msi: flags.1, ..info };
+            assert_eq!(PciDeviceInfo::from_bytes(&one.to_bytes()), Some(one));
+        }
+        assert_eq!(PciDeviceInfo::from_bytes(&bytes[..47]), None);
+        assert_ne!(PciDeviceInfo::SIZE, MmioDeviceInfo::SIZE, "drivers tell them apart by length");
+    }
+
     #[test]
     fn a_memory_mapped_device_survives_the_trip_through_bytes() {
         use super::{MmioDeviceInfo, PciDeviceInfo};

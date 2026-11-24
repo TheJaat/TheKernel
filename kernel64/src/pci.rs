@@ -17,8 +17,10 @@
 //! services the device. MSI-X avoids both problems: the device raises an
 //! interrupt by writing a message - a vector - straight to a CPU's local
 //! APIC, like a memory write. No routing, no shared lines, and each
-//! message is one event (edge-like). It is what modern devices use, and
-//! the only kind this kernel sets up.
+//! message is one event (edge-like). It is what modern devices use.
+//! MSI, its older form, does the same with one message (or a few) set
+//! up in configuration space itself rather than in a table in a BAR:
+//! what SATA controllers commonly have. The kernel sets up either.
 
 use alloc::vec::Vec;
 
@@ -62,11 +64,12 @@ const CAPABILITIES: u8 = 0x34;
 pub const COMMAND_IO: u16 = 1 << 0;
 pub const COMMAND_MEMORY: u16 = 1 << 1;
 pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
-/// Legacy (pin) interrupts off: MSI-X only.
+/// Legacy (pin) interrupts off: MSI-X or MSI only.
 pub const COMMAND_INTX_DISABLE: u16 = 1 << 10;
 
 const STATUS_CAPABILITIES: u16 = 1 << 4;
 pub const CAPABILITY_MSIX: u8 = 0x11;
+pub const CAPABILITY_MSI: u8 = 0x05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Device {
@@ -265,6 +268,54 @@ pub fn enable_msix(config: &mut impl ConfigSpace, address: Address, msix: &MsiX)
     config.write32(address, msix.capability, (word | MSIX_ENABLE << 16) & !(MSIX_FUNCTION_MASK << 16));
 }
 
+/// A function's MSI capability: where it is, and its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Msi {
+    pub capability: u8,
+    /// The address may be 64 bits (one word more before the data).
+    pub wide: bool,
+    /// Each message can be masked: a mask word after the data.
+    pub maskable: bool,
+}
+
+/// MSI's control word (the capability's high half): enable, how many
+/// messages are in use (bits 6:4, as a power of two), 64-bit, masking.
+const MSI_ENABLE: u32 = 1 << 0;
+const MSI_MESSAGES_ENABLED: u32 = 0x7 << 4;
+const MSI_64_BIT: u32 = 1 << 7;
+const MSI_MASKABLE: u32 = 1 << 8;
+
+pub fn msi(config: &mut impl ConfigSpace, address: Address) -> Option<Msi> {
+    let (_, capability) = capabilities(config, address).into_iter().find(|&(id, _)| id == CAPABILITY_MSI)?;
+    let control = config.read32(address, capability) >> 16;
+    Some(Msi { capability, wide: control & MSI_64_BIT != 0, maskable: control & MSI_MASKABLE != 0 })
+}
+
+/// Points MSI's one message at `message_address` with `data`, and turns
+/// MSI on. One message only, whatever the device could use: a driver
+/// that waits on one interrupt handle needs no more.
+///
+/// The layout after the capability's first word: the address (low),
+/// then for a 64-bit one its high half, then the data (16 bits), then,
+/// if maskable, the mask bits - cleared here, so message 0 is let out.
+pub fn enable_msi(config: &mut impl ConfigSpace, address: Address, msi: &Msi, message_address: u64, data: u32) {
+    let at = msi.capability;
+    config.write32(address, at + 4, message_address as u32);
+    let data_at = if msi.wide {
+        config.write32(address, at + 8, (message_address >> 32) as u32);
+        at + 12
+    } else {
+        at + 8
+    };
+    config.write32(address, data_at, data & 0xFFFF);
+    if msi.maskable {
+        config.write32(address, data_at + 4, 0);
+    }
+    let word = config.read32(address, at);
+    let control = (word >> 16) & !MSI_MESSAGES_ENABLED | MSI_ENABLE;
+    config.write32(address, at, (word & 0xFFFF) | control << 16);
+}
+
 /// The message that raises `vector` on the CPU whose local APIC id is
 /// `apic`: an address in the APIC's 0xFEE window naming the CPU, and
 /// data naming the vector (fixed delivery, edge).
@@ -390,6 +441,40 @@ mod tests {
         enable_msix(&mut bus, a, &m);
         assert_eq!(bus.read32(a, 0x50) >> 16, 0x8001, "enabled, entry count kept");
         assert_eq!(msi_message(3, 0x30), (0xFEE0_3000, 0x30));
+    }
+
+    #[test]
+    fn msi_is_found_and_pointed_at_a_cpu() {
+        let mut bus = Bus::default();
+        let mut f = function(0x8086, 0x2922, 0x01_06_01, false);
+        f.words[1] = 0x0010_0000;
+        f.words[CAPABILITIES as usize / 4] = 0x80;
+        // QEMU's ICH9 AHCI: MSI at 0x80, 32-bit, one message; then SATA.
+        f.words[0x80 / 4] = 0x0000_A805;
+        f.words[0xA8 / 4] = 0x0010_0012;
+        let a = at(0, 4, 0);
+        bus.0.insert(a, f.clone());
+        let m = msi(&mut bus, a).unwrap();
+        assert_eq!(m, Msi { capability: 0x80, wide: false, maskable: false });
+        assert_eq!(msix(&mut bus, a), None);
+        enable_msi(&mut bus, a, &m, 0xFEE0_1000, 0x31);
+        assert_eq!(bus.read32(a, 0x84), 0xFEE0_1000);
+        assert_eq!(bus.read32(a, 0x88), 0x31);
+        assert_eq!(bus.read32(a, 0x80), 0x0001_A805, "on, the id and next kept");
+
+        // 64-bit and maskable: the data and the mask move along; a
+        // device that came up with more messages enabled gets one.
+        let mut f = f;
+        // 64-bit, maskable, capable of 32 messages (bits 3:1), 8 enabled.
+        f.words[0x80 / 4] = 0x018A_A805 | 0x3 << 20;
+        f.words[0x90 / 4] = 0xFFFF_FFFF; // all masked
+        bus.0.insert(a, f);
+        let m = msi(&mut bus, a).unwrap();
+        assert_eq!(m, Msi { capability: 0x80, wide: true, maskable: true });
+        enable_msi(&mut bus, a, &m, 0xFEE0_2000, 0x40);
+        assert_eq!((bus.read32(a, 0x84), bus.read32(a, 0x88), bus.read32(a, 0x8C)), (0xFEE0_2000, 0, 0x40));
+        assert_eq!(bus.read32(a, 0x90), 0, "message 0 unmasked");
+        assert_eq!(bus.read32(a, 0x80) >> 16, 0x018B, "one message, on; what it is capable of kept");
     }
 
     #[test]

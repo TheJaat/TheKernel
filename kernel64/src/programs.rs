@@ -61,6 +61,9 @@ mod pc {
     pub static GS: &[u8] = program!("gs");
     pub static PORT: &[u8] = program!("port");
     pub static KBD: &[u8] = program!("kbd");
+    /// The SATA disk driver: an AHCI controller is a PCI device, and
+    /// only the PC kernel hands PCI devices on so far.
+    pub static AHCI: &[u8] = program!("ahci");
 }
 #[cfg(target_arch = "x86_64")]
 pub use pc::*;
@@ -114,6 +117,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("display", DISPLAY),
     ("fs", FS),
     ("blk", BLK),
+    ("ahci", AHCI),
     ("nic", NIC),
     ("net", NET),
     ("registry", REGISTRY),

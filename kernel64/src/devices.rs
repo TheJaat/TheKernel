@@ -4,11 +4,12 @@
 //! and for each device it knows how to hand out, gathers what a driver
 //! needs and turns each piece into a capability:
 //!
-//!   - its I/O ports: an IoPorts object for the BAR's range
+//!   - its registers: an IoPorts object for an I/O BAR's range, or a
+//!     memory object of a memory BAR, mapped uncached
 //!   - memory it can DMA to: a contiguous memory object, and its
 //!     physical address (devices know no other kind)
-//!   - its interrupt: MSI-X message 0 pointed at a fresh vector, and an
-//!     Interrupt object for that vector
+//!   - its interrupt: MSI-X message 0, or else MSI's one message,
+//!     pointed at a fresh vector, and an Interrupt object for it
 //!
 //! and sends them to init, which decides which driver gets them - policy
 //! is init's. The kernel never talks to the device again.
@@ -22,13 +23,17 @@
 //! but not by the bus.
 //!
 //! Offered so far: virtio block devices (disks) and virtio network
-//! cards, both of the kind that speaks the legacy interface.
+//! cards, both of the kind that speaks the legacy interface; and AHCI
+//! (SATA) controllers, by their class - any vendor's. What is on an
+//! AHCI controller's ports, the kernel does not look at: that is the
+//! driver's business.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use abi::PciDeviceInfo;
 use kernel64::cap::Rights;
+use kernel64::paging::Flags;
 use kernel64::pci::{self, Bar, Device};
 
 use crate::arch::{pci::Ports, platform};
@@ -43,16 +48,40 @@ const BLOCK_DMA_PAGES: u64 = 48;
 /// And for a network card's: two queues, and forty buffers of a frame
 /// each (`user/src/bin/nic.rs` says where each lies).
 const NETWORK_DMA_PAGES: u64 = 40;
+/// And for an AHCI controller's: a page for one port's command list,
+/// received FISes and a command table, then the same 128 KiB of data
+/// as a virtio disk's (`ahci/src/lib.rs`, `layout`).
+const AHCI_DMA_PAGES: u64 = 1 + 32;
+/// The most memory a BAR of registers is taken to be: AHCI's is 4 or
+/// 8 KiB. More is a BAR this kernel does not understand.
+const REGISTERS_MAX: u64 = 1 << 20;
 
-/// What a virtio device this kernel can hand on is called, and how
-/// much DMA memory its driver gets. None: no driver for it.
-fn offered(device: &Device) -> Option<(&'static str, u64)> {
+/// The PCI class of an AHCI controller: storage, SATA, AHCI 1.0.
+const AHCI_CLASS: (u8, u8, u8) = (0x01, 0x06, 0x01);
+/// And where its registers are: BAR 5 ("ABAR").
+const AHCI_BAR: u8 = 5;
+
+/// How a device is handed on.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// Registers in I/O ports (BAR 0); MSI-X or polled.
+    VirtioLegacy,
+    /// Registers in memory (BAR 5); MSI-X, MSI or polled.
+    Ahci,
+}
+
+/// What a device this kernel can hand on is called, how, and how much
+/// DMA memory its driver gets. None: no driver for it.
+fn offered(device: &Device) -> Option<(&'static str, Kind, u64)> {
+    if (device.class, device.subclass, device.prog_if) == AHCI_CLASS {
+        return Some(("AHCI controller", Kind::Ahci, AHCI_DMA_PAGES));
+    }
     if device.vendor != virtio::PCI_VENDOR {
         return None;
     }
     match device.device {
-        virtio::PCI_DEVICE_BLOCK => Some(("virtio block device", BLOCK_DMA_PAGES)),
-        virtio::PCI_DEVICE_NETWORK => Some(("virtio network card", NETWORK_DMA_PAGES)),
+        virtio::PCI_DEVICE_BLOCK => Some(("virtio block device", Kind::VirtioLegacy, BLOCK_DMA_PAGES)),
+        virtio::PCI_DEVICE_NETWORK => Some(("virtio network card", Kind::VirtioLegacy, NETWORK_DMA_PAGES)),
         _ => None,
     }
 }
@@ -67,20 +96,23 @@ pub fn offer(to_init: &Object) {
             d.address, d.vendor, d.device, d.class, d.subclass, d.kind()
         );
     }
-    for (device, (what, dma_pages)) in devices.iter().filter_map(|device| Some((device, offered(device)?))) {
-        match prepare(&mut config, device, dma_pages) {
+    for (device, (what, kind, dma_pages)) in devices.iter().filter_map(|device| Some((device, offered(device)?))) {
+        match prepare(&mut config, device, kind, dma_pages) {
             Ok((info, handles)) => {
                 let mut message = b"pci".to_vec();
                 message.extend_from_slice(&info.to_bytes());
                 match ipc::kernel_send(to_init, &message, handles) {
                     Ok(()) => kprintln!(
-                        "[pci] {} {what}: ports {:#x}+{:#x}, {} KiB DMA at {:#x}, {} - handed to init",
+                        "[pci] {} {what}: {}, {} KiB DMA at {:#x}, {} - handed to init",
                         device.address,
-                        info.io_base,
-                        info.io_size,
+                        Registers(&info),
                         info.dma_size / 1024,
                         info.dma_physical,
-                        if info.msix { "MSI-X" } else { "no interrupt (polled)" }
+                        match (info.msix, info.msi) {
+                            (true, _) => "MSI-X",
+                            (_, true) => "MSI",
+                            _ => "no interrupt (polled)",
+                        }
                     ),
                     Err(error) => kprintln!("[pci] {}: could not hand it to init: {error:?}", device.address),
                 }
@@ -92,16 +124,63 @@ pub fn offer(to_init: &Object) {
 
 type Handles = Vec<(Object, Rights)>;
 
-fn prepare(config: &mut Ports, device: &Device, dma_pages: u64) -> Result<(PciDeviceInfo, Handles), &'static str> {
-    let address = device.address;
-    let Some(Bar::Io { base, size }) = pci::bar(config, address, 0) else {
-        return Err("BAR 0 is not I/O ports (not a legacy-capable device)");
-    };
-    if base == 0 || base + size > 0x1_0000 {
-        return Err("BAR 0 has no usable port range");
-    }
+/// The registers part of a boot-log line.
+struct Registers<'a>(&'a PciDeviceInfo);
 
-    // Decode its ports and memory, let it do DMA, and no pin interrupts.
+impl core::fmt::Display for Registers<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let info = self.0;
+        if info.registers_in_memory() {
+            write!(f, "registers {:#x}+{:#x}", info.registers, info.registers_size)
+        } else {
+            write!(f, "ports {:#x}+{:#x}", info.io_base, info.io_size)
+        }
+    }
+}
+
+fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> Result<(PciDeviceInfo, Handles), &'static str> {
+    let address = device.address;
+    let mut info = PciDeviceInfo {
+        bus: address.bus,
+        device: address.device,
+        function: address.function,
+        vendor_id: device.vendor,
+        device_id: device.device,
+        class: device.class,
+        subclass: device.subclass,
+        interface: device.prog_if,
+        ..PciDeviceInfo::default()
+    };
+    // The registers, as a capability.
+    let registers = match kind {
+        Kind::VirtioLegacy => {
+            let Some(Bar::Io { base, size }) = pci::bar(config, address, 0) else {
+                return Err("BAR 0 is not I/O ports (not a legacy-capable device)");
+            };
+            if base == 0 || base + size > 0x1_0000 {
+                return Err("BAR 0 has no usable port range");
+            }
+            info.io_base = base as u16;
+            info.io_size = size as u16;
+            Object::IoPorts(base..base + size)
+        }
+        Kind::Ahci => {
+            let Some(Bar::Memory { base, size, .. }) = pci::bar(config, address, AHCI_BAR) else {
+                return Err("BAR 5 is not memory (no AHCI registers)");
+            };
+            if base == 0 || size > REGISTERS_MAX {
+                return Err("BAR 5 has no usable memory range");
+            }
+            info.registers = base;
+            info.registers_size = size;
+            // Device registers: never cached - every read must reach
+            // the device, every write leave at once and in order.
+            let memory = MemoryObject::device(base, size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
+            Object::Memory(Arc::new(memory))
+        }
+    };
+
+    // Decode its registers, let it do DMA, and no pin interrupts.
     let command = pci::command(config, address);
     pci::set_command(
         config,
@@ -110,31 +189,27 @@ fn prepare(config: &mut Ports, device: &Device, dma_pages: u64) -> Result<(PciDe
     );
 
     let (dma, dma_physical) = MemoryObject::contiguous(dma_pages).ok_or("no contiguous memory for DMA")?;
-    let dma_size = dma.size();
-    let mut handles: Handles = alloc::vec![
-        (Object::IoPorts(base..base + size), Rights::ALL),
-        (Object::Memory(Arc::new(dma)), Rights::ALL),
-    ];
+    info.dma_physical = dma_physical;
+    info.dma_size = dma.size();
+    let mut handles: Handles = alloc::vec![(registers, Rights::ALL), (Object::Memory(Arc::new(dma)), Rights::ALL)];
 
-    let msix = match msix_to_new_line(config, device) {
+    // A legacy virtio device is told which MSI-X entry to use, and has
+    // no other way; an AHCI controller takes whichever it has.
+    let line = match msix_to_new_line(config, device) {
         Some(line) => {
-            handles.push((Object::Interrupt(line), Rights::ALL));
-            true
+            info.msix = true;
+            Some(line)
         }
-        None => false,
+        None if matches!(kind, Kind::Ahci) => {
+            let line = msi_to_new_line(config, device);
+            info.msi = line.is_some();
+            line
+        }
+        None => None,
     };
-    let info = PciDeviceInfo {
-        bus: address.bus,
-        device: address.device,
-        function: address.function,
-        vendor_id: device.vendor,
-        device_id: device.device,
-        io_base: base as u16,
-        io_size: size as u16,
-        dma_physical,
-        dma_size,
-        msix,
-    };
+    if let Some(line) = line {
+        handles.push((Object::Interrupt(line), Rights::ALL));
+    }
     Ok((info, handles))
 }
 
@@ -163,5 +238,16 @@ fn msix_to_new_line(config: &mut Ports, device: &Device) -> Option<&'static inte
         table.add(3).write_volatile(0);
     }
     pci::enable_msix(config, device.address, &msix);
+    Some(line)
+}
+
+/// Points the device's MSI message at a new device line, and turns MSI
+/// on. None if it has no MSI, or no line is left.
+fn msi_to_new_line(config: &mut Ports, device: &Device) -> Option<&'static interrupts::InterruptLine> {
+    let msi = pci::msi(config, device.address)?;
+    let (n, line) = interrupts::allocate_device_line()?;
+    let (vector, cpu) = platform::device_vector(n);
+    let (message_address, message_data) = pci::msi_message(cpu, vector);
+    pci::enable_msi(config, device.address, &msi, message_address, message_data);
     Some(line)
 }
