@@ -25,6 +25,8 @@ LOG=$4
 SITE=$5
 BIG=$6
 HERE=$(dirname "$0")
+# NIC (x86_64 only): the card, as for net-test.sh - virtio-net-pci, or
+# e1000 or e1000e (driven by `e1000`).
 
 fail() {
     echo "FAIL: $1 (log: $LOG)"
@@ -61,7 +63,7 @@ if [ "$ARCH" = aarch64 ]; then
     KEYS="$KEYS" QEMU_ARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -netdev $NETDEV -device virtio-net-device,netdev=n0" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 90
 else
-    DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="-netdev $NETDEV -device virtio-net-pci,netdev=n0" \
+    DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="-netdev $NETDEV -device ${NIC:-virtio-net-pci},netdev=n0" \
         "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 90
 fi
 kill -TERM $peer 2>/dev/null

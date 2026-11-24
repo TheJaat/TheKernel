@@ -28,6 +28,10 @@ IMAGE=$2
 DISK=$3
 LOG=$4
 HERE=$(dirname "$0")
+# NIC (x86_64 only): the card, as for net-test.sh - virtio-net-pci, or
+# e1000 or e1000e (driven by `e1000`).
+DRIVER=nic
+case "${NIC:-}" in e1000*) DRIVER=e1000 ;; esac
 
 fail() {
     echo "FAIL: $1 (log: $LOG)"
@@ -55,7 +59,7 @@ boot() {
         KEYS="$3" QEMU_ARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -netdev $2 -device virtio-net-device,netdev=n0" \
             "$HERE/aarch64-boot.sh" "$IMAGE" "$1" 60
     else
-        DISK="$DISK" SMP=1 KEYS="$3" QEMU_ARGS="-netdev $2 -device virtio-net-pci,netdev=n0" \
+        DISK="$DISK" SMP=1 KEYS="$3" QEMU_ARGS="-netdev $2 -device ${NIC:-virtio-net-pci},netdev=n0" \
             "$HERE/qemu-boot.sh" "$IMAGE" "$1" 60
     fi
 }
@@ -101,7 +105,7 @@ common() {
     said "$1" '\[net\] the card.s driver was replaced: listening to the new one' "the network service did not notice the new driver"
     said "$1" '^1 sent to 10\.0\.2\.2, 1 answered' "with a new driver for the card, a ping was not answered"
     [ "$(grep -ac '\[net\] this machine is' "$1")" -eq 1 ] || { LOG=$1; fail "the network service itself was restarted"; }
-    grep -a 'has not answered for' "$1" | grep -avq '\[init\] nic has not answered' && { LOG=$1; fail "a service other than the card's driver stopped answering during the test"; }
+    grep -a 'has not answered for' "$1" | grep -avq "\[init\] $DRIVER has not answered" && { LOG=$1; fail "a service other than the card's driver stopped answering during the test"; }
     return 0
 }
 

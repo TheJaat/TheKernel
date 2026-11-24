@@ -25,9 +25,10 @@
 //! Offered so far: virtio block devices (disks) and virtio network
 //! cards, both of the kind that speaks the legacy interface; and AHCI
 //! (SATA) controllers and NVMe controllers, by their class - any
-//! vendor's. What is on an AHCI controller's ports, or behind an NVMe
-//! controller's namespaces, the kernel does not look at: that is the
-//! driver's business.
+//! vendor's; and Intel's e1000 Ethernet cards, by their numbers. What is
+//! on an AHCI controller's ports, or behind an NVMe controller's
+//! namespaces, the kernel does not look at: that is the driver's
+//! business.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,6 +58,10 @@ const AHCI_DMA_PAGES: u64 = 1 + 32;
 /// one I/O queue pair, one for a PRP list, then 128 KiB of data
 /// (`nvme/src/lib.rs`, `layout`).
 const NVME_DMA_PAGES: u64 = 5 + 32;
+/// And for an Intel Ethernet card's: two descriptor rings (a page
+/// each), 32 receive and 16 transmit buffers of 2048 bytes
+/// (`e1000/src/lib.rs`, `layout`).
+const INTEL_DMA_PAGES: u64 = 2 + (32 + 16) / 2;
 /// The most memory a BAR of registers is taken to be: AHCI's is 4 or
 /// 8 KiB, NVMe's 8 or 16. More is a BAR this kernel does not understand.
 const REGISTERS_MAX: u64 = 1 << 20;
@@ -70,6 +75,11 @@ const AHCI_BAR: u8 = 5;
 const NVME_CLASS: (u8, u8, u8) = (0x01, 0x08, 0x02);
 /// Its registers: BAR 0 (64 bits wide).
 const NVME_BAR: u8 = 0;
+/// Intel's Ethernet cards of the e1000 family that `e1000` drives: the
+/// 82540EM, 82545EM, 82543GC and 82574L (`e1000::MODELS`). Their
+/// registers are in BAR 0, 128 KiB.
+const INTEL_VENDOR: u16 = 0x8086;
+const INTEL_NICS: [u16; 4] = [0x100E, 0x100F, 0x1004, 0x10D3];
 /// An NVMe driver needs the registers (a page) and the doorbells of two
 /// queue pairs after them: two pages when the doorbells are 4 bytes
 /// apart, as nearly always. (Wider, and the driver finds them out of
@@ -86,6 +96,11 @@ enum Kind {
     /// Registers in memory (BAR 0, cut short of any MSI-X structure in
     /// it); MSI-X, MSI or polled.
     Nvme,
+    /// Registers in memory (BAR 0); MSI or polled. Not MSI-X: an
+    /// 82574L in MSI-X mode routes each cause to a vector of its own
+    /// (IVAR), which `e1000` does not set up; with MSI it behaves as the
+    /// 82540EM does.
+    Intel,
 }
 
 /// What a device this kernel can hand on is called, how, and how much
@@ -96,6 +111,9 @@ fn offered(device: &Device) -> Option<(&'static str, Kind, u64)> {
     }
     if (device.class, device.subclass, device.prog_if) == NVME_CLASS {
         return Some(("NVMe controller", Kind::Nvme, NVME_DMA_PAGES));
+    }
+    if device.vendor == INTEL_VENDOR && INTEL_NICS.contains(&device.device) {
+        return Some(("Intel Ethernet card", Kind::Intel, INTEL_DMA_PAGES));
     }
     if device.vendor != virtio::PCI_VENDOR {
         return None;
@@ -185,9 +203,10 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
             info.io_size = size as u16;
             Object::IoPorts(base..base + size)
         }
-        Kind::Ahci | Kind::Nvme => {
+        Kind::Ahci | Kind::Nvme | Kind::Intel => {
             let (bar, missing) = match kind {
                 Kind::Nvme => (NVME_BAR, "BAR 0 is not memory (no NVMe registers)"),
+                Kind::Intel => (0, "BAR 0 is not memory (no e1000 registers)"),
                 _ => (AHCI_BAR, "BAR 5 is not memory (no AHCI registers)"),
             };
             let Some(Bar::Memory { base, mut size, .. }) = pci::bar(config, address, bar) else {
@@ -231,13 +250,18 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
     let mut handles: Handles = alloc::vec![(registers, Rights::ALL), (Object::Memory(Arc::new(dma)), Rights::ALL)];
 
     // A legacy virtio device is told which MSI-X entry to use, and has
-    // no other way; AHCI and NVMe controllers take whichever they have.
-    let line = match msix_to_new_line(config, device) {
+    // no other way; AHCI and NVMe controllers take whichever they have;
+    // an Intel card gets MSI or nothing (see Kind::Intel).
+    let msix = match kind {
+        Kind::Intel => None,
+        _ => msix_to_new_line(config, device),
+    };
+    let line = match msix {
         Some(line) => {
             info.msix = true;
             Some(line)
         }
-        None if matches!(kind, Kind::Ahci | Kind::Nvme) => {
+        None if matches!(kind, Kind::Ahci | Kind::Nvme | Kind::Intel) => {
             let line = msi_to_new_line(config, device);
             info.msi = line.is_some();
             line

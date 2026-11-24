@@ -11,6 +11,10 @@
 #
 # Then the same machine with the cable going nowhere: niccheck must say
 # that nobody answers, and send one frame only.
+#
+# NIC (x86_64 only) is the card QEMU gives the machine: virtio-net-pci
+# (the default, driven by `nic`), or an Intel one - e1000 (82540EM,
+# polled) or e1000e (82574L, MSI) - driven by `e1000`.
 
 set -u
 ARCH=$1
@@ -18,6 +22,11 @@ IMAGE=$2
 DISK=$3
 LOG=$4
 HERE=$(dirname "$0")
+NIC=${NIC:-virtio-net-pci}
+case "$NIC" in
+    e1000*) DRIVER=e1000 ;;
+    *) DRIVER=nic ;;
+esac
 # `niccheck`, and when it is over `niccheck restart`: the driver made
 # to hang, stopped by init, started again.
 KEYS="n i c c h e c k ret ~ n i c c h e c k spc r e s t a r t ret ~~"
@@ -35,7 +44,7 @@ boot() {
         KEYS="$KEYS" QEMU_ARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 $net -device virtio-net-device,netdev=n0" \
             "$HERE/aarch64-boot.sh" "$IMAGE" "$1" 40
     else
-        DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="$net -device virtio-net-pci,netdev=n0" \
+        DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="$net -device $NIC,netdev=n0" \
             "$HERE/qemu-boot.sh" "$IMAGE" "$1" 40
     fi
 }
@@ -51,12 +60,12 @@ done
 [ -s "$LOG.ports" ] || { kill $wire 2>/dev/null; fail "the other end of the wire did not start"; }
 read -r ours theirs < "$LOG.ports"
 
-echo "Booting $ARCH with a network card wired to this host (log: $LOG)..."
+echo "Booting $ARCH with a network card ($DRIVER) wired to this host (log: $LOG)..."
 boot "$LOG" "$ours" "$theirs"
 kill -TERM $wire 2>/dev/null
 wait $wire
 
-grep -aq '\[nic\] virtio network card at .*: address ..:..:..:..:..:.., link up' "$LOG" || fail "the card's driver did not start"
+grep -aq "\[$DRIVER\] .* at .*: address ..:..:..:..:..:.., link up" "$LOG" || fail "the card's driver ($DRIVER) did not start"
 grep -aq '\[niccheck\] FAILED' "$LOG" && { grep -a '\[niccheck\] FAILED' "$LOG"; fail "niccheck found a fault"; }
 grep -aq '\[niccheck\] [0-9]* checks, all passed: card' "$LOG" || fail "niccheck did not finish"
 cat "$LOG.wire" 2>/dev/null
@@ -73,10 +82,10 @@ grep -q "^wire: ok: $((sent + 2)) frames from" "$LOG.wire" || fail "niccheck cou
 
 # The second run: the driver hung, init stopped it and started another,
 # and the card worked with that one.
-grep -aq '\[nic\] asked to stall' "$LOG" || fail "the driver was not asked to hang"
-grep -aq '\[init\] nic has not answered for 2 s - stopping it' "$LOG" || fail "init did not notice a driver that hangs"
-grep -aq '\[init\] nic ended with code -1001 - restarting it' "$LOG" || fail "init did not start the driver again"
-[ "$(grep -ac '\[nic\] virtio network card at ' "$LOG")" -eq 2 ] || fail "there should have been two drivers, one after the other"
+grep -aq "\[$DRIVER\] asked to stall" "$LOG" || fail "the driver was not asked to hang"
+grep -aq "\[init\] $DRIVER has not answered for 2 s - stopping it" "$LOG" || fail "init did not notice a driver that hangs"
+grep -aq "\[init\] $DRIVER ended with code -1001 - restarting it" "$LOG" || fail "init did not start the driver again"
+[ "$(grep -ac "\[$DRIVER\] .* at .*: address " "$LOG")" -eq 2 ] || fail "there should have been two drivers, one after the other"
 grep -aq '\[niccheck\] restart: [0-9]* checks, all passed' "$LOG" || fail "the card did not work again after its driver was restarted"
 
 echo "Booting it again with the cable going nowhere (log: $LOG.alone)..."
