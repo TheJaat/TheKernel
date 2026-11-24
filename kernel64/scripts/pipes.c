@@ -1,6 +1,7 @@
-/* pipes.c - pipes, file actions, system and popen, checked on TheTaaJ
- * by pipe-test.sh. Run with the right to start programs, in a
- * directory with in.txt (5000 bytes) in it:
+/* pipes.c - pipes, file actions, system and popen - and, through them, sh -
+ * checked on TheTaaJ by pipe-test.sh. Run with the right to start
+ * programs, in a directory with in.txt (5000 bytes) in it, and /sh on
+ * the disk:
  *
  *   with programs pipes           the checks; "pipes: N checks, all passed"
  *
@@ -275,9 +276,7 @@ static void commands(void)
     for (int n = 0; n < 40 && all; n++)
         all = system("pipes emit again > again.txt") == 0;
     check(all && strcmp(contents("again.txt"), "again\n") == 0, "40 redirections one after another: none kept open");
-    errno = 0;
-    check(system("pipes emit a && pipes emit b") == -1 && errno == ENOSYS, "&& still needs a shell");
-    check(system("pipes emit a |") == -1 && errno == ENOSYS, "a pipe to nothing is refused");
+    check(system("pipes emit a |") == 2 << 8, "a pipe to nothing: sh says it is a mistake, 2");
 
     FILE *stream = popen("pipes emit from popen", "r");
     char line[64] = "";
@@ -289,6 +288,42 @@ static void commands(void)
     stream = popen("pipes exit 4", "r");
     check(stream != NULL && pclose(stream) == 4 << 8, "pclose gives the exit code");
     check(popen("nothing", "r") == NULL, "popen of nothing: NULL");
+}
+
+/* What needs a shell: system hands it to /sh. */
+static void shell(void)
+{
+    check(system("pipes emit a > ab.txt && pipes emit b >> ab.txt") == 0 && strcmp(contents("ab.txt"), "a\nb\n") == 0,
+          "&&: both run");
+    check(system("pipes exit 2 && pipes emit no > and.txt") == 2 << 8 && strcmp(contents("and.txt"), "(none)") == 0,
+          "&&: the second not run when the first fails, and its status");
+    check(system("pipes exit 2 || pipes emit rescued > or.txt") == 0 && strcmp(contents("or.txt"), "rescued\n") == 0, "||");
+    check(system("pipes emit one > list.txt; pipes emit two >> list.txt") == 0 && strcmp(contents("list.txt"), "one\ntwo\n") == 0,
+          "; one after the other");
+    check(system("X=made; pipes emit $X \"$X  x\" '$X' > var.txt") == 0 && strcmp(contents("var.txt"), "made made  x $X\n") == 0,
+          "a variable, quoted and not");
+    check(system("GREETING=for-one pipes env GREETING > one.txt") == 0 && strcmp(contents("one.txt"), "for-one\n") == 0,
+          "a variable for one command");
+    check(system("> w1.dat; > w2.dat; pipes emit w*.dat 'w*'.dat > glob.txt") == 0
+              && strcmp(contents("glob.txt"), "w1.dat w2.dat w*.dat\n") == 0, "> alone makes a file; a wildcard, and a quoted one");
+    check(mkdir("sub", 0755) == 0 && system("cd sub && pipes emit here > here.txt") == 0
+              && strcmp(contents("sub/here.txt"), "here\n") == 0 && strcmp(contents("here.txt"), "(none)") == 0,
+          "cd: in sh, not here");
+    check(system("echo $(pipes emit inner) `pipes emit back` > sub.txt") == 0 && strcmp(contents("sub.txt"), "inner back\n") == 0,
+          "$(...) and backquotes; echo with a redirection");
+    check(system("echo piped | pipes count > echoed.txt") == 0 && strcmp(contents("echoed.txt"), "6 bytes\n") == 0,
+          "a builtin in a pipeline");
+    check(system("set -e; pipes exit 3; pipes emit not > e.txt") == 3 << 8 && strcmp(contents("e.txt"), "(none)") == 0,
+          "set -e stops at a failure");
+    check(system("[ -f in.txt ] && test -d sub && ! test -d in.txt") == 0, "test and [");
+    check(system("exit 7") == 7 << 8, "exit");
+    check(system("nothing && pipes emit x") == 127 << 8, "a command not found in a list: 127");
+    check(system("if true; then pipes emit x; fi") == 2 << 8, "if: not in this shell yet, 2");
+    FILE *stream = popen("pipes emit one; pipes emit two", "r");
+    char line[64] = "", second[64] = "";
+    check(stream != NULL && fgets(line, sizeof line, stream) && fgets(second, sizeof second, stream)
+              && strcmp(line, "one\n") == 0 && strcmp(second, "two\n") == 0, "popen of a list, reading");
+    check(stream != NULL && pclose(stream) == 0, "and its status");
 }
 
 static void environment(void)
@@ -368,6 +403,7 @@ int main(int argc, char **argv)
     between_programs();
     files();
     commands();
+    shell();
     environment();
     if (failures) {
         printf("pipes: %d of %d checks failed\n", failures, checks);

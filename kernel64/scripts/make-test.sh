@@ -9,7 +9,8 @@
 #
 # MAKE is pdpmake built for ARCH (make pdpmake64, pdpmake-aarch64);
 # APPEND, in the environment, the append program for ARCH, which
-# changes the sources between the steps.
+# changes the sources between the steps; SH the sh program, which runs
+# each recipe ("set -e;" and the command, as POSIX says).
 # TheTaaJ runs, in /proj:
 #
 #   with programs make          tcc -c main.c, tcc -c util.c, the link
@@ -24,7 +25,7 @@
 #   with programs make fails    tcc's error; make: failed to build
 #                               'bad.o' exit 1 (tcc's), and make exits
 #                               with 2
-#   with programs make shell    a command that needs a shell: refused
+#   with programs make shell    a list, run by sh: "one", then "two"
 #   append main.c, with files make
 #                               without the right to start programs:
 #                               make cannot run tcc
@@ -41,6 +42,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 TFSTOOL=${TFSTOOL:-$ROOT/tools/tfstool-rs/target/release/tfstool}
 APPEND=${APPEND:?the append program, built for $ARCH}
+SH=${SH:?the sh program, built for $ARCH}
 
 fail() {
     echo "FAIL: $1 (log: $LOG)"
@@ -89,6 +91,7 @@ rm -f "$DISK"
 TFSTOOL="$TFSTOOL" "$ROOT/tools/put-tcc.sh" "$DISK" "$TCC_DIR" "$LIBC_A" || fail "cannot put tcc on the disk"
 put make "$MAKE"
 put append "$APPEND"
+put sh "$SH"
 "$TFSTOOL" mkdir "$DISK" proj > /dev/null || fail "cannot make proj on the disk"
 for file in Makefile main.c util.c util.h bad.c; do put "proj/$file" "$WORK/$file"; done
 
@@ -154,14 +157,13 @@ has touch-then "^make: 'prog' is up to date$" "after make -t, prog was not up to
 has fails "^bad\.c:3: error: .nothing. undeclared" "tcc did not say what is wrong in bad.c"
 has fails "^make: \(Makefile:16\): failed to build 'bad\.o' exit 1$" "make did not say it failed to build bad.o, and tcc's exit code"
 has fails '^make exited with code 2$' "make did not exit with code 2 when a command failed"
-has shell "^system: cannot run \"echo one && echo two\": '&' needs a shell, and there is none here$" \
-    "the command that needs a shell was not refused"
-has shell "^make: \(Makefile:19\): couldn't execute 'echo one && echo two'$" "make did not say it could not run the command"
-part shell | grep -aq '^one$' && fail "part of a command that needs a shell was run"
+has shell '^one$' "sh did not run the recipe's first command"
+has shell '^two$' "sh did not run the recipe's command after &&"
+has shell '"make" exited with code 0' "make did not exit with code 0 after a recipe sh ran"
 has refused "^make: \(Makefile:8\): couldn't execute 'tcc -c main\.c'$" "make, not given the right to start programs, started tcc"
 part refused | grep -aq '\[init\] started tcc' && fail "make, not given the right to start programs, started tcc"
 has end '^prog: 42$' "prog, built and rebuilt by make, did not run at the end"
-grep -aE '"(make|tcc)" killed' "$WORK/log" && fail "make or tcc was killed"
+grep -aE '"(make|tcc|sh)" killed' "$WORK/log" && fail "make, tcc or sh was killed"
 grep -a 'has not answered for' "$WORK/log" && fail "a service stopped answering during the test"
 
 # The program and its objects, as the host's tcc makes them from the
