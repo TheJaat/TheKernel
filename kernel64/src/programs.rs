@@ -64,6 +64,8 @@ mod pc {
     /// The SATA disk driver: an AHCI controller is a PCI device, and
     /// only the PC kernel hands PCI devices on so far.
     pub static AHCI: &[u8] = program!("ahci");
+    /// The NVMe disk driver, the same way.
+    pub static NVME: &[u8] = program!("nvme");
 }
 #[cfg(target_arch = "x86_64")]
 pub use pc::*;
@@ -118,6 +120,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("fs", FS),
     ("blk", BLK),
     ("ahci", AHCI),
+    ("nvme", NVME),
     ("nic", NIC),
     ("net", NET),
     ("registry", REGISTRY),

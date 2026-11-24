@@ -100,7 +100,9 @@ for machine in pc q35; do
     logged $machine '^\[pci\] [0-9a-f:.]+ AHCI controller: registers 0x[0-9a-f]+\+0x[0-9a-f]+, 132 KiB DMA at 0x[0-9a-f]+, MSI - handed to init$' \
         "the kernel did not hand the AHCI controller to init, with its registers and an MSI interrupt"
     logged $machine '^\[init\] started: .* ahci ' "init did not start ahci"
-    logged $machine '^\[fs\] ready: TaajFS on the disk' "fs did not find TaajFS on the SATA disk"
+    # Not at the start of a line: the shell may echo the first key typed
+    # just before it, on the same line.
+    logged $machine '\[fs\] ready: TaajFS on the disk' "fs did not find TaajFS on the SATA disk"
     has $machine info '^disk: 8192 sectors of 512 bytes \(4096 KiB\)$' "the disk's size, from its IDENTIFY answer, is wrong"
     has $machine check '^disk check: all 9 checks passed$' "disk check failed through ahci"
     has $machine files '^Hello from the host$' "a file on the SATA disk could not be read"

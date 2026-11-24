@@ -241,7 +241,23 @@ pub struct MsiX {
     /// Which BAR the table is in, and where in it.
     pub table_bar: u8,
     pub table_offset: u32,
+    /// And the pending-bit array's: often the same BAR, after the table.
+    pub pending_bar: u8,
+    pub pending_offset: u32,
     pub entries: u16,
+}
+
+impl MsiX {
+    /// Where in BAR `bar` the first MSI-X structure lies, if any is in
+    /// it: memory from there on is the kernel's, not a driver's.
+    pub fn first_in(&self, bar: u8) -> Option<u32> {
+        let table = (self.table_bar == bar).then_some(self.table_offset);
+        let pending = (self.pending_bar == bar).then_some(self.pending_offset);
+        match (table, pending) {
+            (Some(t), Some(p)) => Some(t.min(p)),
+            (t, p) => t.or(p),
+        }
+    }
 }
 
 /// Each table entry: address (low, high), data, vector control.
@@ -253,10 +269,13 @@ pub fn msix(config: &mut impl ConfigSpace, address: Address) -> Option<MsiX> {
     let (_, capability) = capabilities(config, address).into_iter().find(|&(id, _)| id == CAPABILITY_MSIX)?;
     let control = config.read32(address, capability) >> 16;
     let table = config.read32(address, capability + 4);
+    let pending = config.read32(address, capability + 8);
     Some(MsiX {
         capability,
         table_bar: (table & 0x7) as u8,
         table_offset: table & !0x7,
+        pending_bar: (pending & 0x7) as u8,
+        pending_offset: pending & !0x7,
         entries: (control & 0x7FF) as u16 + 1,
     })
 }
@@ -433,11 +452,17 @@ mod tests {
         f.words[0x40 / 4] = 0x0000_5009; // vendor-specific (9), next 0x50
         f.words[0x50 / 4] = 0x0001_0011; // MSI-X, last; 2 entries
         f.words[0x54 / 4] = 0x0000_0001; // table in BAR1 at offset 0
+        f.words[0x58 / 4] = 0x0000_0801; // pending bits in BAR1 at 0x800
         let a = at(0, 4, 0);
         bus.0.insert(a, f);
         assert_eq!(capabilities(&mut bus, a), vec![(0x09, 0x40), (0x11, 0x50)]);
         let m = msix(&mut bus, a).unwrap();
-        assert_eq!(m, MsiX { capability: 0x50, table_bar: 1, table_offset: 0, entries: 2 });
+        assert_eq!(m, MsiX { capability: 0x50, table_bar: 1, table_offset: 0, pending_bar: 1, pending_offset: 0x800, entries: 2 });
+        assert_eq!((m.first_in(1), m.first_in(0)), (Some(0), None));
+        let nvme = MsiX { table_bar: 0, table_offset: 0x3000, pending_bar: 0, pending_offset: 0x2000, ..m };
+        assert_eq!(nvme.first_in(0), Some(0x2000), "whichever comes first");
+        let split = MsiX { table_bar: 0, table_offset: 0x3000, pending_bar: 2, ..m };
+        assert_eq!((split.first_in(0), split.first_in(2)), (Some(0x3000), Some(0x800)));
         enable_msix(&mut bus, a, &m);
         assert_eq!(bus.read32(a, 0x50) >> 16, 0x8001, "enabled, entry count kept");
         assert_eq!(msi_message(3, 0x30), (0xFEE0_3000, 0x30));

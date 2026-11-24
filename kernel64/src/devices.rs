@@ -24,8 +24,9 @@
 //!
 //! Offered so far: virtio block devices (disks) and virtio network
 //! cards, both of the kind that speaks the legacy interface; and AHCI
-//! (SATA) controllers, by their class - any vendor's. What is on an
-//! AHCI controller's ports, the kernel does not look at: that is the
+//! (SATA) controllers and NVMe controllers, by their class - any
+//! vendor's. What is on an AHCI controller's ports, or behind an NVMe
+//! controller's namespaces, the kernel does not look at: that is the
 //! driver's business.
 
 use alloc::sync::Arc;
@@ -52,14 +53,28 @@ const NETWORK_DMA_PAGES: u64 = 40;
 /// received FISes and a command table, then the same 128 KiB of data
 /// as a virtio disk's (`ahci/src/lib.rs`, `layout`).
 const AHCI_DMA_PAGES: u64 = 1 + 32;
+/// And for an NVMe controller's: a page each for the admin queues and
+/// one I/O queue pair, one for a PRP list, then 128 KiB of data
+/// (`nvme/src/lib.rs`, `layout`).
+const NVME_DMA_PAGES: u64 = 5 + 32;
 /// The most memory a BAR of registers is taken to be: AHCI's is 4 or
-/// 8 KiB. More is a BAR this kernel does not understand.
+/// 8 KiB, NVMe's 8 or 16. More is a BAR this kernel does not understand.
 const REGISTERS_MAX: u64 = 1 << 20;
 
 /// The PCI class of an AHCI controller: storage, SATA, AHCI 1.0.
 const AHCI_CLASS: (u8, u8, u8) = (0x01, 0x06, 0x01);
 /// And where its registers are: BAR 5 ("ABAR").
 const AHCI_BAR: u8 = 5;
+/// The PCI class of an NVMe controller: storage, non-volatile memory,
+/// NVMe.
+const NVME_CLASS: (u8, u8, u8) = (0x01, 0x08, 0x02);
+/// Its registers: BAR 0 (64 bits wide).
+const NVME_BAR: u8 = 0;
+/// An NVMe driver needs the registers (a page) and the doorbells of two
+/// queue pairs after them: two pages when the doorbells are 4 bytes
+/// apart, as nearly always. (Wider, and the driver finds them out of
+/// its reach and says so.)
+const NVME_REGISTERS_MIN: u64 = 0x2000;
 
 /// How a device is handed on.
 #[derive(Clone, Copy)]
@@ -68,6 +83,9 @@ enum Kind {
     VirtioLegacy,
     /// Registers in memory (BAR 5); MSI-X, MSI or polled.
     Ahci,
+    /// Registers in memory (BAR 0, cut short of any MSI-X structure in
+    /// it); MSI-X, MSI or polled.
+    Nvme,
 }
 
 /// What a device this kernel can hand on is called, how, and how much
@@ -75,6 +93,9 @@ enum Kind {
 fn offered(device: &Device) -> Option<(&'static str, Kind, u64)> {
     if (device.class, device.subclass, device.prog_if) == AHCI_CLASS {
         return Some(("AHCI controller", Kind::Ahci, AHCI_DMA_PAGES));
+    }
+    if (device.class, device.subclass, device.prog_if) == NVME_CLASS {
+        return Some(("NVMe controller", Kind::Nvme, NVME_DMA_PAGES));
     }
     if device.vendor != virtio::PCI_VENDOR {
         return None;
@@ -164,12 +185,28 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
             info.io_size = size as u16;
             Object::IoPorts(base..base + size)
         }
-        Kind::Ahci => {
-            let Some(Bar::Memory { base, size, .. }) = pci::bar(config, address, AHCI_BAR) else {
-                return Err("BAR 5 is not memory (no AHCI registers)");
+        Kind::Ahci | Kind::Nvme => {
+            let (bar, missing) = match kind {
+                Kind::Nvme => (NVME_BAR, "BAR 0 is not memory (no NVMe registers)"),
+                _ => (AHCI_BAR, "BAR 5 is not memory (no AHCI registers)"),
+            };
+            let Some(Bar::Memory { base, mut size, .. }) = pci::bar(config, address, bar) else {
+                return Err(missing);
             };
             if base == 0 || size > REGISTERS_MAX {
-                return Err("BAR 5 has no usable memory range");
+                return Err("the registers' BAR has no usable memory range");
+            }
+            // An MSI-X table in the same BAR (NVMe controllers often put
+            // it after the doorbells) is the kernel's: a driver that
+            // could write it could make the device write any memory it
+            // likes - an interrupt message is a memory write. So the
+            // driver gets the BAR up to the first MSI-X structure in it,
+            // whole pages only (the page is what a mapping protects).
+            if let Some(start) = pci::msix(config, address).and_then(|msix| msix.first_in(bar)) {
+                size = size.min(u64::from(start) & !0xFFF);
+            }
+            if matches!(kind, Kind::Nvme) && size < NVME_REGISTERS_MIN {
+                return Err("BAR 0 leaves no room for the doorbells before the MSI-X table");
             }
             info.registers = base;
             info.registers_size = size;
@@ -194,13 +231,13 @@ fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> R
     let mut handles: Handles = alloc::vec![(registers, Rights::ALL), (Object::Memory(Arc::new(dma)), Rights::ALL)];
 
     // A legacy virtio device is told which MSI-X entry to use, and has
-    // no other way; an AHCI controller takes whichever it has.
+    // no other way; AHCI and NVMe controllers take whichever they have.
     let line = match msix_to_new_line(config, device) {
         Some(line) => {
             info.msix = true;
             Some(line)
         }
-        None if matches!(kind, Kind::Ahci) => {
+        None if matches!(kind, Kind::Ahci | Kind::Nvme) => {
             let line = msi_to_new_line(config, device);
             info.msi = line.is_some();
             line
