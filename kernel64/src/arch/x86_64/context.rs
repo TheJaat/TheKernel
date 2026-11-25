@@ -155,3 +155,28 @@ pub unsafe fn initial_stack(top: u64) -> u64 {
     }
     fpu
 }
+
+/// The MSR that holds FS's base: the thread pointer of the program
+/// running, through which it finds its thread-local variables (`fs:0`
+/// is the start of its thread block, as the x86_64 ELF TLS layout has
+/// it). The kernel itself never uses FS.
+const FS_BASE: u32 = 0xC000_0100;
+
+/// The thread pointer as the running program may have changed it: on
+/// x86_64 it can't (FSGSBASE is not turned on, so `wrfsbase` faults),
+/// so the thread's record is always right, and there is nothing to read.
+pub fn save_thread_pointer() -> Option<u64> {
+    None
+}
+
+/// Loads a thread's pointer into FS's base, for when it runs in user
+/// mode.
+///
+/// # Safety
+/// Only a program may rely on FS: nothing of the kernel's may.
+pub unsafe fn load_thread_pointer(value: u64) {
+    // A non-canonical value would make `wrmsr` fault in the kernel;
+    // THREAD_POINTER and THREAD_CREATE check, this makes sure.
+    let value = if value < abi::USER_END { value } else { 0 };
+    super::mmu::write_msr(FS_BASE, value);
+}

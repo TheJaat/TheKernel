@@ -248,3 +248,22 @@ pub unsafe fn initial_stack(top: u64) -> u64 {
     }
     top - FRAME
 }
+
+/// The running program's thread pointer: TPIDR_EL0, which a program
+/// may write itself, so it is read back when its thread leaves the CPU.
+/// (Only the kernel's stack-overflow report borrows it, and that report
+/// is the kernel's last act.)
+pub fn save_thread_pointer() -> Option<u64> {
+    let value: u64;
+    // SAFETY: reading a register that holds only the program's value.
+    unsafe { asm!("mrs {}, tpidr_el0", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    Some(value)
+}
+
+/// Loads a thread's pointer into TPIDR_EL0, for when it runs at EL0.
+///
+/// # Safety
+/// Only a program may rely on TPIDR_EL0: nothing of the kernel's may.
+pub unsafe fn load_thread_pointer(value: u64) {
+    asm!("msr tpidr_el0, {}", in(reg) value, options(nomem, nostack, preserves_flags));
+}

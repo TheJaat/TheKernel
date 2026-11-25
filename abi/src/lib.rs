@@ -142,7 +142,52 @@ pub mod call {
     /// only if the firmware refused. On a PC the same is done in user
     /// space, through ACPI's I/O ports - there is no such handle there.
     pub const POWER: u64 = 25;
+    /// thread_create(entry, stack, argument, pointer) - a second (third,
+    /// ...) thread in this process, sharing its memory and handles. It
+    /// starts at `entry` with its stack pointer at `stack` (16-byte
+    /// aligned, and below it the room the thread may use: the caller
+    /// made it), `argument` as its first argument (RDI / x0), and its
+    /// thread pointer set to `pointer` (see THREAD_POINTER). Returns the
+    /// new thread's id, which the process may use only to tell its
+    /// threads apart: nothing is done to a thread through it. A thread
+    /// ends with THREAD_EXIT; the process ends, with all its threads,
+    /// when any of them calls EXIT or breaks a rule, or when the last
+    /// thread ends.
+    pub const THREAD_CREATE: u64 = 26;
+    /// thread_exit(clear) - ends this thread. If `clear` is not 0, it is
+    /// the address of a u32, which is set to 0 and woken (as by
+    /// FUTEX_WAKE, every waiter) once the thread will run no more of
+    /// the program: how a joining thread learns that it ended. The last
+    /// thread of a process to end ends the process, with exit code 0.
+    /// Never returns.
+    pub const THREAD_EXIT: u64 = 27;
+    /// thread_pointer(value) - sets this thread's thread pointer: FS's
+    /// base on x86_64, TPIDR_EL0 on AArch64. Thread-local variables are
+    /// found through it, each thread having its own. Every thread has
+    /// one, kept for it while other threads run; a new process's first
+    /// thread starts with 0. Returns 0.
+    pub const THREAD_POINTER: u64 = 28;
+    /// futex_wait(address, expected, deadline) - sleeps while the u32 at
+    /// `address` (4-byte aligned, in this process) holds `expected`:
+    /// `Changed` at once if it does not, else until a FUTEX_WAKE on that
+    /// address wakes this thread (0), or the tick count reaches
+    /// `deadline` (`TimedOut`; 0 means no deadline). The value is read
+    /// and the thread queued as one step, so a wake that follows a
+    /// change of the value cannot be missed. A wake that comes without
+    /// a change still wakes: the caller looks again, as with any
+    /// condition variable. Only threads of the same process meet at an
+    /// address.
+    pub const FUTEX_WAIT: u64 = 29;
+    /// futex_wake(address, count) - wakes up to `count` threads waiting
+    /// at `address`, in the order they began to wait; returns how many.
+    pub const FUTEX_WAKE: u64 = 30;
 }
+
+/// The most threads one process may have at once (THREAD_CREATE says
+/// `OutOfMemory` past it). Each has a kernel stack of 60 KiB, which
+/// stays the kernel's once made (kernel64's mm.rs says why): a bound on
+/// what one program can take that way.
+pub const THREADS_MAX: usize = 64;
 
 /// The u64s process_spawn_image's request holds.
 pub const SPAWN_REQUEST_WORDS: usize = 5;
@@ -603,6 +648,8 @@ pub enum Error {
     Interrupted = 14,
     /// The deadline came before what was waited for.
     TimedOut = 15,
+    /// futex_wait: the value at the address was not the one expected.
+    Changed = 16,
 }
 
 impl Error {
@@ -623,6 +670,7 @@ impl Error {
             13 => Some(Error::NotExecutable),
             14 => Some(Error::Interrupted),
             15 => Some(Error::TimedOut),
+            16 => Some(Error::Changed),
             _ => None,
         }
     }

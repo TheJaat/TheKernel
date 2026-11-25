@@ -53,6 +53,15 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::MEMORY_SIZE => ipc::memory_size(args[0]),
         call::OBJECT_WAIT_UNTIL => ipc::object_wait_until(args[0], args[1], Some(args[2])),
         call::POWER => crate::power::system_power(args[0], args[1]),
+        call::THREAD_CREATE => process::create_thread(args[0], args[1], args[2], args[3]),
+        call::THREAD_EXIT => process::exit_thread(args[0]),
+        call::THREAD_POINTER if args[0] < abi::USER_END => {
+            threads::set_pointer(args[0]);
+            Ok(0)
+        }
+        call::THREAD_POINTER => Err(Error::BadAddress),
+        call::FUTEX_WAIT => crate::futex::wait(args[0], args[1], args[2]),
+        call::FUTEX_WAKE => crate::futex::wake_here(args[0], args[1]),
         _ => Err(Error::UnknownCall),
     };
     // The way back to user mode: where a process someone asked to end,

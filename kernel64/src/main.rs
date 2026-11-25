@@ -41,6 +41,7 @@ mod interrupts;
 mod irqlock;
 #[cfg(target_arch = "x86_64")]
 mod lastwords;
+mod futex;
 mod ipc;
 mod memory_object;
 mod mm;

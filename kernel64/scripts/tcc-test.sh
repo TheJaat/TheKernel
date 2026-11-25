@@ -146,7 +146,7 @@ steps="$(keys 'tcc hello.c -o hello') ret ~~ $(keys 'hello') ret ~"
 steps="$steps $(keys 'tcc chello.c -o chello2') ret ~~ $(keys 'chello2 one two') ret ~"
 steps="$steps $(keys 'tcc -c clib.c') ret ~~ $(keys 'tcc clib.o -o clib2') ret ~~"
 steps="$steps $(keys 'with files clib2') ret ~ $(keys 'tcc bad.c') ret ~~ $(keys 'source broken') ret ~~"
-# The build: one line for the shell, 23 commands, 70 files compiled.
+# The build: one line for the shell, 23 commands, 68 files compiled.
 # Each "~~" waits up to ninety seconds, and returns as soon as the
 # command is over, so a spare one costs nothing - and once the keys run
 # out the boot ends. The build took 1404 s on AArch64 beside the rest of
@@ -288,7 +288,7 @@ cmp -s "$WORK/hi.c" "$WORK/hi.c.typed" || fail "hi.c on the disk is not what was
 
 FILES="hello chello2 clib.o clib2 hi src/libc/libc.a"
 LIBC_OBJECTS=0
-for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit pthread emutls signal mmap users unix libm; do
+for f in format stdio fcntl ctype stdlib inet float setjmp time abort fp128 math scan locale atexit signal mmap users unix libm; do
     FILES="$FILES src/libc/c/$f.o"
     LIBC_OBJECTS=$((LIBC_OBJECTS + 1))
 done

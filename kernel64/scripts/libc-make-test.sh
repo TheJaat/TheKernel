@@ -12,7 +12,7 @@
 # MAKE is pdpmake built for ARCH; APPEND and SH, in the environment,
 # the append and sh programs for ARCH. TheTaaJ runs, in /src/libc/c:
 #
-#   with programs make          21 + 39 files compiled, libm.o, libc.a,
+#   with programs make          19 + 39 files compiled, libm.o, libc.a,
 #                               12 programs (sh one of them)
 #   with programs make          nothing to be done
 #   append ctype.c, make        ctype.c alone compiled again, libc.a,
@@ -97,7 +97,7 @@ count() { # count NAME PATTERN: how many lines match
 
 grep -aq '^== end ==$' "$WORK/log" || fail "the steps did not all run"
 compiled=$(count first '^cd (\.|libm) && tcc -c [a-z0-9_]+\.c$')
-[ "$compiled" = 60 ] || fail "the first make compiled $compiled files, not 60 (21 and libm's 39)"
+[ "$compiled" = 58 ] || fail "the first make compiled $compiled files, not 58 (19 and libm's 39)"
 has first '^tcc -ar rcs \.\./libc\.a /lib/libc-rust\.o format\.o ' "the first make did not put libc.a together"
 linked=$(count first '^cd \.\./programs && tcc -L\.\. [a-z]+\.c -o [a-z]+$')
 [ "$linked" = 12 ] || fail "the first make linked $linked programs, not 12"

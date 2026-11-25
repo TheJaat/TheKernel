@@ -1,4 +1,5 @@
-//! Processes: an address space, and (for now) one thread running in it.
+//! Processes: an address space, and the threads running in it - one at
+//! first, more if the program asks (THREAD_CREATE).
 //!
 //! The lower half of the address space is the process's own; the upper
 //! half is the kernel, shared by every process but inaccessible from
@@ -8,6 +9,11 @@
 //! A process also has a handle table (cap.rs): the only way it can reach
 //! any kernel object. When it ends - by exiting or being killed - every
 //! handle is closed at once, so whoever was talking to it finds out.
+//!
+//! Its threads share all of that. A process ends when one of them calls
+//! exit or breaks a rule, or when the last one ends by itself; its other
+//! threads then end too, each the next time it heads for user mode, as
+//! when the process is killed (`kill`).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -49,8 +55,9 @@ pub struct Process {
     exit_code: AtomicI64,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,
-    /// Its thread, once started (0 before): whom a kill wakes.
-    thread: AtomicU64,
+    /// Its threads that have not ended: whom a kill, or the end of the
+    /// process, wakes. At most THREADS_MAX.
+    threads: IrqLock<Vec<ThreadId>>,
     pub handles: IrqLock<CapTable<Object>>,
     /// The I/O ports it may use directly; loaded into the TSS whenever
     /// it runs. Granted for the life of the process.
@@ -293,7 +300,7 @@ pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, Lo
         tables: IrqLock::new(Some(tables)),
         exit_code: AtomicI64::new(RUNNING),
         kill_requested: AtomicBool::new(false),
-        thread: AtomicU64::new(0),
+        threads: IrqLock::new(Vec::new()),
         handles: IrqLock::new(CapTable::new(abi::HANDLES_MAX)),
         io_ports: IrqLock::new(PortBitmap::NONE),
         mappings: IrqLock::new(Regions::new(MAPPING_AREA)),
@@ -319,13 +326,70 @@ pub fn start(loaded: &Loaded, handles: Vec<(Object, Rights)>, argument: u64) -> 
     // The stack pointer as `_start` expects to find it, which is the
     // calling convention's business and so each CPU's own.
     let stack = USER_STACK_TOP - syscall::ENTRY_STACK_GAP;
+    // The list stays locked until the thread is in it: a thread that
+    // ended before it was listed would find no thread of its process,
+    // and take itself for the last.
+    let mut list = process.threads.lock();
     let thread = threads::spawn_in(Some(Arc::clone(process)), "user", move || {
         // SAFETY: this thread runs in `process`'s address space (the
         // switch loaded its CR3 and kernel stack), which maps both.
         unsafe { syscall::enter_user(entry, stack, count, argument) }
     });
-    process.thread.store(thread, Ordering::Release);
+    list.push(thread);
     thread
+}
+
+/// THREAD_CREATE: another thread in the current process, starting at
+/// `entry` with its stack pointer at `stack` (less what the calling
+/// convention puts there for a function just called, as for `_start`),
+/// `argument` as its first argument, and thread pointer `pointer`.
+pub fn create_thread(entry: u64, stack: u64, argument: u64, pointer: u64) -> Result<u64, Error> {
+    if entry >= abi::USER_END || stack >= abi::USER_END || pointer >= abi::USER_END {
+        return Err(Error::BadAddress);
+    }
+    if !stack.is_multiple_of(16) || stack < syscall::ENTRY_STACK_GAP {
+        return Err(Error::InvalidArgument);
+    }
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let mut list = process.threads.lock();
+    if process.kill_requested() {
+        return Err(Error::Interrupted); // ending: no new threads
+    }
+    if list.len() >= abi::THREADS_MAX {
+        return Err(Error::OutOfMemory);
+    }
+    let stack = stack - syscall::ENTRY_STACK_GAP;
+    let thread = threads::try_spawn_in(Some(Arc::clone(&process)), "user", pointer, move || {
+        // SAFETY: the address space is the process's own (the switch
+        // loaded it). Whether `entry` and `stack` are mapped is the
+        // program's business: if not, the new thread faults in user
+        // mode, and the process is killed for it, as for any fault.
+        unsafe { syscall::enter_user(entry, stack, argument, 0) }
+    })
+    .ok_or(Error::OutOfMemory)?;
+    list.push(thread);
+    Ok(thread)
+}
+
+/// THREAD_EXIT: ends the current thread - after setting the u32 at
+/// `clear` to 0 and waking whoever waits there, if `clear` is not 0 -
+/// and the process with it if it was the last.
+pub fn exit_thread(clear: u64) -> ! {
+    let Some(process) = current() else { threads::exit() };
+    if clear != 0 && write_user_word(clear, 0).is_ok() {
+        crate::futex::wake(process.pid, clear, u64::MAX);
+    }
+    let me = threads::current();
+    let last = {
+        let mut list = process.threads.lock();
+        list.retain(|&thread| thread != me);
+        list.is_empty()
+    };
+    drop(process);
+    if last {
+        end_current(0, format_args!("exited with code 0, as its last thread ended"));
+    }
+    threads::exit()
 }
 
 /// The process the running thread belongs to.
@@ -333,19 +397,38 @@ pub fn current() -> Option<Arc<Process>> {
     threads::current_process()
 }
 
-/// Ends the current process: records `code`, closes its handles, tells
-/// whoever waits for it, and ends its thread.
+/// Ends the current process: records `code`, ends its other threads,
+/// closes its handles, tells whoever waits for it, and ends this thread.
+///
+/// Only the first thread here does all that: two threads may exit, or
+/// fault, at the same moment, and the process has one exit code - the
+/// first. The others, and every thread the end reaches later (through
+/// `stop_if_killed`), only end themselves.
 fn end_current(code: i64, how: core::fmt::Arguments) -> ! {
     if let Some(process) = current() {
-        process.exit_code.store(code, Ordering::Release);
-        kprintln!("[process] {} {:?} {how}", process.pid, process.name);
-        if process.pid == ESSENTIAL.load(Ordering::Acquire) {
-            stop_the_system(&process.name, how);
+        let me = threads::current();
+        process.threads.lock().retain(|&thread| thread != me);
+        if process.exit_code.compare_exchange(RUNNING, code, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            kprintln!("[process] {} {:?} {how}", process.pid, process.name);
+            if process.pid == ESSENTIAL.load(Ordering::Acquire) {
+                stop_the_system(&process.name, how);
+            }
+            stop_other_threads(&process);
+            process.close_all_handles();
+            EXITS.wake_all();
         }
-        process.close_all_handles();
     }
-    EXITS.wake_all();
     threads::exit()
+}
+
+/// The process has ended: its other threads end too, each the next time
+/// it heads for user mode - a waiting one woken to get there (see
+/// `kill`).
+fn stop_other_threads(process: &Process) {
+    process.kill_requested.store(true, Ordering::Release);
+    for &thread in process.threads.lock().iter() {
+        threads::wake(thread); // if it is blocked or sleeping; else nothing
+    }
 }
 
 /// The process the system cannot go on without: init. 0 until set.
@@ -412,13 +495,9 @@ pub fn kill(target: &Arc<Process>) {
     if target.exit_code().is_some() {
         return; // already ended
     }
-    // The flag first: a thread woken before it was set would only go
-    // back to waiting.
-    target.kill_requested.store(true, Ordering::Release);
-    let thread = target.thread.load(Ordering::Acquire);
-    if thread != 0 {
-        threads::wake(thread); // if it is blocked or sleeping; else nothing
-    }
+    // The flag first (in `stop_other_threads`): a thread woken before
+    // it was set would only go back to waiting.
+    stop_other_threads(target);
 }
 
 /// Ends the current process if a kill was asked for. Called only where
@@ -495,5 +574,34 @@ pub fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), Error> {
         unsafe { target.copy_from_nonoverlapping(bytes[offset..].as_ptr(), length) };
         offset += length;
     }
+    Ok(())
+}
+
+/// A u32 of the current process's memory, as one atomic access: a futex
+/// word, which the program's other threads change with atomic
+/// instructions at the same moment. `pointer` must be 4-byte aligned,
+/// so the word is all in one page; `write` asks for a writable page.
+fn user_word(pointer: u64, write: bool) -> Result<&'static core::sync::atomic::AtomicU32, Error> {
+    if !pointer.is_multiple_of(4) {
+        return Err(Error::InvalidArgument);
+    }
+    let pages = user_pages(pointer, 4, write)?;
+    let physical = pages.first().ok_or(Error::BadAddress)?.0;
+    // SAFETY: an aligned u32 of user memory, mapped for this process -
+    // never the kernel's own - reached through the direct map, which
+    // maps every frame for as long as the kernel runs. The program may
+    // unmap it later; then it is a frame of memory still, and an atomic
+    // access to it harms nothing.
+    Ok(unsafe { &*phys_to_virt(PhysAddr::new(physical)).as_ptr::<core::sync::atomic::AtomicU32>() })
+}
+
+/// Reads the u32 at `pointer` atomically (see `user_word`).
+pub fn read_user_word(pointer: u64) -> Result<u32, Error> {
+    Ok(user_word(pointer, false)?.load(Ordering::SeqCst))
+}
+
+/// Writes the u32 at `pointer` atomically (see `user_word`).
+pub fn write_user_word(pointer: u64, value: u32) -> Result<(), Error> {
+    user_word(pointer, true)?.store(value, Ordering::SeqCst);
     Ok(())
 }

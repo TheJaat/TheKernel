@@ -71,6 +71,11 @@ struct Thread {
     /// kernel threads, which use the kernel's.
     process: Option<Arc<Process>>,
     entry: Option<Entry>,
+    /// A thread of a program: its thread pointer (FS base on x86_64,
+    /// TPIDR_EL0 on AArch64), through which it finds its thread-local
+    /// variables. Kept here while the thread is not running, loaded into
+    /// the CPU when it is switched to (see `schedule`).
+    pointer: u64,
 }
 
 /// The address space loaded in each CPU's CR3 now, to skip reloading
@@ -116,8 +121,9 @@ pub fn init() {
         stack_top,
         process: None,
         entry: Some(Box::new(idle_loop)),
+        pointer: 0,
     };
-    let boot = Thread { name: "boot", rsp: 0, _stack: None, stack_top: None, process: None, entry: None };
+    let boot = Thread { name: "boot", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0 };
     ACTIVE_ROOT[0].store(mm::kernel_root(), Ordering::Relaxed);
 
     let mut table = BTreeMap::new();
@@ -152,7 +158,7 @@ pub fn add_cpus(count: usize) {
             // Like the boot thread: it runs on the stack the CPU was
             // started on, which nobody frees, and its `rsp` is filled in
             // the first time it is switched away from.
-            let idle = Thread { name: "idle", rsp: 0, _stack: None, stack_top: None, process: None, entry: None };
+            let idle = Thread { name: "idle", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0 };
             t.table.insert(id, Box::new(idle));
             assert_eq!(t.policy.add_cpu(id), cpu);
         }
@@ -199,19 +205,46 @@ pub fn spawn_in(
     name: &'static str,
     f: impl FnOnce() + Send + 'static,
 ) -> ThreadId {
-    let stack = mm::allocate_stack().expect("out of kernel stacks");
+    try_spawn_in(process, name, 0, f).expect("out of kernel stacks")
+}
+
+/// `spawn_in`, for a thread a program asked for: None, instead of a
+/// panic, when there is no kernel stack for it; and with its thread
+/// pointer.
+pub fn try_spawn_in(
+    process: Option<Arc<Process>>,
+    name: &'static str,
+    pointer: u64,
+    f: impl FnOnce() + Send + 'static,
+) -> Option<ThreadId> {
+    let stack = mm::allocate_stack()?;
     // SAFETY: a freshly mapped stack, nobody else's.
     let rsp = unsafe { context::initial_stack(stack.top()) };
     let stack_top = Some(stack.top());
     let thread =
-        Box::new(Thread { name, rsp, _stack: Some(stack), stack_top, process, entry: Some(Box::new(f)) });
-    with(|t| {
+        Box::new(Thread { name, rsp, _stack: Some(stack), stack_top, process, entry: Some(Box::new(f)), pointer });
+    Some(with(|t| {
         let id = t.next_id;
         t.next_id += 1;
         t.table.insert(id, thread);
         t.policy.add(id, arch::cpu());
         id
-    })
+    }))
+}
+
+/// Sets the running thread's thread pointer, in the CPU now and in its
+/// record for when it runs again. With the lock held, interrupts are
+/// off: the thread cannot be moved to another CPU between the two.
+pub fn set_pointer(value: u64) {
+    with(|t| {
+        let id = t.policy.current(arch::cpu());
+        if let Some(thread) = t.table.get_mut(&id) {
+            thread.pointer = value;
+        }
+        // SAFETY: only a program reads its thread pointer; the kernel
+        // uses neither FS nor TPIDR_EL0.
+        unsafe { context::load_thread_pointer(value) };
+    });
 }
 
 /// The thread running on this CPU.
@@ -325,8 +358,21 @@ fn schedule() {
     match switch {
         None => drop(guard),
         Some(Switch { from, to }) => {
-            let save = &raw mut t.table.get_mut(&from).expect("current thread missing").rsp;
+            let leaving = t.table.get_mut(&from).expect("current thread missing");
+            // A program may change its own thread pointer on AArch64
+            // (TPIDR_EL0 is writable at EL0): what it holds now is the
+            // leaving thread's. On x86_64 only `set_pointer` changes it,
+            // and the record already has it.
+            if let Some(value) = context::save_thread_pointer() {
+                leaving.pointer = value;
+            }
+            let save = &raw mut leaving.rsp;
             let next = t.table.get(&to).expect("next thread missing");
+            if next.process.is_some() {
+                // SAFETY: as in `set_pointer`. Kernel threads leave it
+                // as it is: it is only read in user mode.
+                unsafe { context::load_thread_pointer(next.pointer) };
+            }
             let load = next.rsp;
             let root = next.process.as_ref().map_or_else(mm::kernel_root, |p| p.root());
             // The next thread's world: its kernel stack for entries from
