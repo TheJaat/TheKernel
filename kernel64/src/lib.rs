@@ -18,6 +18,7 @@
 extern crate alloc;
 
 pub mod aarch64;
+pub mod account;
 pub mod acpi;
 pub mod bootinfo;
 pub mod cap;

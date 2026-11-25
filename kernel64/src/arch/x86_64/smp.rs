@@ -233,6 +233,17 @@ pub fn poke(cpus: u64) {
     }
 }
 
+/// Sends TLB_VECTOR to each CPU whose bit is set in `cpus`: each
+/// forgets what it remembered of the tables it runs (tlb.rs).
+pub fn send_tlb_flush(cpus: u64) {
+    let message = smp::interrupt_message(platform::TLB_VECTOR);
+    for (cpu, id) in APIC_IDS.iter().enumerate() {
+        if cpus & (1 << cpu) != 0 {
+            apic::send(id.load(Ordering::Relaxed), message);
+        }
+    }
+}
+
 static OTHERS: AtomicUsize = AtomicUsize::new(0);
 /// Set by `release`: the scheduler is ready for them.
 static RELEASED: AtomicBool = AtomicBool::new(false);

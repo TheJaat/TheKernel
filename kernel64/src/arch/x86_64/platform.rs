@@ -31,6 +31,8 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// does, because every interrupt ends by asking the scheduler whether
 /// to switch.
 pub const RESCHEDULE_VECTOR: u8 = 0xF0;
+/// Another CPU took away a translation this one may remember (tlb.rs).
+pub const TLB_VECTOR: u8 = 0xF1;
 const DEVICE_VECTOR_BASE: u8 = 0x30;
 
 /// The vector device line `n` (interrupts::allocate_device_line) is
@@ -167,6 +169,12 @@ pub fn handle_interrupt(vector: u8) {
             interrupts::poked();
             apic::end_of_interrupt();
             interrupts::interrupt_done();
+        }
+        // No `interrupt_done`: nothing was made ready, and the CPU that
+        // asked is waiting for this one with its interrupts off.
+        TLB_VECTOR => {
+            crate::tlb::answer();
+            apic::end_of_interrupt();
         }
         // Spurious: nothing happened. Neither the APIC nor the masked
         // PICs expect an EOI for these.

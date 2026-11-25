@@ -18,6 +18,9 @@
 
 use alloc::vec::Vec;
 
+use alloc::sync::Arc;
+
+use kernel64::account::Account;
 use kernel64::memory::addr::{phys_to_virt, PhysAddr, PAGE_SIZE};
 use kernel64::paging::Flags;
 
@@ -28,12 +31,15 @@ pub struct MemoryObject {
     owned: bool,
     /// Extra page flags for every mapping - caching, for devices.
     pub cache: Flags,
+    /// The account its pages are counted against, if any: its maker's
+    /// (MEMORY_CREATE). They are given back when it goes.
+    account: Option<Arc<Account>>,
 }
 
 impl MemoryObject {
     /// `pages` fresh, zeroed frames. None if memory runs out.
     pub fn new(pages: u64) -> Option<MemoryObject> {
-        let mut object = MemoryObject { frames: Vec::new(), owned: true, cache: Flags::NONE };
+        let mut object = MemoryObject { frames: Vec::new(), owned: true, cache: Flags::NONE, account: None };
         mm::with_frames(|frames| {
             for _ in 0..pages {
                 let frame = frames.allocate()?;
@@ -56,7 +62,7 @@ impl MemoryObject {
         let frames: Vec<PhysAddr> = (0..pages).map(|n| PhysAddr::new(start.as_u64() + n * PAGE_SIZE)).collect();
         // SAFETY: fresh frames, through the direct map.
         unsafe { phys_to_virt(start).as_mut_ptr::<u8>().write_bytes(0, (pages * PAGE_SIZE) as usize) };
-        Some((MemoryObject { frames, owned: true, cache: Flags::NONE }, start.as_u64()))
+        Some((MemoryObject { frames, owned: true, cache: Flags::NONE, account: None }, start.as_u64()))
     }
 
     /// Fixed physical memory - a device's - starting at `physical`.
@@ -64,7 +70,18 @@ impl MemoryObject {
         let first = physical & !(PAGE_SIZE - 1);
         let end = (physical + bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let frames = (first..end).step_by(PAGE_SIZE as usize).map(PhysAddr::new).collect();
-        MemoryObject { frames, owned: false, cache }
+        MemoryObject { frames, owned: false, cache, account: None }
+    }
+
+    /// Counts its pages against `account` from now on - they were
+    /// charged to it already - until it is dropped.
+    pub fn charged_to(&mut self, account: Arc<Account>) {
+        self.account = Some(account);
+    }
+
+    /// The account its pages are counted against: its maker's.
+    pub fn account(&self) -> Option<&Arc<Account>> {
+        self.account.as_ref()
     }
 
     /// Whether the object's frames are its own (not a device's).
@@ -124,6 +141,9 @@ impl kernel64::elf::Source for MemoryObject {
 
 impl Drop for MemoryObject {
     fn drop(&mut self) {
+        if let Some(account) = &self.account {
+            account.uncharge(self.frames.len() as u64);
+        }
         if self.owned {
             mm::with_frames(|frames| {
                 for &frame in &self.frames {

@@ -18,7 +18,9 @@
 //! A program may say how big a stack it wants: the size of its
 //! PT_GNU_STACK header, which `ld.lld -z stack-size=N` writes. Between
 //! STACK_MIN and STACK_MAX, in whole pages; a program that says nothing
-//! gets STACK_MIN.
+//! gets STACK_DEFAULT. The stack is reserved, not taken: a page of it
+//! gets memory when first touched (process.rs), so a big one costs
+//! only what is used.
 //!
 //! This only parses and validates; the kernel does the copying and
 //! mapping (process.rs). The file is read through `Source`, so that it
@@ -32,15 +34,17 @@ use core::ops::Range;
 pub const PAGE: u64 = 4096;
 /// The lowest address a segment may use.
 pub const LOWEST_ADDRESS: u64 = 0x1_0000;
-/// The most memory one program's segments may take, in whole pages.
-pub const MEMORY_MAX: u64 = 256 << 20;
-/// The stack a program gets when it does not ask, and the least it gets
-/// when it does: 64 KiB.
+/// The most memory one program's segments may take, in whole pages: 1
+/// GiB. The program's memory limit (account.rs) is checked too, before
+/// a page is loaded; this only refuses nonsense early.
+pub const MEMORY_MAX: u64 = 1 << 30;
+/// The least stack a program gets when it asks for one: 64 KiB.
 pub const STACK_MIN: u64 = 64 << 10;
-/// The most stack a program may ask for: 16 MiB. The stack's pages are
-/// all made when the program starts (nothing is mapped on demand yet),
-/// so this is memory taken at once.
-pub const STACK_MAX: u64 = 16 << 20;
+/// The stack a program gets when it does not ask: 8 MiB, as on Linux.
+pub const STACK_DEFAULT: u64 = 8 << 20;
+/// The most stack a program may ask for: 1 GiB - of address space;
+/// only the pages it touches take memory.
+pub const STACK_MAX: u64 = 1 << 30;
 /// The most program headers a file may have. Real programs have fewer
 /// than a dozen; the limit keeps a hostile file from making the kernel
 /// read megabytes of them.
@@ -176,7 +180,7 @@ pub fn parse_for(source: &(impl Source + ?Sized), user_end: u64, machine: u16) -
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut memory = 0;
-    let mut stack = STACK_MIN;
+    let mut stack = STACK_DEFAULT;
     for h in headers.as_chunks::<56>().0 {
         if u32_at(h, 0) == PT_GNU_STACK {
             // Its size, if it has one, is the stack the program wants.
@@ -184,7 +188,9 @@ pub fn parse_for(source: &(impl Source + ?Sized), user_end: u64, machine: u16) -
             if wanted > STACK_MAX {
                 return Err(ElfError::TooBig);
             }
-            stack = stack.max((wanted + PAGE - 1) & !(PAGE - 1));
+            if wanted > 0 {
+                stack = STACK_MIN.max((wanted + PAGE - 1) & !(PAGE - 1));
+            }
             continue;
         }
         if u32_at(h, 0) != PT_LOAD {
@@ -405,8 +411,9 @@ mod tests {
 
     #[test]
     fn a_program_gets_the_stack_it_asks_for() {
-        assert_eq!(parse(&*typical(), END).unwrap().stack, STACK_MIN, "not asked: the least");
-        assert_eq!(parse(&*asking_for_a_stack(0), END).unwrap().stack, STACK_MIN, "a header without a size");
+        assert_eq!(parse(&*typical(), END).unwrap().stack, STACK_DEFAULT, "not asked: the default");
+        assert_eq!(parse(&*asking_for_a_stack(0), END).unwrap().stack, STACK_DEFAULT, "a header without a size");
+        assert_eq!(parse(&*asking_for_a_stack(64 << 20), END).unwrap().stack, 64 << 20, "more than the default");
         assert_eq!(parse(&*asking_for_a_stack(1 << 20), END).unwrap().stack, 1 << 20);
         assert_eq!(parse(&*asking_for_a_stack(1000), END).unwrap().stack, STACK_MIN, "never less than the least");
         assert_eq!(parse(&*asking_for_a_stack(STACK_MIN + 1), END).unwrap().stack, STACK_MIN + PAGE, "whole pages");

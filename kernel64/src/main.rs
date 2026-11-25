@@ -53,6 +53,7 @@ mod programs;
 mod selftest;
 mod syscall;
 mod threads;
+mod tlb;
 
 #[cfg(target_arch = "x86_64")]
 use alloc::string::String;

@@ -14,6 +14,15 @@
 //! exit or breaks a rule, or when the last one ends by itself; its other
 //! threads then end too, each the next time it heads for user mode, as
 //! when the process is killed (`kill`).
+//!
+//! Memory comes two ways. A program's file is loaded whole when it
+//! starts, and a memory object is mapped whole. Reserved memory - the
+//! stack, and what MEMORY_RESERVE gives - is only address space at
+//! first: a page gets a frame the first time it is touched (`fault_in`),
+//! when the CPU finds nothing there and faults, or when a system call
+//! reads or writes it (`user_pages`). So a program can have a 64 MiB
+//! stack and pay for the 20 KiB it uses. Every page taken is counted
+//! against the process's limit (account.rs).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -21,6 +30,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use abi::Error;
+use kernel64::account::{self, Account};
 use kernel64::cap::{CapTable, Rights};
 use kernel64::elf::{self, ElfError};
 use kernel64::ioports::PortBitmap;
@@ -35,14 +45,28 @@ use crate::ipc::Object;
 use crate::memory_object::MemoryObject;
 use crate::{mm, threads};
 
-/// The user stack ends just below this address: 64 KiB of it, or what
-/// the program asked for (elf::STACK_MIN, elf::STACK_MAX). The page
-/// below it is left unmapped, so overflowing the stack faults.
+/// The user stack ends just below this address: 8 MiB of it, or what
+/// the program asked for (elf::STACK_DEFAULT, elf::STACK_MAX) - reserved,
+/// a page taken as it is touched. The page below it is never filled, so
+/// overflowing the stack faults.
 const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 
-/// Where memory objects are mapped: far from the program (which sits low,
-/// near 4 MiB) and the stack (at the very top).
+/// Where memory objects are mapped, and reserved memory is put: far from
+/// the program (which sits low, near 4 MiB) and the stack (at the very
+/// top). The page below it is never a program's (`load`), so the first
+/// region has an unmapped page under it like every other.
 const MAPPING_AREA: core::ops::Range<u64> = 0x0000_1000_0000_0000..0x0000_7000_0000_0000;
+
+/// What a region of the mapping area holds.
+enum Mapping {
+    /// A memory object, every page mapped when it was. The region holds
+    /// a reference, so the frames outlive any handle while mapped.
+    /// (Held, never read: dropping it is what frees the frames.)
+    Object(#[allow(dead_code)] Arc<MemoryObject>),
+    /// Reserved memory (MEMORY_RESERVE): each page filled when first
+    /// touched, with a frame of the process's own.
+    Reserved { writable: bool },
+}
 
 const RUNNING: i64 = i64::MIN;
 
@@ -62,10 +86,13 @@ pub struct Process {
     /// The I/O ports it may use directly; loaded into the TSS whenever
     /// it runs. Granted for the life of the process.
     pub io_ports: IrqLock<PortBitmap>,
-    /// Mapped memory objects. Each region holds a reference to its
-    /// object, so the frames outlive any handle while they are mapped.
-    /// Taken before `tables`.
-    mappings: IrqLock<Regions<Arc<MemoryObject>>>,
+    /// Mapped memory objects and reserved memory. Taken before `tables`.
+    mappings: IrqLock<Regions<Mapping>>,
+    /// The stack of its first thread: reserved, filled as touched.
+    stack: core::ops::Range<u64>,
+    /// The pages it has taken, and may (account.rs). Shared with the
+    /// memory objects it made, which give theirs back when they go.
+    pub account: Arc<Account>,
 }
 
 #[derive(Debug)]
@@ -75,6 +102,8 @@ pub enum LoadError {
     #[allow(dead_code)]
     Elf(ElfError),
     OutOfMemory,
+    /// More than the new program's memory limit.
+    OverLimit,
 }
 
 impl Process {
@@ -120,7 +149,7 @@ impl Drop for Process {
 pub fn map_memory(object: &Arc<MemoryObject>, writable: bool) -> Result<u64, Error> {
     let process = current().ok_or(Error::InvalidArgument)?;
     let mut mappings = process.mappings.lock();
-    let start = mappings.allocate(object.size(), Arc::clone(object)).ok_or(Error::OutOfMemory)?;
+    let start = mappings.allocate(object.size(), Mapping::Object(Arc::clone(object))).ok_or(Error::OutOfMemory)?;
 
     // Never executable: shared memory is data. A page another process
     // can write must not be one this process can run (W^X across
@@ -150,26 +179,152 @@ pub fn map_memory(object: &Arc<MemoryObject>, writable: bool) -> Result<u64, Err
     Ok(start)
 }
 
-/// Removes the current process's mapping that starts at `start`.
+/// Removes the current process's mapping, or reserved memory, that
+/// starts at `start`.
+///
+/// Its pages leave the tables first, under the locks. Then every CPU
+/// that may remember them forgets (tlb.rs) - other threads of this
+/// process may be running on other CPUs - and only then are frames
+/// given back: an object's when its last reference goes, reserved
+/// memory's here.
 pub fn unmap_memory(start: u64) -> Result<u64, Error> {
     let process = current().ok_or(Error::InvalidArgument)?;
     let mut mappings = process.mappings.lock();
-    let (range, object) = mappings.remove(start).ok_or(Error::InvalidArgument)?;
+    let (range, mapping) = mappings.remove(start).ok_or(Error::InvalidArgument)?;
+    let mut taken = Vec::new();
     {
         let mut tables = process.tables.lock();
         let tables = tables.as_mut().ok_or(Error::InvalidArgument)?;
         for page in range.step_by(PAGE_SIZE as usize) {
-            tables.unmap(VirtAddr::new(page));
-            // The CPU may still hold the old translation in its TLB; until
-            // it is flushed the process could keep using a page that is
-            // about to be freed. (This process is the one running, so its
-            // tables are the active ones.)
+            let frame = tables.unmap(VirtAddr::new(page));
+            // This CPU's TLB; the others' below.
             mmu::flush(page);
+            if let (Some(frame), Mapping::Reserved { .. }) = (frame, &mapping) {
+                taken.push(frame);
+            }
         }
     }
     drop(mappings);
-    drop(object); // possibly the last reference: frees the frames
+    crate::tlb::shootdown(process.root);
+    if !taken.is_empty() {
+        mm::with_frames(|frames| taken.iter().for_each(|&frame| frames.free(frame)));
+        process.account.uncharge(taken.len() as u64);
+    }
+    drop(mapping); // an object's last reference, maybe: frees its frames
     Ok(0)
+}
+
+/// MEMORY_RESERVE: `size` bytes of address space in the current process,
+/// nothing in them yet; returns where.
+pub fn reserve_memory(size: u64, writable: u64) -> Result<u64, Error> {
+    let writable = match writable {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::InvalidArgument),
+    };
+    if size == 0 || size > abi::RESERVE_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let start = process.mappings.lock().allocate(size, Mapping::Reserved { writable });
+    start.ok_or(Error::OutOfMemory)
+}
+
+/// MEMORY_LIMIT: lowers the current process's limit to `bytes`, if
+/// lower (0 only asks); the limit now, in bytes.
+pub fn memory_limit(bytes: u64) -> Result<u64, Error> {
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let pages = if bytes == 0 { process.account.limit() } else { process.account.lower_limit(bytes / PAGE_SIZE) };
+    Ok(pages * PAGE_SIZE)
+}
+
+/// MEMORY_USED: the bytes counted against the current process.
+pub fn memory_used() -> Result<u64, Error> {
+    Ok(current().ok_or(Error::InvalidArgument)?.account.used() * PAGE_SIZE)
+}
+
+/// What became of a page fault in user mode.
+pub enum Fault {
+    /// The page was reserved, and has a frame now (or had one already,
+    /// filled by another thread meanwhile): run the instruction again.
+    Filled,
+    /// Not reserved, or not for this kind of access: the program broke
+    /// a rule.
+    NotOurs,
+    /// Reserved, but the process is at its limit: (pages used, limit).
+    OverLimit(u64, u64),
+    /// Reserved, but the machine has no frame left.
+    NoMemory,
+}
+
+/// A user-mode access to `address` (a write if `write`) found no page.
+/// If the address is reserved, the page is filled now.
+pub fn fault_in(address: u64, write: bool) -> Fault {
+    let Some(process) = current() else { return Fault::NotOurs };
+    let mappings = process.mappings.lock();
+    let mut tables = process.tables.lock();
+    let Some(tables) = tables.as_mut() else { return Fault::NotOurs };
+    fill(&process, &mappings, tables, address, write)
+}
+
+/// Kills the current process for a page it could not have - the fault
+/// handlers' answer to OverLimit and NoMemory.
+pub fn out_of_memory(fault: Fault) -> ! {
+    match fault {
+        Fault::OverLimit(used, limit) => {
+            let mib = |pages: u64| (pages * PAGE_SIZE) >> 20;
+            end_current(
+                abi::KILLED,
+                format_args!("killed: out of memory - {} MiB used, its limit is {} MiB", mib(used), mib(limit)),
+            )
+        }
+        _ => end_current(abi::KILLED, format_args!("killed: out of memory - the machine has none left")),
+    }
+}
+
+/// `fault_in`'s work, with both locks held (mappings, then tables).
+fn fill(process: &Process, mappings: &Regions<Mapping>, tables: &mut PageTables, address: u64, write: bool) -> Fault {
+    let writable = if process.stack.contains(&address) {
+        true
+    } else {
+        match mappings.find(address) {
+            Some((_, Mapping::Reserved { writable })) => *writable,
+            _ => return Fault::NotOurs,
+        }
+    };
+    if write && !writable {
+        return Fault::NotOurs;
+    }
+    let page = address & !(PAGE_SIZE - 1);
+    // Two threads may touch the same new page at once: both fault, and
+    // the second to get here finds it filled.
+    if tables.translate(VirtAddr::new(page)).is_some() {
+        return Fault::Filled;
+    }
+    if !process.account.charge(1) {
+        return Fault::OverLimit(process.account.used(), process.account.limit());
+    }
+    let mut flags = Flags::USER | Flags::OWNED | mm::no_execute();
+    if writable {
+        flags |= Flags::WRITABLE;
+    }
+    let mapped = mm::with_frames(|frames| {
+        let frame = frames.allocate()?;
+        // SAFETY: a fresh frame, through the direct map. Zeroed: what
+        // its last owner left there must not be seen.
+        unsafe { phys_to_virt(frame).as_mut_ptr::<u8>().write_bytes(0, PAGE_SIZE as usize) };
+        if tables.map(VirtAddr::new(page), frame, PageSize::Size4K, flags, frames).is_err() {
+            frames.free(frame); // no frame left for a page table
+            return None;
+        }
+        Some(())
+    });
+    if mapped.is_none() {
+        process.account.uncharge(1);
+        return Fault::NoMemory;
+    }
+    mmu::commit_mappings();
+    Fault::Filled
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -195,6 +350,20 @@ impl core::ops::Deref for Loaded {
     type Target = Arc<Process>;
     fn deref(&self) -> &Arc<Process> {
         &self.process
+    }
+}
+
+/// The memory limit a program gets unless its parent's is lower, in
+/// pages: account::default_limit of the machine's, worked out once.
+fn default_limit() -> u64 {
+    static LIMIT: AtomicU64 = AtomicU64::new(0);
+    match LIMIT.load(Ordering::Relaxed) {
+        0 => {
+            let limit = account::default_limit(mm::boot_free_frames()).max(1);
+            LIMIT.store(limit, Ordering::Relaxed);
+            limit
+        }
+        limit => limit,
     }
 }
 
@@ -224,7 +393,29 @@ pub static EXITS: threads::WaitQueue = threads::WaitQueue::new();
 /// into the kernel), or the pages of the memory object a program from
 /// the disk came in, read where they are.
 pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, LoadError> {
-    let image = elf::parse(file, MAPPING_AREA.start).map_err(LoadError::Elf)?;
+    load_limited(name, file, None)
+}
+
+/// `load`, the new program's memory limit no more than `limit` pages.
+///
+/// The limit is the lowest of: the machine's default; that of the
+/// process loading it; and `limit`, which spawn_image takes from the
+/// program file's memory object - the limit of whoever made it. That is
+/// how a program started through init (posix_spawn, the shell) gets
+/// the limit of the one who asked, not init's: the asker read the file
+/// into an object of its own, and cannot make one counted against
+/// anyone else.
+pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Option<u64>) -> Result<Loaded, LoadError> {
+    // Below the mapping area, and off its first page's neighbour.
+    let image = elf::parse(file, MAPPING_AREA.start - PAGE_SIZE).map_err(LoadError::Elf)?;
+    let mut pages = default_limit();
+    if let Some(loader) = current() {
+        pages = pages.min(loader.account.limit());
+    }
+    if let Some(limit) = limit {
+        pages = pages.min(limit);
+    }
+    let account = Arc::new(Account::new(pages));
 
     // SAFETY: frames are reached through the direct map.
     let mut tables = mm::with_memory(|kernel, frames| unsafe {
@@ -236,6 +427,11 @@ pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, Lo
         // A page at `virt`: zeroed, then `bytes` of the file from
         // `from` written at `at` in it.
         let mut map_page = |virt: u64, flags: Flags, at: usize, from: u64, bytes: usize| {
+            // Counted before it is taken. (If loading fails, the account
+            // goes with the half-made process: nothing to give back.)
+            if !account.charge(1) {
+                return Err(LoadError::OverLimit);
+            }
             let frame = frames.allocate().ok_or(LoadError::OutOfMemory)?;
             let page = phys_to_virt(frame).as_mut_ptr::<u8>();
             // SAFETY: a fresh frame, reached through the direct map, and
@@ -283,9 +479,6 @@ pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, Lo
                 map_page(page, flags, (from - page) as usize, offset, bytes)?;
             }
         }
-        for n in 1..=image.stack / PAGE_SIZE {
-            map_page(USER_STACK_TOP - n * PAGE_SIZE, Flags::WRITABLE | mm::no_execute(), 0, 0, 0)?;
-        }
         Ok(())
     });
     if let Err(error) = loaded {
@@ -304,6 +497,8 @@ pub fn load(name: &str, file: &(impl elf::Source + ?Sized)) -> Result<Loaded, Lo
         handles: IrqLock::new(CapTable::new(abi::HANDLES_MAX)),
         io_ports: IrqLock::new(PortBitmap::NONE),
         mappings: IrqLock::new(Regions::new(MAPPING_AREA)),
+        stack: USER_STACK_TOP - image.stack..USER_STACK_TOP,
+        account,
     });
     ALL.lock().push(Arc::downgrade(&process));
     Ok(Loaded { process, entry: image.entry })
@@ -516,15 +711,25 @@ pub fn stop_if_killed() {
 /// the range is looked up in the process's own page tables first, and
 /// must be mapped with the USER bit - so a pointer into the kernel half,
 /// into unmapped memory, or wrapping around the address space is an
-/// error, not a fault and not a leak.
+/// error, not a fault and not a leak. A reserved page not yet touched is
+/// filled here, as the program's own access would have filled it; if it
+/// cannot be (the limit), the call fails with OutOfMemory.
+///
+/// What is returned are physical addresses, used after the locks are
+/// let go. Another thread of the process could unmap the memory
+/// meanwhile, and the frame be reused while the call still copies to
+/// it - a race the program would have to make on purpose, against its
+/// own memory, but one that touches a frame no longer its own. Closing
+/// it means holding the frames (or the lock) for the copy: still to do.
 fn user_pages(pointer: u64, length: u64, write: bool) -> Result<Vec<(u64, usize)>, Error> {
     let end = pointer.checked_add(length).ok_or(Error::BadAddress)?;
     if end > abi::USER_END {
         return Err(Error::BadAddress);
     }
     let process = current().ok_or(Error::BadAddress)?;
-    let tables = process.tables.lock();
-    let tables = tables.as_ref().ok_or(Error::BadAddress)?;
+    let mappings = process.mappings.lock();
+    let mut tables = process.tables.lock();
+    let tables = tables.as_mut().ok_or(Error::BadAddress)?;
 
     let mut needed = Flags::USER;
     if write {
@@ -533,7 +738,27 @@ fn user_pages(pointer: u64, length: u64, write: bool) -> Result<Vec<(u64, usize)
     let mut pieces = Vec::new();
     let mut address = pointer;
     while address < end {
-        let translation = tables.translate(VirtAddr::new(address)).ok_or(Error::BadAddress)?;
+        let translation = match tables.translate(VirtAddr::new(address)) {
+            Some(translation) => translation,
+            None => match fill(&process, &mappings, tables, address, write) {
+                Fault::Filled => tables.translate(VirtAddr::new(address)).ok_or(Error::BadAddress)?,
+                Fault::NotOurs => return Err(Error::BadAddress),
+                // The call fails; the program is not ended here, in the
+                // middle of a system call, whose callers may hold locks
+                // and references the end would never let go.
+                Fault::OverLimit(used, limit) => {
+                    kprintln!(
+                        "[process] {} {:?}: a system call found no memory - {} MiB used, its limit is {} MiB",
+                        process.pid,
+                        process.name,
+                        (used * PAGE_SIZE) >> 20,
+                        (limit * PAGE_SIZE) >> 20
+                    );
+                    return Err(Error::OutOfMemory);
+                }
+                Fault::NoMemory => return Err(Error::OutOfMemory),
+            },
+        };
         if !translation.flags.contains(needed) {
             return Err(Error::BadAddress);
         }

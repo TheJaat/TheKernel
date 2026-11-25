@@ -181,6 +181,27 @@ pub mod call {
     /// futex_wake(address, count) - wakes up to `count` threads waiting
     /// at `address`, in the order they began to wait; returns how many.
     pub const FUTEX_WAKE: u64 = 30;
+    /// memory_reserve(size, writable) - reserves `size` bytes (rounded
+    /// up to whole pages, at most RESERVE_MAX) of this process's address
+    /// space, at an address the kernel chooses; returns it. No memory is
+    /// taken yet: each page gets a zeroed frame the first time it is
+    /// touched - by the program, or by a system call reading or writing
+    /// it - and is counted against the process's limit then (see
+    /// MEMORY_LIMIT). A page past the limit, or past what the machine
+    /// has, ends the process ("out of memory"). `writable` is 0 or 1;
+    /// never executable. Like a mapping, it has an unmapped page on
+    /// each side, and MEMORY_UNMAP gives it back, every page it took.
+    pub const MEMORY_RESERVE: u64 = 31;
+    /// memory_limit(bytes) - lowers this process's memory limit to
+    /// `bytes` (rounded down to pages) if that is lower, and returns the
+    /// limit now, in bytes; 0 only asks. A limit cannot be raised. A
+    /// program started later starts with its parent's limit (or the
+    /// machine's default, if that is lower). Counted: the program's
+    /// loaded file and stack, reserved pages as they are touched, and
+    /// memory objects it made, while they last.
+    pub const MEMORY_LIMIT: u64 = 32;
+    /// memory_used() - the bytes counted against this process now.
+    pub const MEMORY_USED: u64 = 33;
 }
 
 /// The most threads one process may have at once (THREAD_CREATE says
@@ -191,12 +212,13 @@ pub const THREADS_MAX: usize = 64;
 
 /// The u64s process_spawn_image's request holds.
 pub const SPAWN_REQUEST_WORDS: usize = 5;
-/// The largest program file process_spawn_image accepts: 128 MiB. The
+/// The largest program file process_spawn_image accepts: 512 MiB. The
 /// file is read where it lies, in the memory object (copied first only
 /// if someone else could change it), so the limit is a guard against a
-/// nonsense size, not a measure of the kernel's own memory. LLVM's
-/// tools are tens of megabytes.
-pub const PROGRAM_IMAGE_MAX: u64 = 128 << 20;
+/// nonsense size, not a measure of the kernel's own memory - the new
+/// program's memory limit (MEMORY_LIMIT) is that. LLVM's tools are tens
+/// of megabytes; rustc, LLVM linked in, about 200.
+pub const PROGRAM_IMAGE_MAX: u64 = 512 << 20;
 
 /// What a program learns from its parent besides its handles: the
 /// argument of process_spawn, in RSI. Each flag says one more startup
@@ -604,10 +626,14 @@ pub const WAIT_HANDLES_MAX: u64 = 32;
 /// Longest program name.
 pub const PROGRAM_NAME_MAX: u64 = 64;
 
-/// Largest memory object: 128 MiB, as big as a program file may be
-/// (PROGRAM_IMAGE_MAX), which travels in one. (Per-process memory quotas
-/// come later; until then this bounds what one call can take.)
-pub const MEMORY_MAX: u64 = 128 << 20;
+/// Largest memory object: 512 MiB, as big as a program file may be
+/// (PROGRAM_IMAGE_MAX), which travels in one. What a process may take
+/// in all is its memory limit (MEMORY_LIMIT); this only bounds one call.
+pub const MEMORY_MAX: u64 = 512 << 20;
+/// The most one MEMORY_RESERVE may ask for: 64 GiB of address space.
+/// Reserving takes no memory, so this can be far more than the machine
+/// has; it only stops a nonsense size.
+pub const RESERVE_MAX: u64 = 64 << 30;
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Most handles one process may hold.

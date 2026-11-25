@@ -313,6 +313,7 @@ pub fn init(memory: &BootMemory) {
         frames.free_range(PhysAddr::new(range.start), PhysAddr::new(range.end));
     }
     reserve_occupied(&mut frames);
+    BOOT_FREE_FRAMES.store(frames.free_frames() as u64, Ordering::Relaxed);
     kprintln!(
         "[memory] {} frames free of {} ({} MiB), bitmap {} KiB at {:#x}",
         frames.free_frames(),
@@ -583,6 +584,16 @@ impl Drop for KernelStack {
 /// Frames nothing is using: the free ones, and those of stacks waiting
 /// for a thread. What "nothing leaked" must compare - how many stacks
 /// are waiting depends on how many threads have just ended.
+/// The frames free once the kernel had set memory up: the memory the
+/// machine has for everything else. (`total_frames` is the span of the
+/// bitmap, holes and all - 5 GiB on a PC with 4, its devices just below
+/// 4 GiB.)
+static BOOT_FREE_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn boot_free_frames() -> u64 {
+    BOOT_FREE_FRAMES.load(Ordering::Relaxed)
+}
+
 pub fn unused_frames() -> usize {
     let waiting = SLOTS.lock().free.len();
     with_memory(|_, frames| frames.free_frames()) + waiting * STACK_PAGES as usize

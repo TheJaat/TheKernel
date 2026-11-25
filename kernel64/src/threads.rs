@@ -79,16 +79,18 @@ struct Thread {
 }
 
 /// The address space loaded in each CPU's CR3 now, to skip reloading
-/// the same one (a reload flushes that CPU's TLB).
+/// the same one (a reload flushes that CPU's TLB) - and to know which
+/// CPUs to tell when a translation is taken away (tlb.rs).
 ///
-/// The TLB is why this comparison must stay exactly as it is. Each CPU
-/// remembers translations on its own. A process runs on one CPU at a
-/// time, and a CPU that stops running it always loads other page tables
-/// before the process can run anywhere else - its idle thread's, at
-/// least. So when a process comes back to a CPU, that CPU has reloaded
-/// CR3 since, and remembers nothing stale about it. Keeping a process's
-/// tables loaded while idling ("lazy TLB") would be faster and would
-/// break this.
+/// Each CPU remembers translations on its own. A CPU that stops running
+/// a process always loads other page tables before it is idle - its
+/// idle thread's, at least - so a CPU that runs a process again has
+/// reloaded CR3 since, and remembers nothing stale about it. While it
+/// runs the process, though, another thread of the same process on
+/// another CPU may unmap a page: then this table is how the unmapping
+/// CPU finds the others to tell (`cpus_running`). Keeping a process's
+/// tables loaded while idling ("lazy TLB") would be faster, and would
+/// mean telling idle CPUs too.
 static ACTIVE_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 struct Threads {
@@ -172,6 +174,15 @@ pub fn run_idle() -> ! {
     ACTIVE_ROOT[arch::cpu()].store(mm::kernel_root(), Ordering::Relaxed);
     idle_loop();
     unreachable!("the idle loop ended")
+}
+
+/// The CPUs whose CR3 holds `root` now, as a bit set.
+pub fn cpus_running(root: u64) -> u64 {
+    ACTIVE_ROOT
+        .iter()
+        .enumerate()
+        .filter(|(_, active)| active.load(Ordering::SeqCst) == root)
+        .fold(0, |set, (cpu, _)| set | 1 << cpu)
 }
 
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
@@ -382,7 +393,10 @@ fn schedule() {
             if let Some(top) = next.stack_top {
                 syscall::set_kernel_stack(top);
             }
-            if ACTIVE_ROOT[cpu].swap(root, Ordering::Relaxed) != root {
+            // SeqCst: a CPU removing a mapping from these tables reads
+            // this after its removal (tlb.rs); either it sees this CPU
+            // here, or this CPU's walk of the tables sees the removal.
+            if ACTIVE_ROOT[cpu].swap(root, Ordering::SeqCst) != root {
                 // SAFETY: a process's tables share the kernel half.
                 unsafe { mmu::activate(root) };
                 // A different process (or none): its I/O ports. The

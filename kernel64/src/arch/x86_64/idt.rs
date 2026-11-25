@@ -387,9 +387,27 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         return;
     }
 
-    // From user mode (the low bits of CS are the privilege level): the
-    // program broke a rule. Kill it; the kernel carries on.
+    // From user mode (the low bits of CS are the privilege level).
     if frame.cs & 3 == 3 {
+        // Nothing at the address (error bit 0 clear), for a read or a
+        // write (bit 1), not an instruction fetch (bit 4): reserved
+        // memory not yet touched, perhaps - filled, and the instruction
+        // runs again.
+        if frame.vector == PAGE_FAULT && frame.error_code & (1 | 16) == 0 {
+            match crate::process::fault_in(read_cr2(), frame.error_code & 2 != 0) {
+                crate::process::Fault::Filled => {
+                    crate::process::stop_if_killed();
+                    return;
+                }
+                crate::process::Fault::NotOurs => {}
+                fault => {
+                    kprintln!("[process] page fault at {:#x} in user mode, for {:#x}", frame.rip, read_cr2());
+                    crate::process::out_of_memory(fault);
+                }
+            }
+        }
+        // Otherwise the program broke a rule. Kill it; the kernel
+        // carries on.
         kprintln!("[process] {name} at {:#x} in user mode", frame.rip);
         if frame.vector == PAGE_FAULT {
             report_page_fault(frame.error_code);

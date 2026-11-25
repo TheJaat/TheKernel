@@ -48,7 +48,7 @@
 
 use core::arch::{asm, global_asm};
 
-use kernel64::aarch64::{vector_name, Syndrome};
+use kernel64::aarch64::{vector_name, Access, Cause, Syndrome};
 
 /// Everything the interrupted code had in the CPU. The assembly below
 /// fills it in this order.
@@ -414,6 +414,23 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
             let args = [frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5]];
             frame.x[0] = crate::syscall::dispatch(frame.x[8], args);
             return;
+        }
+        // A read or write that found no page: reserved memory not yet
+        // touched, perhaps - filled, and the instruction runs again.
+        if let Some(abort) = syndrome.abort() {
+            if matches!(abort.cause, Cause::NotMapped { .. }) && abort.access != Access::Execute {
+                match crate::process::fault_in(fault_address(), abort.access == Access::Write) {
+                    crate::process::Fault::Filled => {
+                        crate::process::stop_if_killed();
+                        return;
+                    }
+                    crate::process::Fault::NotOurs => {}
+                    fault => {
+                        kprintln!("[process] {abort} at {:#x}, for {:#x}", frame.elr, fault_address());
+                        crate::process::out_of_memory(fault);
+                    }
+                }
+            }
         }
         // Anything else: the program broke a rule. It ends; the
         // kernel carries on.

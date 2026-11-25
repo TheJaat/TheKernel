@@ -11,8 +11,14 @@
 //! mapping is followed by one unmapped guard page, so running off the
 //! end of a buffer faults instead of landing in the next one.
 //!
+//! Every region has an unmapped page after it (its guard), and so one
+//! before it too: the previous region's guard, or - for the first - the
+//! page below the area, which the kernel keeps clear (process.rs). A
+//! stack that grows down, in a region, overflows into a fault.
+//!
 //! Generic over what each region records (the kernel stores the memory
-//! object, to keep it alive while mapped), so it is tested on the host.
+//! object, or that the region is reserved memory filled in as it is
+//! touched), so it is tested on the host.
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -60,6 +66,16 @@ impl<T> Regions<T> {
         Some(self.used.remove(n))
     }
 
+    /// The region `address` falls in (not counting guard pages), and
+    /// what it records.
+    pub fn find(&self, address: u64) -> Option<(&Range<u64>, &T)> {
+        // The last region starting at or below `address`: the only one
+        // that can hold it, the list being sorted and the regions apart.
+        let n = self.used.partition_point(|(range, _)| range.start <= address).checked_sub(1)?;
+        let (range, value) = &self.used[n];
+        range.contains(&address).then_some((range, value))
+    }
+
     pub fn len(&self) -> usize {
         self.used.len()
     }
@@ -97,6 +113,23 @@ mod tests {
         assert_eq!(r.allocate(2 * PAGE, 5), Some(b), "fits the gap");
         assert_eq!(r.remove(a + PAGE), None, "not a region start");
         assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn an_address_finds_its_region_and_no_other() {
+        let mut r = Regions::new(AREA);
+        assert_eq!(r.find(AREA.start), None, "nothing yet");
+        let a = r.allocate(2 * PAGE, 'a').unwrap();
+        let b = r.allocate(PAGE, 'b').unwrap();
+        assert_eq!(r.find(a), Some((&(a..a + 2 * PAGE), &'a')));
+        assert_eq!(r.find(a + 2 * PAGE - 1).map(|x| *x.1), Some('a'), "its last byte");
+        assert_eq!(r.find(a + 2 * PAGE), None, "its guard page");
+        assert_eq!(r.find(b + 100).map(|x| *x.1), Some('b'));
+        assert_eq!(r.find(b + PAGE), None, "past the last");
+        assert_eq!(r.find(AREA.start - 1), None, "below the area");
+        r.remove(a);
+        assert_eq!(r.find(a), None, "removed");
+        assert_eq!(r.find(b).map(|x| *x.1), Some('b'));
     }
 
     #[test]

@@ -360,11 +360,14 @@ fn spawn_from(
                 return Err(Error::InvalidArgument);
             }
             let program = name.ok_or(Error::InvalidArgument)?;
+            // The limit of whoever made the file's object: the program
+            // that asked for this one (process::load_limited says why).
+            let limit = object.account().map(|account| account.limit());
             if Arc::strong_count(&object) == 2 {
-                process::load(program, &*object)
+                process::load_limited(program, &*object, limit)
             } else {
                 let copy = object.copy().ok_or(Error::OutOfMemory)?;
-                process::load(program, &copy)
+                process::load_limited(program, &copy, limit)
             }
         }
     };
@@ -375,6 +378,15 @@ fn spawn_from(
     let loaded = loaded.map_err(|error| match error {
         process::LoadError::Elf(_) => Error::NotExecutable,
         process::LoadError::OutOfMemory => Error::OutOfMemory,
+        process::LoadError::OverLimit => {
+            kprintln!(
+                "[process] {} {:?}: the program is bigger than the memory limit ({} MiB)",
+                process.pid,
+                process.name,
+                (process.account.limit() * abi::PAGE_SIZE) >> 20
+            );
+            Error::OutOfMemory
+        }
     })?;
 
     // 3. Nothing fails from here on.
@@ -448,7 +460,17 @@ pub fn memory_create(size: u64) -> Result<u64, Error> {
     if process.handles.lock().room() == 0 {
         return Err(Error::TooManyHandles);
     }
-    let object = MemoryObject::new(size.div_ceil(abi::PAGE_SIZE)).ok_or(Error::OutOfMemory)?;
+    // Counted against its maker for as long as it lives, wherever its
+    // handles go: the object gives the pages back when it is dropped.
+    let pages = size.div_ceil(abi::PAGE_SIZE);
+    if !process.account.charge(pages) {
+        return Err(Error::OutOfMemory);
+    }
+    let Some(mut object) = MemoryObject::new(pages) else {
+        process.account.uncharge(pages);
+        return Err(Error::OutOfMemory);
+    };
+    object.charged_to(Arc::clone(&process.account));
     let handle = process.handles.lock().insert(Object::Memory(Arc::new(object)), Rights::ALL);
     handle
 }

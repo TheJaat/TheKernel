@@ -62,6 +62,9 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::THREAD_POINTER => Err(Error::BadAddress),
         call::FUTEX_WAIT => crate::futex::wait(args[0], args[1], args[2]),
         call::FUTEX_WAKE => crate::futex::wake_here(args[0], args[1]),
+        call::MEMORY_RESERVE => process::reserve_memory(args[0], args[1]),
+        call::MEMORY_LIMIT => process::memory_limit(args[0]),
+        call::MEMORY_USED => process::memory_used(),
         _ => Err(Error::UnknownCall),
     };
     // The way back to user mode: where a process someone asked to end,
