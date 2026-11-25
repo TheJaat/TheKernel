@@ -212,9 +212,113 @@ pub mod startup {
     /// gives up on a screen that takes nothing for a second, where on
     /// any other output it waits: text for a file must not be dropped.
     pub const SCREEN: u64 = 1 << 7;
+    /// A channel holding the program's descriptors beyond 0, 1 and 2,
+    /// one message each (`super::descriptors`): what a C program left
+    /// open when it started this one - a file, a pipe's end - as Unix
+    /// hands a child every descriptor not marked close-on-exec. Only
+    /// C programs read it (libc); and only libc sends one.
+    ///
+    /// Bit 8, past the two flags that bring no handle: its handle comes
+    /// last, after standard error's.
+    pub const DESCRIPTORS: u64 = 1 << 8;
     /// The flags that each stand for one startup handle: the ones
-    /// below the two that do not.
-    pub const HANDLES: u64 = KEYBOARD - 1;
+    /// below the two that do not, and DESCRIPTORS.
+    pub const HANDLES: u64 = (KEYBOARD - 1) | DESCRIPTORS;
+
+    /// Which of the startup handles flag `flag` stands for (counting
+    /// from 0), given the flags a program was started with - if it has
+    /// that one at all. Handles come in the order of their flags' bits,
+    /// and only the flags in HANDLES bring one.
+    pub fn index(flags: u64, flag: u64) -> Option<u64> {
+        (flags & flag != 0 && flag & HANDLES != 0).then(|| u64::from((flags & HANDLES & (flag - 1)).count_ones()))
+    }
+}
+
+/// A program's descriptors beyond 0, 1 and 2, as its parent hands them
+/// down (startup::DESCRIPTORS): one message per descriptor, on a
+/// channel the parent fills and closes before the child starts.
+///
+///   [descriptor] [FILE] [flags, 4 bytes] [offset, 8 bytes] [path]
+///   [descriptor] [READ]       + one handle: a stream to read from
+///   [descriptor] [WRITE]      + one handle: a stream to write to
+///
+/// A file is no more than its name, where the parent had got to, and
+/// how it was opened (a C library keeps nothing else for one: the file
+/// service remembers nothing between requests), so it travels as those,
+/// and the child's copy moves on its own from there. A pipe's end, or
+/// another stream, is a channel: the handle itself goes down. Numbers
+/// are little-endian; `flags` are open's (Linux's values); `path` is
+/// from the root.
+pub mod descriptors {
+    pub const FILE: u8 = 1;
+    pub const READ: u8 = 2;
+    pub const WRITE: u8 = 3;
+
+    /// One descriptor, as a message says it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Entry<'a> {
+        File { descriptor: u8, flags: i32, offset: u64, path: &'a str },
+        /// A stream end; its handle travels with the message.
+        Read { descriptor: u8 },
+        Write { descriptor: u8 },
+    }
+
+    impl<'a> Entry<'a> {
+        /// The message, in `out`: its length, or None if it does not
+        /// fit.
+        pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+            match *self {
+                Entry::File { descriptor, flags, offset, path } => {
+                    let length = 2 + 4 + 8 + path.len();
+                    if length > out.len() {
+                        return None;
+                    }
+                    out[0] = descriptor;
+                    out[1] = FILE;
+                    out[2..6].copy_from_slice(&flags.to_le_bytes());
+                    out[6..14].copy_from_slice(&offset.to_le_bytes());
+                    out[14..length].copy_from_slice(path.as_bytes());
+                    Some(length)
+                }
+                Entry::Read { descriptor } | Entry::Write { descriptor } => {
+                    if out.len() < 2 {
+                        return None;
+                    }
+                    out[0] = descriptor;
+                    out[1] = if matches!(self, Entry::Read { .. }) { READ } else { WRITE };
+                    Some(2)
+                }
+            }
+        }
+
+        /// The entry a message says, or None if it says none - and
+        /// whether it should have brought a handle (READ, WRITE).
+        pub fn decode(message: &'a [u8]) -> Option<Entry<'a>> {
+            let (&[descriptor, kind], rest) = message.split_first_chunk::<2>()?;
+            match kind {
+                FILE => {
+                    let (flags, rest) = rest.split_first_chunk::<4>()?;
+                    let (offset, path) = rest.split_first_chunk::<8>()?;
+                    let path = core::str::from_utf8(path).ok().filter(|path| path.starts_with('/'))?;
+                    Some(Entry::File { descriptor, flags: i32::from_le_bytes(*flags), offset: u64::from_le_bytes(*offset), path })
+                }
+                READ if rest.is_empty() => Some(Entry::Read { descriptor }),
+                WRITE if rest.is_empty() => Some(Entry::Write { descriptor }),
+                _ => None,
+            }
+        }
+
+        pub fn descriptor(&self) -> u8 {
+            match *self {
+                Entry::File { descriptor, .. } | Entry::Read { descriptor } | Entry::Write { descriptor } => descriptor,
+            }
+        }
+
+        /// Whether a handle comes with it.
+        pub fn has_handle(&self) -> bool {
+            !matches!(self, Entry::File { .. })
+        }
+    }
 }
 
 /// A stream: bytes in order, in messages, on a channel. What standard
@@ -319,6 +423,11 @@ pub mod init {
     /// as the arguments do - laid out by `pack`. init sends it to the
     /// program after its command line (startup::ARGUMENTS).
     pub const ENVIRONMENT: u8 = 0x40;
+    /// Added to `kind`: one more handle, after the flags' and before the
+    /// reply's - a channel holding the new program's descriptors beyond
+    /// 0, 1 and 2 (`super::descriptors`), which init hands down as
+    /// startup::DESCRIPTORS.
+    pub const DESCRIPTORS: u8 = 0x20;
 
     /// `arguments` and `environment` as one Run's `arguments`, for a
     /// `kind` with ENVIRONMENT: the arguments' length in two bytes
@@ -346,9 +455,15 @@ pub mod init {
     }
 
     impl<'a> Run<'a> {
-        /// The kind without REPLY and ENVIRONMENT: BUILT_IN or IMAGE.
+        /// The kind without REPLY, ENVIRONMENT and DESCRIPTORS:
+        /// BUILT_IN or IMAGE.
         pub fn what(&self) -> u8 {
-            self.kind & !(REPLY | ENVIRONMENT)
+            self.kind & !(REPLY | ENVIRONMENT | DESCRIPTORS)
+        }
+
+        /// Whether a channel of descriptors comes with it (DESCRIPTORS).
+        pub fn has_descriptors(&self) -> bool {
+            self.kind & DESCRIPTORS != 0
         }
 
         /// The arguments and the environment (none, without
@@ -403,7 +518,7 @@ pub mod init {
                 let (said, rest) = arguments.split_first_chunk::<2>()?;
                 rest.split_at_checked(usize::from(u16::from_le_bytes(*said)))?;
             }
-            matches!(kind & !(REPLY | ENVIRONMENT), BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
+            matches!(kind & !(REPLY | ENVIRONMENT | DESCRIPTORS), BUILT_IN | IMAGE).then_some(Run { kind, flags, name, directory, file, arguments })
         }
     }
 }
@@ -1947,6 +2062,61 @@ pub mod net {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_handles_are_found_past_the_flags_that_bring_none() {
+        use super::startup::*;
+        // stdout, stdin, keyboard, screen, descriptors: the descriptors'
+        // handle is the third (after stdout's and stdin's), whatever
+        // KEYBOARD and SCREEN say.
+        let flags = STDOUT | STDIN | KEYBOARD | SCREEN | DESCRIPTORS;
+        assert_eq!(index(flags, STDOUT), Some(0));
+        assert_eq!(index(flags, STDIN), Some(1));
+        assert_eq!(index(flags, DESCRIPTORS), Some(2));
+        assert_eq!(index(flags, STDERR), None);
+        assert_eq!(index(flags, KEYBOARD), None); // not a handle
+        let all = HANDLES | KEYBOARD | SCREEN;
+        assert_eq!(index(all, DESCRIPTORS), Some(6));
+    }
+
+    #[test]
+    fn descriptors_travel_and_come_back() {
+        use super::descriptors::*;
+        let mut out = [0u8; 64];
+        let file = Entry::File { descriptor: 3, flags: 0o2101, offset: 1 << 40, path: "/docs/log" };
+        let n = file.encode(&mut out).unwrap();
+        assert_eq!(Entry::decode(&out[..n]), Some(file.clone()));
+        assert!(!file.has_handle());
+        for entry in [Entry::Read { descriptor: 7 }, Entry::Write { descriptor: 31 }] {
+            let n = entry.encode(&mut out).unwrap();
+            assert_eq!(n, 2);
+            assert_eq!(Entry::decode(&out[..n]), Some(entry.clone()));
+            assert!(entry.has_handle());
+        }
+        // Too small; a path not from the root; a kind there is not; a
+        // READ with bytes after it; a message cut short.
+        assert_eq!(file.encode(&mut [0u8; 10]), None);
+        let mut bad = out;
+        let n = Entry::File { descriptor: 3, flags: 0, offset: 0, path: "docs" }.encode(&mut bad).unwrap();
+        assert_eq!(Entry::decode(&bad[..n]), None);
+        assert_eq!(Entry::decode(&[3, 9]), None);
+        assert_eq!(Entry::decode(&[3, READ, 0]), None);
+        assert_eq!(Entry::decode(&[3, FILE, 0, 0]), None);
+    }
+
+    #[test]
+    fn a_run_with_descriptors_is_still_an_image() {
+        use super::init::*;
+        let run = Run { kind: IMAGE | REPLY | DESCRIPTORS, flags: 0, name: "cat", directory: "", file: "/cat", arguments: b"" };
+        let mut out = [0u8; 64];
+        let n = run.encode(&mut out).unwrap();
+        let back = Run::decode(&out[..n]).unwrap();
+        assert_eq!(back.what(), IMAGE);
+        assert!(back.has_descriptors() && back.replies_apart());
+        let plain = Run { kind: IMAGE, ..run };
+        let n = plain.encode(&mut out).unwrap();
+        assert!(!Run::decode(&out[..n]).unwrap().has_descriptors());
+    }
+
 
     #[test]
     fn a_pointer_message_goes_there_and_back() {

@@ -21,8 +21,10 @@
 #   with programs sh script.sh one 'two words'
 #                            a script: its arguments, cd, $(...), test,
 #                            a wildcard, ${...}, if, for, while read,
-#                            case, a function, $((...)), set -e
-#   with programs sh -c 'cat << x'   refused: not in this shell yet
+#                            case, a function, $((...)), exec 3<, read
+#                            <&3, a here-document, a group's output a
+#                            file, set -e
+#   with programs sh -c 'a &'   refused: not in this shell yet
 #   with programs make       four recipes with <, >, |, 2>&1, ;, $(...)
 #                            and a for loop
 #   with programs make       again: nothing to do
@@ -100,6 +102,16 @@ case "$1" in
     one) echo "first is one" ;;
     *) echo "first is not" ;;
 esac
+exec 3< in.txt
+read -r first <&3
+echo "from 3: ${#first}"
+pipes fdcount 3
+while read -r w n; do echo "here: $n $w"; done <<END
+one 1
+two $((1 + 1))
+END
+{ echo grouped; pipes emit from-a-program; } > grouped.txt
+cat grouped.txt
 set -e
 pipes exit 3
 echo "not reached"
@@ -123,7 +135,7 @@ steps="$(keys 'cd t') ret ~"
 steps="$steps $(keys 'echo == checks ==') ret ~ $(keys 'with programs pipes') ret ~~ ~~ ~~"
 steps="$steps $(keys 'echo == typed ==') ret ~ $(keys "with programs sh -c 'echo a && echo b; false || echo c'") ret ~"
 steps="$steps $(keys 'echo == script ==') ret ~ $(keys "with programs sh script.sh one 'two words'") ret ~~"
-steps="$steps $(keys 'echo == missing ==') ret ~ $(keys "with programs sh -c 'cat << x'") ret ~"
+steps="$steps $(keys 'echo == missing ==') ret ~ $(keys "with programs sh -c 'a &'") ret ~"
 steps="$steps $(keys 'echo == make ==') ret ~ $(keys 'with programs make') ret ~~"
 steps="$steps $(keys 'echo == again ==') ret ~ $(keys 'with programs make') ret ~"
 steps="$steps $(keys 'echo == refused ==') ret ~ $(keys 'with files make refused') ret ~"
@@ -159,13 +171,14 @@ has typed '^c$' "sh -c did not run the command after ||"
 has typed '"sh" exited with code 0' "sh -c did not exit with code 0"
 for line in 'args: 2 \[one\] \[two words\] script\.sh' '/t/sub' 'counted: 5000 bytes' 'in\.txt is a file' \
     'in\.txt is not a directory' 'env\.mk' '8 bytes' 'tcc none 3' 'in\.txt: there' 'env\.mk: there' 'none: missing' \
-    '2 arguments' 'sum: 42' 'script' 'read: y x' 'first is one'; do
+    '2 arguments' 'sum: 42' 'script' 'read: y x' 'first is one' 'from 3: 4999' '0 bytes' 'here: 1 one' 'here: 2 two' \
+    'grouped' 'from-a-program'; do
     has script "^$line\$" "the script did not say: $line"
 done
 has script '"sh" exited with code 3' "set -e did not stop the script at pipes exit 3"
 part script | grep -aq 'not reached' && fail "the script went on after a failure, with set -e"
-has missing '^sh: a here-document, <<, is not in this shell yet$' "sh did not refuse a here-document"
-has missing '"sh" exited with code 2' "sh did not exit with code 2 for a here-document"
+has missing '^sh: running a command in the background, &, is not in this shell yet$' "sh did not refuse &"
+has missing '"sh" exited with code 2' "sh did not exit with code 2 for &"
 has make '"make" exited with code 0' "make did not exit with code 0"
 [ "$(part make | grep -ac '\[init\] started pipes')" -eq 5 ] || fail "make did not start exactly the five commands of its recipes"
 has again '^make: nothing to be done for all$' "a second make did something"
@@ -186,4 +199,4 @@ part refused | grep -aq '^not run$' && fail "make, not given the right to start 
 "$TFSTOOL" get "$DISK" t/made-loop.txt > "$WORK/loop.txt" || fail "t/made-loop.txt cannot be read off the disk"
 printf 'a\nb\n' | cmp -s - "$WORK/loop.txt" || fail "t/made-loop.txt is not what the recipe's loop wrote: $(cat "$WORK/loop.txt")"
 
-echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script with if, for, while read, case and a function; make ran recipes with <, >, |, 2>&1, \$(...) and a loop"
+echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script with if, for, while read, case, a function, exec 3< and a here-document; make ran recipes with <, >, |, 2>&1, \$(...) and a loop"

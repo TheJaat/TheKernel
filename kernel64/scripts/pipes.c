@@ -13,7 +13,10 @@
  *   pipes oops WORD       prints WORD on standard error
  *   pipes count           reads standard input to its end: "N bytes"
  *   pipes exit N          exits with N
- *   pipes env NAME        prints NAME's value, or "(unset)" */
+ *   pipes env NAME        prints NAME's value, or "(unset)"
+ *   pipes fdcount N       reads descriptor N to its end: "N bytes", or
+ *                         "N: closed" if it has no N
+ *   pipes fdwrite N WORD  writes WORD and a new line to descriptor N */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -106,6 +109,11 @@ static void in_one_program(void)
     close(ends[1]);
 }
 
+/* The pipes here are pipe2(..., O_CLOEXEC): each is meant for one
+ * child, which gets the end it is to have by adddup2. A plain pipe's
+ * ends would go to every child as well (descriptors are inherited), and
+ * a child holding the write end of its own input never sees its end -
+ * as on Unix. */
 static void between_programs(void)
 {
     char buffer[8192];
@@ -113,7 +121,7 @@ static void between_programs(void)
     int out[2], in[2];
 
     /* Its output, through a pipe. */
-    pipe(out);
+    pipe2(out, O_CLOEXEC);
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
     char *emit[] = {"pipes", "emit", "through", "a", "pipe", NULL};
@@ -127,8 +135,8 @@ static void between_programs(void)
     close(out[0]);
 
     /* Its input, through a pipe, and its output through another. */
-    pipe(in);
-    pipe(out);
+    pipe2(in, O_CLOEXEC);
+    pipe2(out, O_CLOEXEC);
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, in[0], 0);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
@@ -147,7 +155,7 @@ static void between_programs(void)
     close(out[0]);
 
     /* Standard error onto standard output: 2 a copy of 1. */
-    pipe(out);
+    pipe2(out, O_CLOEXEC);
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
     posix_spawn_file_actions_adddup2(&actions, 1, 2);
@@ -161,7 +169,7 @@ static void between_programs(void)
     close(out[0]);
 
     /* A reader that goes away: the writer is stopped, SIGPIPE. */
-    pipe(out);
+    pipe2(out, O_CLOEXEC);
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
     char *lines[] = {"pipes", "lines", "100000", NULL};
@@ -203,7 +211,7 @@ static void files(void)
 
     /* Its input from a file. */
     int out[2];
-    pipe(out);
+    pipe2(out, O_CLOEXEC);
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, 0, "in.txt", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
@@ -318,7 +326,7 @@ static void shell(void)
     check(system("[ -f in.txt ] && test -d sub && ! test -d in.txt") == 0, "test and [");
     check(system("exit 7") == 7 << 8, "exit");
     check(system("nothing && pipes emit x") == 127 << 8, "a command not found in a list: 127");
-    check(system("cat << END") == 2 << 8, "a here-document: not in this shell yet, 2");
+    check(system("cat << END") == 2 << 8, "a here-document with no lines: a mistake, 2");
     check(system("for w in a b c; do pipes emit $w; done > for.txt") == 0 && strcmp(contents("for.txt"), "a\nb\nc\n") == 0,
           "for, its output a file");
     check(system("if [ -f in.txt ]; then pipes emit yes > if.txt; else pipes emit no > if.txt; fi") == 0
@@ -339,6 +347,118 @@ static void shell(void)
     check(stream != NULL && fgets(line, sizeof line, stream) && fgets(second, sizeof second, stream)
               && strcmp(line, "one\n") == 0 && strcmp(second, "two\n") == 0, "popen of a list, reading");
     check(stream != NULL && pclose(stream) == 0, "and its status");
+}
+
+/* Descriptors beyond 0, 1 and 2 go to the programs this one starts,
+ * as exec leaves them on Unix - unless marked close-on-exec. */
+static void inherited(void)
+{
+    posix_spawn_file_actions_t actions;
+    char buffer[64];
+    int out[2];
+
+    /* A file open here, read part way: the child reads on from there. */
+    int fd = open("in.txt", O_RDONLY);
+    check(fd >= 3 && lseek(fd, 4990, SEEK_SET) == 4990, "in.txt open at 4990");
+    char number[8];
+    snprintf(number, sizeof number, "%d", fd);
+    char *fdcount[] = {"pipes", "fdcount", number, NULL};
+    pipe2(out, O_CLOEXEC);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+    pid_t child = start(&actions, fdcount);
+    close(out[1]);
+    drain(out[0], buffer, sizeof buffer);
+    close(out[0]);
+    check(child > 0 && status_of(child) == 0 && strcmp(buffer, "10 bytes\n") == 0, "a file open here: the child has it, from 4990 on");
+
+    /* Marked close-on-exec: the child has no such descriptor. */
+    check(fcntl(fd, F_GETFD) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && fcntl(fd, F_GETFD) == FD_CLOEXEC,
+          "F_SETFD marks it close-on-exec, F_GETFD says so");
+    pipe2(out, O_CLOEXEC);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+    child = start(&actions, fdcount);
+    close(out[1]);
+    drain(out[0], buffer, sizeof buffer);
+    close(out[0]);
+    char closed[32];
+    snprintf(closed, sizeof closed, "%d: closed\n", fd);
+    check(child > 0 && strcmp(buffer, closed) == 0, "close-on-exec: not given");
+    status_of(child);
+    close(fd);
+
+    /* addclose of one that would be inherited. */
+    fd = open("in.txt", O_RDONLY);
+    pipe2(out, O_CLOEXEC);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+    posix_spawn_file_actions_addclose(&actions, fd);
+    child = start(&actions, fdcount);
+    close(out[1]);
+    drain(out[0], buffer, sizeof buffer);
+    close(out[0]);
+    check(child > 0 && strcmp(buffer, closed) == 0, "addclose: not given");
+    status_of(child);
+    close(fd);
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* A plain pipe's write end: the child writes on it, by number. */
+    int ends[2];
+    check(pipe(ends) == 0, "a pipe, not close-on-exec");
+    snprintf(number, sizeof number, "%d", ends[1]);
+    char *fdwrite[] = {"pipes", "fdwrite", number, "down-the-pipe", NULL};
+    child = start(NULL, fdwrite);
+    close(ends[1]);
+    drain(ends[0], buffer, sizeof buffer);
+    close(ends[0]);
+    check(child > 0 && status_of(child) == 0 && strcmp(buffer, "down-the-pipe\n") == 0, "a pipe's end, inherited, written to");
+
+    /* addopen to 3, and adddup2 to 5. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 3, "three.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char *to3[] = {"pipes", "fdwrite", "3", "into-three", NULL};
+    child = start(&actions, to3);
+    posix_spawn_file_actions_destroy(&actions);
+    check(child > 0 && status_of(child) == 0 && strcmp(contents("three.txt"), "into-three\n") == 0, "addopen to 3");
+    pipe2(out, O_CLOEXEC);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 5);
+    char *to5[] = {"pipes", "fdwrite", "5", "into-five", NULL};
+    child = start(&actions, to5);
+    posix_spawn_file_actions_destroy(&actions);
+    close(out[1]);
+    drain(out[0], buffer, sizeof buffer);
+    close(out[0]);
+    check(child > 0 && status_of(child) == 0 && strcmp(buffer, "into-five\n") == 0,
+          "adddup2 to 5 of a close-on-exec end: given, as 5");
+
+    /* Through sh: exec, here-documents, read from a descriptor, and
+     * redirections of builtins and loops, done in the shell itself. */
+    FILE *stream = popen("exec 3< in.txt; pipes fdcount 3", "r");
+    char line[64] = "";
+    check(stream && fgets(line, sizeof line, stream) && strcmp(line, "5000 bytes\n") == 0 && pclose(stream) == 0,
+          "sh: exec 3< - its programs get 3");
+    check(system("pipes count > here.txt <<END\nfour\nEND") == 0 && strcmp(contents("here.txt"), "5 bytes\n") == 0,
+          "sh: a here-document");
+    check(system("X=x; cat > here2.txt <<-'END'\n\t$X\n\tEND\n") == 0 && strcmp(contents("here2.txt"), "$X\n") == 0,
+          "sh: <<- and a quoted delimiter");
+    check(system("exec 4< in.txt; read -r l <&4; read -r m <&4; echo \"${#l} [$m] $?\" > read4.txt") == 0
+              && strcmp(contents("read4.txt"), "4999 [] 1\n") == 0, "sh: read <&4 twice: one offset, so the second is at the end");
+    check(system("n=0; while read l; do n=$((n + 1)); done <<E\na\nb\nc\nE\necho $n > loop.txt") == 0
+              && strcmp(contents("loop.txt"), "3\n") == 0, "sh: while read ... done << - its variables kept");
+    check(system("{ echo a; pipes emit b; echo c; } > group.txt") == 0 && strcmp(contents("group.txt"), "a\nb\nc\n") == 0,
+          "sh: a group's output a file - the shell's and a program's, in order");
+    check(system("{ read a; pipes count; } < in.txt > split.txt") == 0 && strcmp(contents("split.txt"), "0 bytes\n") == 0,
+          "sh: a program reads on from where read got to");
+    check(system("echo first > rw.txt; echo X 1<> rw.txt") == 0 && strcmp(contents("rw.txt"), "X\nrst\n") == 0,
+          "sh: <> writes over the start");
+    check(system("exec > exec.txt; echo one; pipes emit two") == 0 && strcmp(contents("exec.txt"), "one\ntwo\n") == 0,
+          "sh: exec > - the shell's own output, for good");
+    check(system("exec pipes exit 6; exit 1") == 6 << 8, "sh: exec COMMAND - the shell ends with its status");
+    check(system("read x < none.txt") == 1 << 8, "sh: read < a file not there: 1");
 }
 
 static void environment(void)
@@ -408,6 +528,24 @@ int main(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "exit") == 0)
         return atoi(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "fdcount") == 0) {
+        int fd = atoi(argv[2]);
+        char buffer[512];
+        long total = 0;
+        ssize_t n;
+        while ((n = read(fd, buffer, sizeof buffer)) > 0)
+            total += n;
+        if (n < 0)
+            printf("%d: closed\n", fd);
+        else
+            printf("%ld bytes\n", total);
+        return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "fdwrite") == 0) {
+        char line[256];
+        int length = snprintf(line, sizeof line, "%s\n", argv[3]);
+        return write(atoi(argv[2]), line, (size_t)length) == length ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "env") == 0) {
         const char *value = getenv(argv[2]);
         printf("%s\n", value ? value : "(unset)");
@@ -419,6 +557,7 @@ int main(int argc, char **argv)
     files();
     commands();
     shell();
+    inherited();
     environment();
     if (failures) {
         printf("pipes: %d of %d checks failed\n", failures, checks);
