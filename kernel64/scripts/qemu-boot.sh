@@ -9,6 +9,8 @@
 # the limit for a kernel that hangs silently.
 #
 # Environment:
+#   TAAJ_ACCEL kvm or tcg (default tcg): the Makefile sets it, kvm when
+#              /dev/kvm can be opened
 #   QEMU_ARGS  extra QEMU options (for example the firmware)
 #   KEYS       QEMU key names to type once the keyboard driver is ready,
 #              through QEMU's monitor (`sendkey`) - e.g. "shift-h i ret".
@@ -59,7 +61,9 @@ MONITOR="$LOG.monitor"
 start_qemu() {
     rm -f "$LOG" "$LOG.ppm" "$LOG.hang.ppm" "$LOG.qemu" "$MONITOR"
     : > "$LOG"
-    qemu-system-x86_64 -m 512M -cdrom "$ISO" -boot d \
+    # TAAJ_ACCEL: kvm or tcg, worked out by TheTaaJ's Makefile (KVM when
+    # /dev/kvm can be opened); emulated when this script runs on its own.
+    qemu-system-x86_64 -accel "${TAAJ_ACCEL:-tcg}" -m 512M -cdrom "$ISO" -boot d \
         -smp "${SMP:-4}" -display none -no-reboot -serial "file:$LOG" \
         -monitor "unix:$MONITOR,server,nowait" \
         -d cpu_reset -D "$LOG.qemu" $DISK_ARGS ${QEMU_ARGS:-} &
