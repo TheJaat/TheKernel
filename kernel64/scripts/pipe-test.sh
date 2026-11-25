@@ -15,7 +15,8 @@
 #   with programs pipes      its checks: pipes in one program and between
 #                            two, file actions, system - with lists,
 #                            variables and the rest, through sh - popen,
-#                            the environment passed on - to make too
+#                            the environment passed on - to make too,
+#                            names of up to 64 bytes
 #                            ("pipes: N checks, all passed")
 #   with programs sh -c '...'    a list, typed
 #   with programs sh script.sh one 'two words'
@@ -30,7 +31,8 @@
 #   with programs make       again: nothing to do
 #   with files make refused  no right to start programs: refused
 #
-# and the files the recipes wrote are read off the disk afterwards.
+# and the files the recipes wrote, and the long-named ones pipes made,
+# are read off the disk afterwards.
 
 set -u
 ARCH=$1
@@ -198,5 +200,13 @@ part refused | grep -aq '^not run$' && fail "make, not given the right to start 
 [ "$(cat "$WORK/shell.txt")" = "counted: 5000 bytes" ] || fail "t/made-shell.txt is not what the recipe wrote: $(cat "$WORK/shell.txt")"
 "$TFSTOOL" get "$DISK" t/made-loop.txt > "$WORK/loop.txt" || fail "t/made-loop.txt cannot be read off the disk"
 printf 'a\nb\n' | cmp -s - "$WORK/loop.txt" || fail "t/made-loop.txt is not what the recipe's loop wrote: $(cat "$WORK/loop.txt")"
+# Names of 40 to 64 bytes, written by pipes.c on TheTaaJ (a version-5
+# volume now), read here by the host's tool.
+LONG=the-longest-name-a-file-may-have-here-is-sixty-four-bytes-long.c
+INSIDE=a-directory-of-forty-bytes-in-its-name.d/a-file-name-of-fifty-bytes-made-for-taajfs-v5.text
+[ "$("$TFSTOOL" get "$DISK" "t/$LONG")" = long ] || fail "t/$LONG cannot be read off the disk"
+[ "$("$TFSTOOL" get "$DISK" "t/$INSIDE")" = inside ] || fail "t/$INSIDE cannot be read off the disk"
+"$TFSTOOL" dump "$DISK" > "$WORK/dump.txt" || fail "the disk does not dump clean"
+grep -q '^format version 5:' "$WORK/dump.txt" || fail "the disk did not become version 5"
 
-echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script with if, for, while read, case, a function, exec 3< and a here-document; make ran recipes with <, >, |, 2>&1, \$(...) and a loop"
+echo "pipes on TheTaaJ ($ARCH): $CHECKS checks of pipes, file actions, system, sh, popen and the environment passed; sh ran a list and a script with if, for, while read, case, a function, exec 3< and a here-document; make ran recipes with <, >, |, 2>&1, \$(...) and a loop; names of up to 64 bytes on the disk"

@@ -157,11 +157,11 @@ put_tree() { # put_tree FROM TO: every file under FROM, at TO on the disk
     done
     for file in $(cd "$1" && find . -type f | sort); do
         file=${file#./}
-        # TaajFS names are at most 27 bytes; the few of clang's headers
-        # with longer names (CUDA's, HIP's, Hexagon's, and one of the
-        # PC's AVX-512 headers) are not on the disk. Nothing here
-        # includes them.
-        if [ "$(basename "$file" | wc -c)" -gt 28 ]; then
+        # TaajFS names are at most 64 bytes (27 before version 5, when
+        # CUDA's, HIP's, Hexagon's and one AVX-512 header were left
+        # out). None of clang's is longer now; one that was would be
+        # left out and named at the end.
+        if [ "$(basename "$file" | wc -c)" -gt 65 ]; then
             echo "$file" >> "$WORK/left-out"
             continue
         fi
@@ -301,5 +301,5 @@ echo "clang on TheTaaJ ($ARCH) wrote, byte for byte as the host's:$same"
 echo "ld.lld on TheTaaJ ($ARCH) linked, byte for byte as the build's own programs:$linked"
 echo "clang on TheTaaJ ($ARCH) compiled and linked chello in one, starting ld.lld itself: the build's chello, byte for byte"
 echo "the timed steps took (s): $times"
-[ -s "$WORK/left-out" ] && echo "clang's headers not on the disk (names over 27 bytes): $(tr '\n' ' ' < "$WORK/left-out")"
+[ -s "$WORK/left-out" ] && echo "clang's headers not on the disk (names over 64 bytes): $(tr '\n' ' ' < "$WORK/left-out")"
 exit 0

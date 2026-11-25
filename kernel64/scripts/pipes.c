@@ -22,8 +22,10 @@
  *                         bytes a call: a pattern a checker can know
  *   pipes stdio FILE KB   the same through stdio, 100-byte lines */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -334,6 +336,54 @@ static void files(void)
     posix_spawn_file_actions_destroy(&actions);
 }
 
+/* Whether the directory `path` lists `name`. */
+static int lists(const char *path, const char *name)
+{
+    DIR *dir = opendir(path);
+    int found = 0;
+    for (struct dirent *e; dir && (e = readdir(dir)) != NULL;)
+        found |= strcmp(e->d_name, name) == 0;
+    if (dir)
+        closedir(dir);
+    return found;
+}
+
+/* Names longer than 27 bytes, on TaajFS since version 5: up to NAME_MAX
+ * (64), in two of a directory's slots. pipe-test.sh reads the files left
+ * here off the disk afterwards, with the host's tool. */
+static void long_names(void)
+{
+    const char *file = "a-file-name-of-fifty-bytes-made-for-taajfs-v5.text";
+    const char *most = "the-longest-name-a-file-may-have-here-is-sixty-four-bytes-long.c";
+    const char *dir = "a-directory-of-forty-bytes-in-its-name.d";
+    char path[160];
+    check(NAME_MAX == 64 && strlen(file) == 50 && strlen(most) == 64 && strlen(dir) == 40, "NAME_MAX is 64");
+
+    int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    check(fd >= 0 && write(fd, "long\n", 5) == 5 && close(fd) == 0, "a file of a 50-byte name made and written");
+    check(strcmp(contents(file), "long\n") == 0, "and read back by that name");
+    check(lists(".", file), "the directory lists it, whole");
+    check(rename(file, most) == 0, "renamed to 64 bytes");
+    struct stat status;
+    errno = 0;
+    check(stat(most, &status) == 0 && status.st_size == 5 && stat(file, &status) == -1 && errno == ENOENT,
+          "there under the new name, not the old");
+
+    char too_long[NAME_MAX + 2];
+    memset(too_long, 'n', NAME_MAX + 1);
+    too_long[NAME_MAX + 1] = 0;
+    errno = 0;
+    check(open(too_long, O_WRONLY | O_CREAT, 0644) == -1 && errno == ENAMETOOLONG, "65 bytes: ENAMETOOLONG");
+    errno = 0;
+    check(mkdir(too_long, 0755) == -1 && errno == ENAMETOOLONG && !lists(".", too_long), "for mkdir too, and nothing made");
+
+    check(mkdir(dir, 0755) == 0, "a directory of a 40-byte name");
+    snprintf(path, sizeof path, "pipes emit inside > %s/%s", dir, file);
+    check(system(path) == 0, "sh writes a file of a long name in it");
+    snprintf(path, sizeof path, "%s/%s", dir, file);
+    check(strcmp(contents(path), "inside\n") == 0 && lists(dir, file), "there, and listed");
+}
+
 static void commands(void)
 {
     check(system("pipes emit one two three | pipes count > counted.txt") == 0, "system: a pipe and a redirection");
@@ -632,6 +682,7 @@ int main(int argc, char **argv)
     in_one_program();
     between_programs();
     files();
+    long_names();
     commands();
     shell();
     inherited();
