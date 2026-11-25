@@ -16,7 +16,11 @@
  *   pipes env NAME        prints NAME's value, or "(unset)"
  *   pipes fdcount N       reads descriptor N to its end: "N bytes", or
  *                         "N: closed" if it has no N
- *   pipes fdwrite N WORD  writes WORD and a new line to descriptor N */
+ *   pipes fdwrite N WORD  writes WORD and a new line to descriptor N
+ *   pipes fill FILE KB PIECE
+ *                         writes KB kilobytes to FILE with write(), PIECE
+ *                         bytes a call: a pattern a checker can know
+ *   pipes stdio FILE KB   the same through stdio, 100-byte lines */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -58,7 +62,7 @@ static size_t drain(int fd, char *out, size_t room)
 /* A file's contents, as text. */
 static const char *contents(const char *path)
 {
-    static char buffer[65536];
+    static char buffer[262144];
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return "(none)";
@@ -84,6 +88,60 @@ static int status_of(pid_t child)
     if (waitpid(child, &status, 0) != child)
         return -1;
     return status;
+}
+
+/* `total` bytes of a pattern a checker can know - byte n is 'a' + n %
+ * 26 - written to `path` with write(), `piece` bytes a call; `how`
+ * O_TRUNC to start afresh, O_APPEND to add (the pattern going on). 0
+ * if all went in. */
+static int fill(const char *path, long total, long piece, int how)
+{
+    char *buffer = malloc((size_t)piece);
+    int fd = open(path, O_WRONLY | O_CREAT | how, 0644);
+    if (fd < 0 || buffer == NULL)
+        return 1;
+    long start = how == O_APPEND ? lseek(fd, 0, SEEK_END) : 0;
+    for (long at = 0; at < total; at += piece) {
+        long n = total - at < piece ? total - at : piece;
+        for (long i = 0; i < n; i++)
+            buffer[i] = (char)('a' + (start + at + i) % 26);
+        if (write(fd, buffer, (size_t)n) != n)
+            return 2;
+    }
+    free(buffer);
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* Whether `path` is `size` bytes of fill's pattern. */
+static int is_pattern(const char *path, long size)
+{
+    static char buffer[8192];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    long at = 0;
+    ssize_t n;
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) {
+        for (ssize_t i = 0; i < n; i++)
+            if (buffer[i] != (char)('a' + (at + i) % 26)) {
+                close(fd);
+                return 0;
+            }
+        at += n;
+    }
+    close(fd);
+    return at == size;
+}
+
+/* `count` lines of 100 bytes through stdio; 0 if all went in. */
+static int stdio_lines(const char *path, long count)
+{
+    FILE *out = fopen(path, "w");
+    if (out == NULL)
+        return 1;
+    for (long n = 0; n < count; n++)
+        fprintf(out, "line %08ld of the stdio test, written with fprintf, one hundred bytes long, give or take........\n", n);
+    return fclose(out) == 0 ? 0 : 3;
 }
 
 static void in_one_program(void)
@@ -234,6 +292,21 @@ static void files(void)
     posix_spawn_file_actions_destroy(&actions);
     close(fd);
     check(child > 0 && status_of(child) == 0 && strcmp(contents("given.txt"), "given\n") == 0, "a file open here, given");
+
+    /* Big writes. More than a message holds goes to the file service
+     * in a memory object (WRITE_FROM), up to 1 MiB a request: one
+     * write() of 1.5 MiB is two of them; then 300 KB added in 7000-byte
+     * writes; the whole read back. And stdio's 64 KB buffer for a file. */
+    check(fill("big.dat", 1536 * 1024, 1536 * 1024, O_TRUNC) == 0 && is_pattern("big.dat", 1536 * 1024),
+          "one write() of 1.5 MiB: all of it, right");
+    check(fill("big.dat", 300 * 1024, 7000, O_APPEND) == 0 && is_pattern("big.dat", 1836 * 1024),
+          "and 300 KB more in 7000-byte writes, O_APPEND");
+    check(unlink("big.dat") == 0, "and it can go");
+    check(stdio_lines("lines.txt", 2000) == 0, "2000 lines through stdio");
+    struct stat lines_stat;
+    check(stat("lines.txt", &lines_stat) == 0 && lines_stat.st_size == 200000, "200000 bytes of them");
+    const char *last = contents("lines.txt");
+    check(strncmp(last + 199900, "line 00001999 of the stdio test", 31) == 0, "the last where it belongs");
 
     /* Not there, and not to be made: not started. */
     posix_spawn_file_actions_init(&actions);
@@ -541,6 +614,10 @@ int main(int argc, char **argv)
             printf("%ld bytes\n", total);
         return 0;
     }
+    if (argc == 5 && strcmp(argv[1], "fill") == 0)
+        return fill(argv[2], atol(argv[3]) * 1024, atol(argv[4]), O_TRUNC);
+    if (argc == 4 && strcmp(argv[1], "stdio") == 0)
+        return stdio_lines(argv[2], atol(argv[3]) * 1024 / 100);
     if (argc == 4 && strcmp(argv[1], "fdwrite") == 0) {
         char line[256];
         int length = snprintf(line, sizeof line, "%s\n", argv[3]);

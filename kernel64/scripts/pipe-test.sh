@@ -123,7 +123,7 @@ put() {
 }
 
 rm -f "$DISK"
-"$TFSTOOL" mkfs "$DISK" 1024 > /dev/null && truncate -s 4M "$DISK" || fail "cannot make the disk"
+"$TFSTOOL" mkfs "$DISK" 2048 > /dev/null && truncate -s 8M "$DISK" || fail "cannot make the disk"
 put pipes "$PIPES"
 put make "$MAKE"
 put cat "$CAT"
