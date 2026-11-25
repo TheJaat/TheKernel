@@ -76,6 +76,9 @@ struct Thread {
     /// variables. Kept here while the thread is not running, loaded into
     /// the CPU when it is switched to (see `schedule`).
     pointer: u64,
+    /// A thread of a program: the stack its signals marked "on stack"
+    /// are delivered on (SIGNAL_STACK) - base and size; size 0, none.
+    signal_stack: (u64, u64),
 }
 
 /// The address space loaded in each CPU's CR3 now, to skip reloading
@@ -124,8 +127,9 @@ pub fn init() {
         process: None,
         entry: Some(Box::new(idle_loop)),
         pointer: 0,
+        signal_stack: (0, 0),
     };
-    let boot = Thread { name: "boot", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0 };
+    let boot = Thread { name: "boot", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0, signal_stack: (0, 0) };
     ACTIVE_ROOT[0].store(mm::kernel_root(), Ordering::Relaxed);
 
     let mut table = BTreeMap::new();
@@ -160,7 +164,7 @@ pub fn add_cpus(count: usize) {
             // Like the boot thread: it runs on the stack the CPU was
             // started on, which nobody frees, and its `rsp` is filled in
             // the first time it is switched away from.
-            let idle = Thread { name: "idle", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0 };
+            let idle = Thread { name: "idle", rsp: 0, _stack: None, stack_top: None, process: None, entry: None, pointer: 0, signal_stack: (0, 0) };
             t.table.insert(id, Box::new(idle));
             assert_eq!(t.policy.add_cpu(id), cpu);
         }
@@ -233,7 +237,7 @@ pub fn try_spawn_in(
     let rsp = unsafe { context::initial_stack(stack.top()) };
     let stack_top = Some(stack.top());
     let thread =
-        Box::new(Thread { name, rsp, _stack: Some(stack), stack_top, process, entry: Some(Box::new(f)), pointer });
+        Box::new(Thread { name, rsp, _stack: Some(stack), stack_top, process, entry: Some(Box::new(f)), pointer, signal_stack: (0, 0) });
     Some(with(|t| {
         let id = t.next_id;
         t.next_id += 1;
@@ -256,6 +260,34 @@ pub fn set_pointer(value: u64) {
         // uses neither FS nor TPIDR_EL0.
         unsafe { context::load_thread_pointer(value) };
     });
+}
+
+/// SIGNAL_STACK: the running thread's signal stack, `size` bytes from
+/// `base` (size 0: none).
+pub fn set_signal_stack(base: u64, size: u64) -> Result<u64, abi::Error> {
+    if size != 0 {
+        if size < abi::SIGNAL_STACK_MIN {
+            return Err(abi::Error::InvalidArgument);
+        }
+        if base.checked_add(size).is_none_or(|end| end > abi::USER_END) {
+            return Err(abi::Error::BadAddress);
+        }
+    }
+    with(|t| {
+        let id = t.policy.current(arch::cpu());
+        if let Some(thread) = t.table.get_mut(&id) {
+            thread.signal_stack = if size == 0 { (0, 0) } else { (base, size) };
+        }
+    });
+    Ok(0)
+}
+
+/// The running thread's signal stack: (base, size), size 0 for none.
+pub fn signal_stack() -> (u64, u64) {
+    with(|t| {
+        let id = t.policy.current(arch::cpu());
+        t.table.get(&id).map_or((0, 0), |thread| thread.signal_stack)
+    })
 }
 
 /// The thread running on this CPU.

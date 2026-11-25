@@ -53,6 +53,7 @@ mod signals;
 #[cfg(target_arch = "aarch64")]
 mod mmio_devices;
 mod programs;
+mod random;
 mod selftest;
 mod syscall;
 mod threads;
@@ -771,6 +772,11 @@ fn read_madt(rsdp: u64) -> Madt {
 /// reading, if there was one, and says what the date is.
 fn start_clock(rtc: Option<u64>, name: &str) {
     clock::start(rtc);
+    let (instruction, from_cpu, timings) = random::init(rtc.unwrap_or(0));
+    match from_cpu {
+        0 => kprintln!("[random] seeded from {timings} timings (no random instruction on this CPU)"),
+        n => kprintln!("[random] seeded from {n} numbers from {instruction} and {timings} timings"),
+    }
     match rtc {
         Some(seconds) => {
             kprintln!("[clock] {} says {} UTC; time is counted from here at {} Hz", name, kernel64::rtc::Date::from_unix_seconds(seconds), arch::clock_hz())

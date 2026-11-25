@@ -207,10 +207,12 @@ pub mod call {
     /// counter, so finer than a tick; InvalidArgument for another
     /// `which`.
     pub const CLOCK: u64 = 34;
-    /// signal_setup(entry, caught, ignored) - how this process takes
-    /// signals (see `signal`): `entry` is where a caught one is
-    /// delivered (0: none is), `caught` and `ignored` are masks, bit n
-    /// for signal n. A signal in neither does what it does by default:
+    /// signal_setup(entry, caught, ignored, on_stack) - how this
+    /// process takes signals (see `signal`): `entry` is where a caught
+    /// one is delivered (0: none is), `caught` and `ignored` are masks,
+    /// bit n for signal n, and so is `on_stack`: the caught signals
+    /// delivered on the thread's signal stack (SIGNAL_STACK), if it has
+    /// one and is not on it already - POSIX's SA_ONSTACK. A signal in neither does what it does by default:
     /// ends the process, with the exit code signal::exit_code(n), or
     /// nothing for those in signal::IGNORED_BY_DEFAULT. SIGKILL is never
     /// caught or ignored.
@@ -231,7 +233,39 @@ pub mod call {
     /// only cancels. Returns the nanoseconds the earlier one had left,
     /// or 0. At most ALARM_MAX.
     pub const ALARM: u64 = 38;
+    /// random(buffer, length) - fills `length` bytes at `buffer` (at
+    /// most RANDOM_MAX) with random bytes from the kernel's generator
+    /// (ChaCha20, seeded at boot from the CPU's random instruction where
+    /// there is one and from timing jitter, and mixed with the time of
+    /// every timer tick since). Never blocks. Returns `length`.
+    pub const RANDOM: u64 = 39;
+    /// program_headers(buffer, length) - copies this program's ELF
+    /// program headers (56 bytes each, as in its file) to `buffer`, as
+    /// many as fit in `length` bytes; returns how many bytes they all
+    /// take. What libc needs to find the thread-local storage template
+    /// (PT_TLS) and to answer dl_iterate_phdr.
+    pub const PROGRAM_HEADERS: u64 = 40;
+    /// signal_stack(base, size) - the stack this thread's signals
+    /// marked "on stack" (signal_setup) are delivered on: `size` bytes
+    /// from `base`; size 0 means none. Each thread has its own.
+    /// InvalidArgument for a size below SIGNAL_STACK_MIN (other than 0),
+    /// BadAddress for one outside the program's memory.
+    pub const SIGNAL_STACK: u64 = 41;
+    /// process_notify(process, signal) - `signal` to this process when
+    /// the process a handle names ends (at once, if it has): how a
+    /// program that started a child through init learns of its end -
+    /// libc asks for SIGCHLD. Any right to the handle will do.
+    pub const PROCESS_NOTIFY: u64 = 42;
 }
+
+/// The most RANDOM gives in one call.
+pub const RANDOM_MAX: u64 = 1 << 20;
+
+/// The smallest signal stack: room for the context the kernel pushes
+/// and libc's floating-point save, with a little to run C in (POSIX's
+/// MINSIGSTKSZ is 2048 on Linux x86_64; TheTaaJ's AArch64 save is
+/// bigger).
+pub const SIGNAL_STACK_MIN: u64 = 4096;
 
 /// The longest alarm: a year.
 pub const ALARM_MAX: u64 = 366 * 24 * 3600 * 1_000_000_000;

@@ -56,9 +56,21 @@ pub fn deliver_pending(frame: &mut impl UserFrame) {
 pub fn deliver(frame: &mut impl UserFrame, signal: u64, entry: u64) {
     let mut context = frame.context();
     context.signal = signal;
+    // On the thread's signal stack, if the signal asks for it and the
+    // thread has one it is not already on (a signal during a handler
+    // there stacks below the first, as on any stack). That is how a
+    // program hears of its own stack overflowing: its stack has no room
+    // for the context, the signal stack has.
+    let (base, size) = crate::threads::signal_stack();
+    let sp = frame.stack();
+    let top = if size != 0 && !(base..base + size).contains(&sp) && crate::process::signal_on_stack(signal) {
+        base + size
+    } else {
+        sp
+    };
     // 16-byte aligned, below the red zone. The stack is the program's;
     // a value that wraps is no stack at all.
-    let at = frame.stack().checked_sub(STACK_SKIP + CONTEXT_SIZE as u64).map(|at| at & !15);
+    let at = top.checked_sub(STACK_SKIP + CONTEXT_SIZE as u64).map(|at| at & !15);
     match at.map(|at| (at, process::copy_to_user(at, &context.to_bytes()))) {
         Some((at, Ok(()))) => frame.enter(entry, at, signal, at),
         _ => process::kill_current("no room on its stack for a signal"),

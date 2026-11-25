@@ -429,6 +429,22 @@ pub fn signal(handle: Handle, signal: u64) -> Result<u64, Error> {
     Ok(0)
 }
 
+/// PROCESS_NOTIFY: `signal` to the caller when the process `handle`
+/// names ends. Any right to the handle will do: whoever may wait for a
+/// process may as well be told it ended.
+pub fn notify(handle: Handle, signal: u64) -> Result<u64, Error> {
+    if !(1..=abi::signal::MAX).contains(&signal) {
+        return Err(Error::InvalidArgument);
+    }
+    let me = me()?;
+    let target = match me.handles.lock().get(handle, Rights(0))? {
+        Object::Process(target) => Arc::clone(target),
+        _ => return Err(Error::WrongType),
+    };
+    process::notify_on_end(&target, &me, signal);
+    Ok(0)
+}
+
 /// Waits for any of several processes to end.
 pub fn wait(handles: u64, count: u64, code: u64) -> Result<u64, Error> {
     if count == 0 || count > abi::SPAWN_HANDLES_MAX {

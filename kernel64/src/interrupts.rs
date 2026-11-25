@@ -35,6 +35,9 @@ pub fn timer_tick() {
         // Only this CPU writes it, with interrupts off.
         let now = counted.max(TICKS.load(Ordering::Relaxed));
         TICKS.store(now, Ordering::Relaxed);
+        // When exactly the tick came, to the counter's step: a little
+        // of the unpredictable, for the random numbers.
+        crate::random::add(crate::arch::clock());
         crate::threads::on_tick(now);
         // Programs' output waits in a queue for an idle moment; on a
         // busy machine this is the only moment there is.
