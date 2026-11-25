@@ -1,6 +1,7 @@
 //! x86_64.
 
 mod apic;
+pub mod cmos;
 pub mod context;
 mod entry;
 mod gdt;

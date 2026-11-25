@@ -325,6 +325,51 @@ const NAMES: [&str; 32] = [
     "reserved",
 ];
 
+/// The signal a fault in user mode means, if it means one (abi::signal).
+fn fault_signal(vector: u64) -> Option<u64> {
+    use abi::signal::*;
+    match vector {
+        0 | 16 | 19 => Some(SIGFPE),  // divide error, x87 and SIMD errors
+        6 => Some(SIGILL),            // invalid opcode
+        17 => Some(SIGBUS),           // alignment check
+        11 | 12 | 13 | 14 => Some(SIGSEGV), // not present, stack, protection, page
+        _ => None,
+    }
+}
+
+impl crate::signals::UserFrame for InterruptFrame {
+    fn context(&self) -> abi::signal::Context {
+        let mut context = abi::signal::Context::zeroed();
+        let f = self;
+        let registers = [f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15];
+        context.registers[..15].copy_from_slice(&registers);
+        context.sp = f.rsp;
+        context.pc = f.rip;
+        context.flags = f.rflags;
+        context
+    }
+
+    fn restore(&mut self, context: &abi::signal::Context) {
+        let r = &context.registers;
+        (self.rax, self.rbx, self.rcx, self.rdx, self.rsi, self.rdi, self.rbp) = (r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+        (self.r8, self.r9, self.r10, self.r11, self.r12, self.r13, self.r14, self.r15) = (r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14]);
+        self.rsp = context.sp;
+        self.rip = context.pc;
+        self.rflags = super::syscall::user_flags(context.flags);
+    }
+
+    fn enter(&mut self, entry: u64, stack: u64, signal: u64, context: u64) {
+        self.rip = entry;
+        self.rsp = stack;
+        self.rdi = signal;
+        self.rsi = context;
+    }
+
+    fn stack(&self) -> u64 {
+        self.rsp
+    }
+}
+
 const NMI: u64 = 2;
 const BREAKPOINT: u64 = 3;
 const DOUBLE_FAULT: u64 = 8;
@@ -370,7 +415,7 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         // makes a system call still passes here on every timer tick: if
         // it has been asked to end meanwhile, this is where it does.
         if frame.cs & 3 == 3 {
-            crate::process::stop_if_killed();
+            crate::signals::on_return(frame);
         }
         return;
     }
@@ -396,7 +441,7 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         if frame.vector == PAGE_FAULT && frame.error_code & (1 | 16) == 0 {
             match crate::process::fault_in(read_cr2(), frame.error_code & 2 != 0) {
                 crate::process::Fault::Filled => {
-                    crate::process::stop_if_killed();
+                    crate::signals::on_return(frame);
                     return;
                 }
                 crate::process::Fault::NotOurs => {}
@@ -406,8 +451,15 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
                 }
             }
         }
-        // Otherwise the program broke a rule. Kill it; the kernel
-        // carries on.
+        // Otherwise the program broke a rule. If it catches the signal
+        // the fault means, its handler runs; if not, it ends. Either
+        // way the kernel carries on.
+        if let Some(signal) = fault_signal(frame.vector) {
+            if let Some(entry) = crate::process::fault_signal(signal) {
+                crate::signals::deliver(frame, signal, entry);
+                return;
+            }
+        }
         kprintln!("[process] {name} at {:#x} in user mode", frame.rip);
         if frame.vector == PAGE_FAULT {
             report_page_fault(frame.error_code);

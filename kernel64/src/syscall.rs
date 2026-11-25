@@ -27,8 +27,11 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
             Ok(0)
         }
         call::SLEEP if args[0] <= MAX_SLEEP => {
-            threads::sleep(args[0]);
-            Ok(0)
+            if threads::sleep(args[0]) {
+                Ok(0)
+            } else {
+                Err(Error::Interrupted)
+            }
         }
         call::SLEEP => Err(Error::InvalidArgument),
         call::PROCESS_ID => Ok(process::current().map_or(0, |p| p.pid)),
@@ -65,6 +68,13 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::MEMORY_RESERVE => process::reserve_memory(args[0], args[1]),
         call::MEMORY_LIMIT => process::memory_limit(args[0]),
         call::MEMORY_USED => process::memory_used(),
+        call::CLOCK => crate::clock::read(args[0]),
+        call::SIGNAL_SETUP => process::signal_setup(args[0], args[1], args[2]),
+        call::SIGNAL_SEND => ipc::signal(args[0], args[1]),
+        call::ALARM => crate::alarms::set(args[0]),
+        // Taken before dispatch, by the architecture's own code: it
+        // changes every register. Here only if that code did not.
+        call::SIGNAL_RETURN => Err(Error::UnknownCall),
         _ => Err(Error::UnknownCall),
     };
     // The way back to user mode: where a process someone asked to end,

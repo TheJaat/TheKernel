@@ -14,14 +14,27 @@ use crate::threads::WaitQueue;
 pub const HZ: u64 = abi::TICKS_PER_SECOND;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// The boot CPU's timer interrupts: how many came, which is not quite
+/// how many ticks there have been (clock.rs).
+static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
 /// A timer interrupt, on whichever CPU it arrived. Every CPU has its
 /// own timer, at the same rate, for its own time slices. Time itself -
 /// the tick count, and waking sleepers - is kept by the boot CPU alone:
 /// four CPUs counting would make a second four times too short.
+///
+/// The tick count is the counter's (clock::ticks), not the number of
+/// interrupts: an interrupt that came late, or two merged into one,
+/// moves it on by as many ticks as really passed. It never goes back;
+/// an interrupt that comes a hair early leaves it where it was, and the
+/// next one catches up. (Before the clock starts, it is the interrupts.)
 pub fn timer_tick() {
     if crate::arch::cpu() == 0 {
-        let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        let interrupts = INTERRUPTS.fetch_add(1, Ordering::Relaxed) + 1;
+        let counted = if crate::clock::started() { crate::clock::ticks() } else { interrupts };
+        // Only this CPU writes it, with interrupts off.
+        let now = counted.max(TICKS.load(Ordering::Relaxed));
+        TICKS.store(now, Ordering::Relaxed);
         crate::threads::on_tick(now);
         // Programs' output waits in a queue for an idle moment; on a
         // busy machine this is the only moment there is.
@@ -53,6 +66,11 @@ pub fn interrupt_done() {
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// The boot CPU's timer interrupts so far.
+pub fn timer_interrupts() -> u64 {
+    INTERRUPTS.load(Ordering::Relaxed)
 }
 
 /// A device's interrupt, as a kernel object a driver holds a handle to.

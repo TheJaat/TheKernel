@@ -79,6 +79,15 @@ pub struct Process {
     exit_code: AtomicI64,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,
+    /// The exit code that end will have: STOPPED, or a signal's.
+    kill_code: AtomicI64,
+    /// Signals (abi::signal), a bit for each: those sent and caught but
+    /// not yet delivered, and what signal_setup said - which are caught,
+    /// which ignored, and where caught ones go.
+    signals_pending: AtomicU64,
+    signals_caught: AtomicU64,
+    signals_ignored: AtomicU64,
+    signal_entry: AtomicU64,
     /// Its threads that have not ended: whom a kill, or the end of the
     /// process, wakes. At most THREADS_MAX.
     threads: IrqLock<Vec<ThreadId>>,
@@ -493,6 +502,11 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         tables: IrqLock::new(Some(tables)),
         exit_code: AtomicI64::new(RUNNING),
         kill_requested: AtomicBool::new(false),
+        kill_code: AtomicI64::new(abi::STOPPED),
+        signals_pending: AtomicU64::new(0),
+        signals_caught: AtomicU64::new(0),
+        signals_ignored: AtomicU64::new(0),
+        signal_entry: AtomicU64::new(0),
         threads: IrqLock::new(Vec::new()),
         handles: IrqLock::new(CapTable::new(abi::HANDLES_MAX)),
         io_ports: IrqLock::new(PortBitmap::NONE),
@@ -687,8 +701,17 @@ pub fn kill_current(reason: &str) -> ! {
 /// How long it takes: a waiting thread ends the next time it runs; one
 /// computing in user mode, at the next timer tick - 10 ms at most.
 pub fn kill(target: &Arc<Process>) {
+    kill_with(target, abi::STOPPED);
+}
+
+/// `kill`, ending the process with `code` - unless a kill is already
+/// on its way, whose code stays.
+fn kill_with(target: &Arc<Process>, code: i64) {
     if target.exit_code().is_some() {
         return; // already ended
+    }
+    if !target.kill_requested() {
+        target.kill_code.store(code, Ordering::Release);
     }
     // The flag first (in `stop_other_threads`): a thread woken before
     // it was set would only go back to waiting.
@@ -698,9 +721,97 @@ pub fn kill(target: &Arc<Process>) {
 /// Ends the current process if a kill was asked for. Called only where
 /// the thread is about to return to user mode.
 pub fn stop_if_killed() {
-    if current().is_some_and(|process| process.kill_requested()) {
-        end_current(abi::STOPPED, format_args!("stopped: killed by request"));
+    // The code only - not the process: end_current never returns, so a
+    // reference held across it would never be dropped, and the process
+    // never freed.
+    let code = current().filter(|process| process.kill_requested()).map(|process| process.kill_code.load(Ordering::Acquire));
+    if let Some(code) = code {
+        match code {
+            abi::STOPPED => end_current(code, format_args!("stopped: killed by request")),
+            _ => {
+                let signal = abi::signal::of_exit_code(code).unwrap_or(0);
+                end_current(code, format_args!("ended by signal {signal} ({})", abi::signal::name(signal)))
+            }
+        }
     }
+}
+
+// ---- signals ---------------------------------------------------------
+//
+// What the kernel does with a signal depends on three things the
+// process told it (signal_setup): caught ones wait in `signals_pending`
+// for a thread to take on its way to user mode (signals.rs delivers
+// it); ignored ones are dropped as they come; any other ends the
+// process, as a kill does, with the signal's exit code. A
+// program that never asked - every Rust program on the taaj crate -
+// has nothing caught and nothing ignored: Ctrl+C ends it.
+
+/// signal_setup: where caught signals go, and which are caught and
+/// which ignored. SIGKILL is neither, whatever the masks say.
+pub fn signal_setup(entry: u64, caught: u64, ignored: u64) -> Result<u64, Error> {
+    if entry >= abi::USER_END {
+        return Err(Error::InvalidArgument);
+    }
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let never = abi::signal::bit(abi::signal::SIGKILL) | 1; // and bit 0, no signal
+    process.signal_entry.store(entry, Ordering::Release);
+    process.signals_ignored.store(ignored & !never, Ordering::Release);
+    process.signals_caught.store(if entry == 0 { 0 } else { caught & !never }, Ordering::Release);
+    Ok(0)
+}
+
+/// Sends `signal` to `target` (see above for what that does).
+pub fn send_signal(target: &Arc<Process>, signal: u64) {
+    use abi::signal::{bit, exit_code, IGNORED_BY_DEFAULT, SIGKILL};
+    if target.exit_code().is_some() {
+        return;
+    }
+    if signal == SIGKILL {
+        return kill_with(target, exit_code(SIGKILL));
+    }
+    let bit = bit(signal);
+    if target.signals_caught.load(Ordering::Acquire) & bit != 0 {
+        // Pending first, then the wake-up: a thread woken looks for it
+        // (threads.rs, rule 2), and one that was not waiting finds it
+        // on its way back to user mode.
+        target.signals_pending.fetch_or(bit, Ordering::AcqRel);
+        for &thread in target.threads.lock().iter() {
+            threads::wake(thread);
+        }
+    } else if (target.signals_ignored.load(Ordering::Acquire) | IGNORED_BY_DEFAULT) & bit == 0 {
+        kill_with(target, exit_code(signal));
+    }
+}
+
+/// Whether the current process has a caught signal waiting: a wait it
+/// is in ends early (threads.rs), so that the signal is taken.
+pub fn signal_waiting() -> bool {
+    current().is_some_and(|process| process.signals_pending.load(Ordering::Acquire) != 0)
+}
+
+/// Takes the lowest-numbered signal waiting for the current process, if
+/// one is: (the signal, where to deliver it). Another thread may take
+/// it first; each signal is taken once.
+pub fn take_signal() -> Option<(u64, u64)> {
+    let process = current()?;
+    let mut pending = process.signals_pending.load(Ordering::Acquire);
+    while pending != 0 {
+        let signal = u64::from(pending.trailing_zeros());
+        let bit = abi::signal::bit(signal);
+        match process.signals_pending.compare_exchange(pending, pending & !bit, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some((signal, process.signal_entry.load(Ordering::Acquire))),
+            Err(now) => pending = now,
+        }
+    }
+    None
+}
+
+/// Where a fault's signal (SIGSEGV, SIGILL, ...) goes, if the current
+/// process catches it. None: the fault ends the process, as always.
+pub fn fault_signal(signal: u64) -> Option<u64> {
+    let process = current()?;
+    let entry = process.signal_entry.load(Ordering::Acquire);
+    (entry != 0 && process.signals_caught.load(Ordering::Acquire) & abi::signal::bit(signal) != 0).then_some(entry)
 }
 
 /// The physical address behind each page of `pointer..pointer+length`

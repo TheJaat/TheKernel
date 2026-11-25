@@ -170,7 +170,7 @@ boot() {
         # them, never shorten them much), registers kept, masking kept.
         need "$log" "\[irq\] GIC version $gic: 288 interrupt lines, all off but the timer's"
         need "$log" "\[timer\] the CPU's own: counts at [0-9]+ Hz, interrupt 27, 100 ticks a second"
-        need "$log" "\[selftest\] timer: 10 ticks in (9[0-9]|[12][0-9][0-9]) ms \(expected 100\)"
+        need "$log" "\[selftest\] timer: 10 interrupts in (9[0-9]|[12][0-9][0-9]) ms \(expected 100\)"
         need "$log" "\[selftest\] context switch: there and back with a known value in each of 11 registers, none changed"
         need "$log" "\[selftest\] interrupts: 5 taken with a known value in each of 28 registers, none changed"
         need "$log" "\[selftest\] interrupts masked for 35 ms: no tick arrived; unmasked: [3-9] counted at once"
@@ -231,7 +231,7 @@ boot() {
                 did="read-only - every write refused"; mode=", read-only"; checks=340
             fi
             need "$log" "\[virtio\] 0xa003e00 block device: registers in the page at 0xa003000, 192 KiB DMA at 0x4[0-9a-f]+000, interrupt 79, off until its driver waits - ready for a driver"
-            need "$log" "\[blk\] virtio disk at 0xa003e00: 6143 sectors \(3071 KiB\)$mode, queue of 1024, interrupts"
+            need "$log" "\[blk\] virtio disk at 0xa003e00: 6143 sectors \(3071 KiB\)$mode(, a write cache \(flushed on commit\))?, queue of 1024, interrupts"
             need "$log" "\[blkcheck\] $checks checks, all passed: 6143 sectors, $did"
             # Twice: the second driver takes over the device the first left.
             [ "$(grep -ac "^\[blkcheck\] $checks checks, all passed" "$log")" -eq 2 ] || fail "the disk test did not run exactly twice"

@@ -168,22 +168,34 @@ fn heap() {
 /// calibrated separately against the PIT; on AArch64 the CPU's
 /// counter).
 pub fn timer() {
+    // The interrupts themselves, not the ticks: the tick count is now
+    // worked out from the counter (clock.rs), and measuring it with the
+    // counter would measure nothing.
     let tsc_hz = arch::clock_hz();
-    let first = interrupts::ticks();
-    // Line up with a tick boundary, then count ten.
-    while interrupts::ticks() == first {
+    let first = interrupts::timer_interrupts();
+    // Line up with an interrupt, then count ten.
+    while interrupts::timer_interrupts() == first {
         arch::wait_for_interrupt();
     }
-    let start_ticks = interrupts::ticks();
+    let start_interrupts = interrupts::timer_interrupts();
     let start = arch::clock();
-    while interrupts::ticks() < start_ticks + 10 {
+    while interrupts::timer_interrupts() < start_interrupts + 10 {
         arch::wait_for_interrupt();
     }
     let ms = (arch::clock() - start) * 1000 / tsc_hz.max(1);
     let expected = 10 * 1000 / interrupts::HZ;
     // Generous bounds: a VM's clocks can stretch under load.
-    assert!(ms >= expected / 2 && ms <= expected * 3, "10 timer ticks took {ms} ms, expected {expected}");
-    kprintln!("[selftest] timer: 10 ticks in {ms} ms (expected {expected})");
+    assert!(ms >= expected / 2 && ms <= expected * 3, "10 timer interrupts took {ms} ms, expected {expected}");
+    // And the clock: the ticks it counted in that time, and its two
+    // readings agreeing with each other.
+    let ticks = interrupts::ticks();
+    let (monotonic, realtime) = (crate::clock::monotonic(), crate::clock::realtime());
+    assert!(realtime >= monotonic, "the time of day is before boot");
+    assert!(ticks >= 10, "the clock counted {ticks} ticks in ten interrupts");
+    kprintln!(
+        "[selftest] timer: 10 interrupts in {ms} ms (expected {expected}); the clock says {} ms since it started, {ticks} ticks",
+        monotonic / 1_000_000
+    );
 }
 
 /// Threads: they take turns, a thread that never yields is still

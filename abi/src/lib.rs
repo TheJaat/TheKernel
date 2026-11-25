@@ -202,6 +202,222 @@ pub mod call {
     pub const MEMORY_LIMIT: u64 = 32;
     /// memory_used() - the bytes counted against this process now.
     pub const MEMORY_USED: u64 = 33;
+    /// clock(which) - nanoseconds on one of the clocks in `clock`:
+    /// since boot, or since 1970 (the time of day). Read from the CPU's
+    /// counter, so finer than a tick; InvalidArgument for another
+    /// `which`.
+    pub const CLOCK: u64 = 34;
+    /// signal_setup(entry, caught, ignored) - how this process takes
+    /// signals (see `signal`): `entry` is where a caught one is
+    /// delivered (0: none is), `caught` and `ignored` are masks, bit n
+    /// for signal n. A signal in neither does what it does by default:
+    /// ends the process, with the exit code signal::exit_code(n), or
+    /// nothing for those in signal::IGNORED_BY_DEFAULT. SIGKILL is never
+    /// caught or ignored.
+    pub const SIGNAL_SETUP: u64 = 35;
+    /// signal_send(process, signal) - sends `signal` (1 to 63) to the
+    /// process a handle with the KILL right names, or to this one
+    /// (signal::SELF). Returns at once: the process takes it the next
+    /// time one of its threads heads for user mode, and a thread that
+    /// waits is woken for it (its call ends Interrupted). SIGKILL is
+    /// process_kill, with the exit code signal::exit_code(SIGKILL).
+    pub const SIGNAL_SEND: u64 = 36;
+    /// signal_return(context) - back from a signal handler: every
+    /// register as the `signal::Context` at `context` says, the flags
+    /// only as far as a program may set them. Does not return.
+    pub const SIGNAL_RETURN: u64 = 37;
+    /// alarm(nanoseconds) - SIGALRM to this process that long from now
+    /// (to the tick, rounded up), in place of any alarm it had set; 0
+    /// only cancels. Returns the nanoseconds the earlier one had left,
+    /// or 0. At most ALARM_MAX.
+    pub const ALARM: u64 = 38;
+}
+
+/// The longest alarm: a year.
+pub const ALARM_MAX: u64 = 366 * 24 * 3600 * 1_000_000_000;
+
+/// Signals: the kernel interrupting a program, as on Unix. The numbers
+/// are Linux's (libc's signal.h has them all).
+///
+/// The kernel knows little of what a program does with one: only the
+/// two masks and the entry signal_setup gave it. A caught signal is
+/// delivered at `entry` - the program's own code, libc's trampoline -
+/// on the stack the program was using, below what it had there: the
+/// kernel writes a `Context` (the registers as they were) and starts
+/// `entry(signal, context)` with the stack pointer at the context.
+/// When the handler is done, signal_return(context) puts everything
+/// back. Floating-point registers are the trampoline's to save: the
+/// kernel never touches them on the way.
+pub mod signal {
+    pub const SIGHUP: u64 = 1;
+    pub const SIGINT: u64 = 2;
+    pub const SIGQUIT: u64 = 3;
+    pub const SIGILL: u64 = 4;
+    pub const SIGTRAP: u64 = 5;
+    pub const SIGABRT: u64 = 6;
+    pub const SIGBUS: u64 = 7;
+    pub const SIGFPE: u64 = 8;
+    pub const SIGKILL: u64 = 9;
+    pub const SIGUSR1: u64 = 10;
+    pub const SIGSEGV: u64 = 11;
+    pub const SIGUSR2: u64 = 12;
+    pub const SIGPIPE: u64 = 13;
+    pub const SIGALRM: u64 = 14;
+    pub const SIGTERM: u64 = 15;
+    pub const SIGCHLD: u64 = 17;
+    pub const SIGCONT: u64 = 18;
+    pub const SIGSTOP: u64 = 19;
+    pub const SIGURG: u64 = 23;
+    pub const SIGWINCH: u64 = 28;
+    /// The highest signal number: a mask is 64 bits, and bit 0 is none.
+    pub const MAX: u64 = 63;
+
+    pub const fn bit(signal: u64) -> u64 {
+        1 << signal
+    }
+
+    /// Signals that do nothing unless caught (POSIX's "ignore" default).
+    /// SIGSTOP and its kin would stop a process, which no process here
+    /// can be; they are ignored too.
+    pub const IGNORED_BY_DEFAULT: u64 =
+        bit(SIGCHLD) | bit(SIGCONT) | bit(SIGURG) | bit(SIGWINCH) | bit(SIGSTOP) | bit(20) | bit(21) | bit(22);
+
+    /// The exit codes of processes signals ended: SIGNALLED - n for
+    /// signal n, below the kernel's other codes (KILLED, STOPPED). Not
+    /// 128 + n, the number a Unix shell shows: a program may exit with
+    /// 130 itself, and whoever waits must be able to tell the two apart
+    /// (waitpid's WIFSIGNALED).
+    pub const SIGNALLED: i64 = -1100;
+
+    pub const fn exit_code(signal: u64) -> i64 {
+        SIGNALLED - signal as i64
+    }
+
+    /// The signal that ended a process with exit code `code`, if one did.
+    pub const fn of_exit_code(code: i64) -> Option<u64> {
+        if code < SIGNALLED && code >= SIGNALLED - MAX as i64 {
+            Some((SIGNALLED - code) as u64)
+        } else {
+            None
+        }
+    }
+
+    /// A signal's name, as C's <signal.h> spells it.
+    pub fn name(signal: u64) -> &'static str {
+        const NAMES: [&str; 32] = [
+            "", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1",
+            "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP",
+            "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR",
+            "SIGSYS",
+        ];
+        NAMES.get(signal as usize).copied().filter(|name| !name.is_empty()).unwrap_or("a real-time signal")
+    }
+
+    /// signal_send's handle for "this process".
+    pub const SELF: u64 = u64::MAX;
+
+    /// The registers of the code a signal interrupted, as the kernel
+    /// saves them on its stack. `registers` holds, on x86_64: rax, rbx,
+    /// rcx, rdx, rsi, rdi, rbp, r8 to r15 (16); on AArch64: x0 to x30.
+    /// `flags` is RFLAGS or SPSR.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Context {
+        pub registers: [u64; 31],
+        pub sp: u64,
+        pub pc: u64,
+        pub flags: u64,
+        /// The signal, for the handler's information.
+        pub signal: u64,
+        /// Keeps the size a multiple of 16: the stack stays aligned.
+        pub reserved: u64,
+    }
+
+    impl Context {
+        pub const fn zeroed() -> Context {
+            Context { registers: [0; 31], sp: 0, pc: 0, flags: 0, signal: 0, reserved: 0 }
+        }
+
+        pub fn to_bytes(&self) -> [u8; CONTEXT_SIZE] {
+            let mut bytes = [0u8; CONTEXT_SIZE];
+            let rest = [self.sp, self.pc, self.flags, self.signal, self.reserved];
+            let words = self.registers.iter().chain(&rest);
+            for (slot, word) in bytes.chunks_exact_mut(8).zip(words) {
+                slot.copy_from_slice(&word.to_le_bytes());
+            }
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Option<Context> {
+            if bytes.len() != CONTEXT_SIZE {
+                return None;
+            }
+            let mut words = bytes.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap_or([0; 8])));
+            let mut context = Context::zeroed();
+            for register in &mut context.registers {
+                *register = words.next()?;
+            }
+            context.sp = words.next()?;
+            context.pc = words.next()?;
+            context.flags = words.next()?;
+            context.signal = words.next()?;
+            context.reserved = words.next()?;
+            Some(context)
+        }
+    }
+
+    pub const CONTEXT_SIZE: usize = 36 * 8;
+    const _: () = assert!(core::mem::size_of::<Context>() == CONTEXT_SIZE && CONTEXT_SIZE % 16 == 0);
+
+    /// How far below the interrupted stack pointer the context goes:
+    /// x86_64's "red zone", 128 bytes a function may use below its stack
+    /// pointer without moving it, is left alone.
+    pub const STACK_SKIP: u64 = 128;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_context_goes_through_bytes_and_back() {
+            let mut context = Context::zeroed();
+            for (n, register) in context.registers.iter_mut().enumerate() {
+                *register = 0x1111 * n as u64;
+            }
+            context.sp = 0x7fff_0000;
+            context.pc = 0x40_1234;
+            context.flags = 0x246;
+            context.signal = SIGINT;
+            let bytes = context.to_bytes();
+            assert_eq!(Context::from_bytes(&bytes), Some(context));
+            assert_eq!(Context::from_bytes(&bytes[1..]), None);
+            // The layout C sees: sp right after the 31 registers, then pc.
+            assert_eq!(&bytes[31 * 8..32 * 8], &0x7fff_0000u64.to_le_bytes());
+            assert_eq!(&bytes[32 * 8..33 * 8], &0x40_1234u64.to_le_bytes());
+        }
+
+        #[test]
+        fn defaults() {
+            assert_eq!(exit_code(SIGINT), -1102);
+            assert_eq!(of_exit_code(exit_code(SIGINT)), Some(SIGINT));
+            assert_eq!(of_exit_code(exit_code(MAX)), Some(MAX));
+            assert_eq!(of_exit_code(130), None, "a program's own exit(130)");
+            assert_eq!(of_exit_code(crate::STOPPED), None);
+            assert_eq!(of_exit_code(SIGNALLED), None);
+            assert_eq!(name(SIGSEGV), "SIGSEGV");
+            assert_ne!(IGNORED_BY_DEFAULT & bit(SIGCHLD), 0);
+            assert_eq!(IGNORED_BY_DEFAULT & (bit(SIGINT) | bit(SIGKILL) | bit(SIGSEGV)), 0);
+        }
+    }
+}
+
+/// The clocks the CLOCK call reads.
+pub mod clock {
+    /// Since the system started; never set, never goes back.
+    pub const MONOTONIC: u64 = 0;
+    /// Since 1 January 1970, UTC: the machine's real-time clock at boot
+    /// plus the time since. A machine without one reads boot as 1970.
+    pub const REALTIME: u64 = 1;
 }
 
 /// The most threads one process may have at once (THREAD_CREATE says
@@ -1254,6 +1470,12 @@ pub mod block {
     /// Payload: a number of ticks (u64 LE, at most STALL_MAX). A test:
     /// answered, and then the driver does nothing for that long.
     pub const STALL: u8 = 6;
+    /// No payload (the request is the one byte). Answered once every
+    /// write answered before it is on the medium - not only in the
+    /// disk's cache, where a power cut loses it. A disk answers a write
+    /// as soon as it has the data; without this, "written" says nothing
+    /// about surviving. Only on the channel that may write.
+    pub const FLUSH: u8 = 7;
 
     pub const OK: u8 = 0;
     /// The disk reported an error.

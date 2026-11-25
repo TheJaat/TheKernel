@@ -510,6 +510,9 @@ pub struct Machine<'a> {
     /// `memory`.
     pub virtio: [DeviceSlot; Machine::VIRTIO_MAX],
     pub virtio_count: usize,
+    /// The real-time clock's registers, if the machine has a PL031
+    /// ("arm,pl031"): its first register counts seconds since 1970.
+    pub rtc: Option<Range>,
     pub nodes: usize,
     pub deepest: usize,
 }
@@ -647,6 +650,10 @@ impl<'a> Machine<'a> {
                     }
                     machine.virtio_count += 1;
                 }
+            }
+
+            if node.is_compatible("arm,pl031") && node.direct && machine.rtc.is_none() {
+                machine.rtc = node.reg().next().filter(|range| range.size > 0);
             }
 
             if node.is_compatible("arm,psci") || node.is_compatible("arm,psci-0.2") || node.is_compatible("arm,psci-1.0") {
@@ -946,6 +953,10 @@ mod tests {
             .text("status", &["disabled"])
             .cells("reg", &[0x2000, 0x100])
             .end()
+            .begin("pl031@9000")
+            .text("compatible", &["arm,pl031", "arm,primecell"])
+            .cells("reg", &[0x9000, 0x1000])
+            .end()
             .end()
             .begin("far-bus")
             .cells("#address-cells", &[1])
@@ -988,6 +999,7 @@ mod tests {
                 (1, "soc"),
                 (2, "serial@1000"),
                 (2, "serial@2000"),
+                (2, "pl031@9000"),
                 (1, "far-bus"),
                 (2, "serial@0"),
                 (1, "cpus"),
@@ -1113,7 +1125,8 @@ mod tests {
         );
         assert_eq!(machine.interrupt_controller, None);
         assert_eq!(machine.firmware_call, None);
-        assert_eq!(machine.nodes, 13);
+        assert_eq!(machine.rtc, Some(Range { start: 0x9000, size: 0x1000 }));
+        assert_eq!(machine.nodes, 14);
         assert_eq!(machine.deepest, 2);
     }
 
@@ -1330,6 +1343,8 @@ mod tests {
         );
         assert_eq!(machine.timer_interrupts, [Some(29), Some(30), Some(27), Some(26)]);
         assert_eq!(machine.firmware_call, Some(FirmwareCall::Hvc));
+        // The real-time clock, a PL031.
+        assert_eq!(machine.rtc, Some(Range { start: 0x901_0000, size: 0x1000 }));
         assert!(machine.nodes > 40, "{} nodes", machine.nodes);
         // Thirty-two places for virtio devices, 512 bytes each, with
         // the shared interrupts 16 to 47 - numbers 48 to 79.

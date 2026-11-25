@@ -34,7 +34,9 @@ extern crate alloc;
 #[macro_use]
 mod console; // first, so its macros are visible in every later module
 
+mod alarms;
 mod arch;
+mod clock;
 #[cfg(target_arch = "x86_64")]
 mod devices;
 mod interrupts;
@@ -47,6 +49,7 @@ mod memory_object;
 mod mm;
 mod power;
 mod process;
+mod signals;
 #[cfg(target_arch = "aarch64")]
 mod mmio_devices;
 mod programs;
@@ -114,6 +117,7 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
     // SAFETY: once, on the boot CPU, interrupts still disabled.
     let platform = unsafe { arch::platform::init(&madt, interrupts::HZ) };
     report_platform(&platform);
+    start_clock(arch::cmos::seconds(), "the CMOS clock");
     arch::enable_interrupts();
     selftest::timer();
 
@@ -336,6 +340,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
                 interrupts.timer_interrupt,
                 interrupts::HZ
             );
+            start_clock(machine.rtc.and_then(arch::pl031_seconds), "the PL031");
             arch::enable_interrupts();
             selftest::timer();
             arch::selftest_interrupts();
@@ -760,6 +765,18 @@ fn read_madt(rsdp: u64) -> Madt {
             ..Madt::default()
         }
     })
+}
+
+/// Starts the kernel's clock (clock.rs) from the real-time clock's
+/// reading, if there was one, and says what the date is.
+fn start_clock(rtc: Option<u64>, name: &str) {
+    clock::start(rtc);
+    match rtc {
+        Some(seconds) => {
+            kprintln!("[clock] {} says {} UTC; time is counted from here at {} Hz", name, kernel64::rtc::Date::from_unix_seconds(seconds), arch::clock_hz())
+        }
+        None => kprintln!("[clock] no date from {name}: the time of day is the time since boot, from 1970"),
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

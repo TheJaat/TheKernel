@@ -14,7 +14,13 @@
 //! every other register still holds something of the program's.
 //!
 //! Back to the user: `sysretq`, the mirror image - RCX to RIP, R11 to
-//! RFLAGS, user CS and SS from STAR.
+//! RFLAGS, user CS and SS from STAR. Which leaves no way to give the
+//! program back an RCX or R11 of its own - and that is just what the
+//! end of a signal handler must do (signal_return: every register as it
+//! was when the signal came, possibly in the middle of code that was
+//! using both). So there is a second way out: through `iretq`, as from
+//! an interrupt, which loads RIP, RFLAGS and RSP from memory and leaves
+//! every general register free. The handler says which (`Exit`).
 
 use core::arch::{asm, global_asm};
 
@@ -33,8 +39,14 @@ const ENTRY_CLEARED_FLAGS: u64 = 0x100 | 0x200 | 0x400 | 0x4000 | 0x40000;
 
 /// The user's registers, as `syscall_entry` saves them (lowest address
 /// first - the reverse of the pushes).
+///
+/// `r11` and `rcx` start as what `syscall` left in them - RFLAGS and
+/// RIP - and are only used on the way out through `iretq`, which can
+/// return different ones.
 #[repr(C)]
 pub struct SyscallFrame {
+    pub r11: u64,
+    pub rcx: u64,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -77,12 +89,18 @@ global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
-    // 16 pushes: RSP is still 16-byte aligned for the call.
+    "    push rcx",
+    "    push r11",
+    // 18 pushes: RSP is still 16-byte aligned for the call.
     "    mov rdi, rsp",
     "    call {handler}",
     // Interrupts off before RSP becomes the user's again: an interrupt
     // taken in ring 0 would push onto whatever RSP holds.
     "    cli",
+    "    test eax, eax",
+    "    jnz 2f",
+    // The usual way: sysretq, RIP and RFLAGS through RCX and R11.
+    "    add rsp, 16",
     "    pop r15",
     "    pop r14",
     "    pop r13",
@@ -102,9 +120,41 @@ global_asm!(
     // The last thing: the program's GS back.
     "    swapgs",
     "    sysretq",
+    // The other way: every general register from the frame, then RIP,
+    // RFLAGS and RSP by `iretq`. Its five words are pushed below the
+    // frame's last three - RIP, RFLAGS, RSP - with `push` from memory,
+    // which needs no register: an address based on RSP is worked out
+    // before the push moves RSP. Each push moves RSP 8 lower, so each
+    // word is 8 further from it than the one before was.
+    "2:",
+    "    pop r11",
+    "    pop rcx",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop r10",
+    "    pop r9",
+    "    pop r8",
+    "    pop rbp",
+    "    pop rdi",
+    "    pop rsi",
+    "    pop rdx",
+    "    pop rbx",
+    "    pop rax",
+    // RSP points at the saved RIP; RFLAGS is 8 above, RSP 16 above.
+    "    push {ss}",
+    "    push qword ptr [rsp + 24]", // the saved RSP
+    "    push qword ptr [rsp + 24]", // the saved RFLAGS
+    "    push {cs}",
+    "    push qword ptr [rsp + 32]", // the saved RIP
+    "    swapgs",
+    "    iretq",
     user_rsp = const percpu::USER_RSP,
     kernel_rsp = const percpu::KERNEL_RSP,
     handler = sym syscall_handler,
+    ss = const USER_DATA as u64,
+    cs = const USER_CODE as u64,
 );
 
 extern "C" {
@@ -116,16 +166,74 @@ extern "C" {
 const USER_FLAGS: u64 = 0x8D5 | 0x400 | 0x40000; // CF PF AF ZF SF OF, DF, AC
 const INTERRUPTS_ON: u64 = 0x200;
 
-extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
-    let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
-    frame.rax = crate::syscall::dispatch(frame.rax, args);
+/// Which way `syscall_entry` returns: what `syscall_handler` returns.
+#[repr(u32)]
+enum Exit {
+    Sysret = 0,
+    Iret = 1,
+}
+
+extern "C" fn syscall_handler(frame: &mut SyscallFrame) -> u32 {
+    let exit = if frame.rax == abi::call::SIGNAL_RETURN {
+        // Every register from the context; then, as below, the end of a
+        // system call - where another signal may be waiting.
+        let context = frame.rdi;
+        crate::signals::return_from(frame, context);
+        crate::signals::on_return(frame);
+        Exit::Iret
+    } else {
+        let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
+        frame.rax = crate::syscall::dispatch(frame.rax, args);
+        crate::signals::deliver_pending(frame);
+        Exit::Sysret
+    };
 
     // `sysretq` to a non-canonical address faults - in ring 0, but on the
-    // user's stack (a known x86 hazard). Never attempt it.
+    // user's stack (a known x86 hazard). Never attempt it; nor `iretq`.
     if frame.rip >= abi::USER_END {
         crate::process::kill_current("returned to a kernel or non-canonical address");
     }
     frame.rflags = (frame.rflags & USER_FLAGS) | INTERRUPTS_ON;
+    exit as u32
+}
+
+/// The flags a program's context may give it: its own, and interrupts
+/// on (bit 1 always reads as 1).
+pub fn user_flags(flags: u64) -> u64 {
+    (flags & USER_FLAGS) | INTERRUPTS_ON | 0x2
+}
+
+impl crate::signals::UserFrame for SyscallFrame {
+    fn context(&self) -> abi::signal::Context {
+        let mut context = abi::signal::Context::zeroed();
+        let f = self;
+        let registers = [f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15];
+        context.registers[..15].copy_from_slice(&registers);
+        context.sp = f.rsp;
+        context.pc = f.rip;
+        context.flags = f.rflags;
+        context
+    }
+
+    fn restore(&mut self, context: &abi::signal::Context) {
+        let r = &context.registers;
+        (self.rax, self.rbx, self.rcx, self.rdx, self.rsi, self.rdi, self.rbp) = (r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+        (self.r8, self.r9, self.r10, self.r11, self.r12, self.r13, self.r14, self.r15) = (r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14]);
+        self.rsp = context.sp;
+        self.rip = context.pc;
+        self.rflags = user_flags(context.flags);
+    }
+
+    fn enter(&mut self, entry: u64, stack: u64, signal: u64, context: u64) {
+        self.rip = entry;
+        self.rsp = stack;
+        self.rdi = signal;
+        self.rsi = context;
+    }
+
+    fn stack(&self) -> u64 {
+        self.rsp
+    }
 }
 
 /// How far below the top of its stack a program's stack pointer

@@ -311,15 +311,20 @@ fn stay() {
 /// then the kill flag is read. A kill before the mark is seen here; a
 /// kill after it finds a sleeping thread and wakes it. There is no
 /// moment in between.
-pub fn sleep(ticks: u64) {
+///
+/// A caught signal cuts it short as a kill does (see `interrupted`).
+/// Returns whether the whole time was slept.
+pub fn sleep(ticks: u64) -> bool {
     let were_enabled = arch::disable_interrupts();
-    announce(State::Sleeping(interrupts::ticks() + ticks));
-    if being_killed() {
+    let until = interrupts::ticks() + ticks;
+    announce(State::Sleeping(until));
+    if interrupted() {
         stay();
     } else {
         schedule();
     }
     arch::restore_interrupts(were_enabled);
+    interrupts::ticks() >= until
 }
 
 /// Ends the current thread.
@@ -349,6 +354,15 @@ fn being_killed() -> bool {
             .and_then(|thread| thread.process.as_ref())
             .is_some_and(|p| p.kill_requested())
     })
+}
+
+/// Whether a wait of the running thread's should end now, though what
+/// it waits for has not come: its process is being killed, or has a
+/// caught signal waiting (process.rs). The call gives up with
+/// Interrupted, and on the way back to user mode the process ends, or
+/// the signal is delivered.
+fn interrupted() -> bool {
+    being_killed() || crate::process::signal_waiting()
 }
 
 /// Makes a blocked or sleeping thread ready.
@@ -581,9 +595,10 @@ impl WaitQueue {
 /// condition reads FIRST, and call `wake_all` after.
 ///
 /// Returns true once the condition no longer holds. Returns false if
-/// the thread's process is being killed: the wait is over, though what
-/// was waited for has not happened. The caller must then give up and
-/// return to the system call's exit, where the process ends - returning
+/// the thread's process is being killed or has a signal waiting
+/// (`interrupted`): the wait is over, though what was waited for has
+/// not happened. The caller must then give up and return to the system
+/// call's exit, where the process ends or takes the signal - returning
 /// normally, so that everything it holds on the way (references to
 /// channels, to processes) is released as usual. Ending the thread
 /// right here would strand them.
@@ -597,8 +612,8 @@ pub fn wait_any(queues: &[&WaitQueue], condition: impl FnMut() -> bool) -> bool 
 pub enum Waited {
     /// The condition no longer holds: what was waited for happened.
     Done,
-    /// The thread's process is being killed.
-    Killed,
+    /// The thread's process is being killed, or has a signal to take.
+    Interrupted,
     /// The deadline came first.
     TimedOut,
 }
@@ -631,8 +646,8 @@ pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, mut conditio
         // with a wake-up that finds the two steps above already done.
         let ended = if !condition() {
             Some(Waited::Done)
-        } else if being_killed() {
-            Some(Waited::Killed)
+        } else if interrupted() {
+            Some(Waited::Interrupted)
         } else if deadline.is_some_and(|deadline| interrupts::ticks() >= deadline) {
             Some(Waited::TimedOut)
         } else {

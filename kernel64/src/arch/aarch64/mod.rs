@@ -482,3 +482,14 @@ pub mod fault_tests {
         unsafe { address.read_volatile() }
     }
 }
+
+/// What the PL031 real-time clock at `registers` says: its data
+/// register, at offset 0, counts seconds since 1970. None if it reads
+/// 0 - a clock never set.
+pub fn pl031_seconds(registers: kernel64::devicetree::Range) -> Option<u64> {
+    let base = crate::mm::map_mmio(registers.start, registers.size.max(0x1000));
+    // SAFETY: mapped just now as device memory; reading the data
+    // register only reads the count.
+    let seconds = unsafe { (base as *const u32).read_volatile() };
+    (seconds != 0).then_some(u64::from(seconds))
+}

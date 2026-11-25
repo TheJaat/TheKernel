@@ -357,6 +357,60 @@ pub unsafe fn init() {
     unsafe { asm!("msr vbar_el1, {}", "isb", in(reg) table as u64, options(nomem, nostack)) };
 }
 
+/// The signal a program's exception means, if it means one.
+fn fault_signal(syndrome: Syndrome) -> Option<u64> {
+    use abi::signal::*;
+    match syndrome.class() {
+        // An instruction the CPU does not know, or may not run here.
+        0x00 | 0x0E => Some(SIGILL),
+        // A misaligned program counter or stack pointer.
+        0x22 | 0x26 => Some(SIGBUS),
+        // A trapped floating-point exception.
+        0x2C => Some(SIGFPE),
+        // An abort: an alignment fault (status 0b100001) is a bus
+        // error, anything else a bad address.
+        0x20 | 0x24 if syndrome.0 & 0x3F == 0b10_0001 => Some(SIGBUS),
+        0x20 | 0x24 => Some(SIGSEGV),
+        _ => None,
+    }
+}
+
+/// AArch64's condition flags, in SPSR: N, Z, C and V. The only part of
+/// it a program may set - the rest says which level it runs at and what
+/// it may be interrupted by.
+const SPSR_FLAGS: u64 = 0xF000_0000;
+
+impl crate::signals::UserFrame for Frame {
+    fn context(&self) -> abi::signal::Context {
+        let mut context = abi::signal::Context::zeroed();
+        context.registers = self.x;
+        context.sp = self.sp;
+        context.pc = self.elr;
+        context.flags = self.spsr;
+        context
+    }
+
+    fn restore(&mut self, context: &abi::signal::Context) {
+        self.x = context.registers;
+        self.sp = context.sp;
+        self.elr = context.pc;
+        // The flags only: this frame is the program's own (a system
+        // call from EL0), so the rest is already what it must be.
+        self.spsr = (self.spsr & !SPSR_FLAGS) | (context.flags & SPSR_FLAGS);
+    }
+
+    fn enter(&mut self, entry: u64, stack: u64, signal: u64, context: u64) {
+        self.elr = entry;
+        self.sp = stack;
+        self.x[0] = signal;
+        self.x[1] = context;
+    }
+
+    fn stack(&self) -> u64 {
+        self.sp
+    }
+}
+
 fn syndrome() -> Syndrome {
     let value: u64;
     // SAFETY: reading a register that only describes the last exception.
@@ -387,7 +441,7 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
         // makes a system call still passes here on every timer tick:
         // if it has been asked to end meanwhile, this is where it does.
         if vector == FROM_PROGRAM + 1 {
-            crate::process::stop_if_killed();
+            crate::signals::on_return(frame);
         }
         return;
     }
@@ -411,8 +465,17 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
         // Every other register returns as it came. (The saved address
         // is already that of the instruction after the `svc`.)
         if syndrome.class() == Syndrome::SYSTEM_CALL {
+            if frame.x[8] == abi::call::SIGNAL_RETURN {
+                // Every register from the context, x0 too: nothing is
+                // answered. `eret` loads them all, as it always does.
+                let context = frame.x[0];
+                crate::signals::return_from(frame, context);
+                crate::signals::on_return(frame);
+                return;
+            }
             let args = [frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5]];
             frame.x[0] = crate::syscall::dispatch(frame.x[8], args);
+            crate::signals::deliver_pending(frame);
             return;
         }
         // A read or write that found no page: reserved memory not yet
@@ -421,7 +484,7 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
             if matches!(abort.cause, Cause::NotMapped { .. }) && abort.access != Access::Execute {
                 match crate::process::fault_in(fault_address(), abort.access == Access::Write) {
                     crate::process::Fault::Filled => {
-                        crate::process::stop_if_killed();
+                        crate::signals::on_return(frame);
                         return;
                     }
                     crate::process::Fault::NotOurs => {}
@@ -432,8 +495,15 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
                 }
             }
         }
-        // Anything else: the program broke a rule. It ends; the
-        // kernel carries on.
+        // Anything else: the program broke a rule. If it catches the
+        // signal that means, its handler runs; if not, it ends. Either
+        // way the kernel carries on.
+        if let Some(signal) = fault_signal(syndrome) {
+            if let Some(entry) = crate::process::fault_signal(signal) {
+                crate::signals::deliver(frame, signal, entry);
+                return;
+            }
+        }
         let name = syndrome.class_name();
         kprintln!("[process] {name} at {:#x} in user mode", frame.elr);
         if let Some(abort) = syndrome.abort() {

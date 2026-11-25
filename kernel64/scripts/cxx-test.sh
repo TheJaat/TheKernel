@@ -21,7 +21,7 @@
 #                              "c++: N checks, all passed" - and after
 #                              main, a destructor's last words
 #   cxxlib throw               nobody catches it: std::terminate says
-#                              what it was, and the exit code is 134
+#                              what it was, and abort ends it: SIGABRT
 #   cxxhello pear apple pear fig
 #                              the first C++ program, its usual lines
 #   cxxhello antidisestablishmentarianism
@@ -76,7 +76,7 @@ said '^c\+\+: the objects outside main were destroyed' "the destructors of the o
 said '"cxxlib" exited with code 0' "cxxlib did not exit with 0"
 said "^libc\+\+abi: terminating due to uncaught exception of type std::runtime_error: nobody catches this" \
     "an uncaught exception did not say what it was"
-said '"cxxlib" exited with code 134' "an uncaught exception did not end the program with abort's code"
+said '"cxxlib" ended by signal 6 \(SIGABRT\)' "an uncaught exception did not end the program by abort's SIGABRT"
 said '^Hello from C\+\+' "cxxhello did not say hello"
 said '^4 words, 3 different, in order: apple fig pear pear' "cxxhello did not sort its words"
 said '^pear 2, apple 1, fig 1' "cxxhello did not count its words"

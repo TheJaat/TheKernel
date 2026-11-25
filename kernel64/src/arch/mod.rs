@@ -9,7 +9,7 @@ mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::{
-    breakpoint, clock, clock_hz, console_write, console_write_bytes, cpu, disable_interrupts, enable_interrupts, halt_forever, init_cpu,
+    breakpoint, clock, clock_hz, cmos, console_write, console_write_bytes, cpu, disable_interrupts, enable_interrupts, halt_forever, init_cpu,
     init_early_console, mmu, pci, platform, context, syscall, rearm_interrupt, restore_interrupts, set_io_bitmap, smp, stop_other_cpus,
     wait_for_interrupt,
 };
@@ -27,7 +27,7 @@ mod aarch64;
 pub use self::aarch64::{
     breakpoint, clock, clock_hz, console_write, console_write_bytes, context, cpu, device_interrupt, device_interrupts, device_tree,
     disable_interrupts, rearm_interrupt,
-    enable_interrupts, halt_forever, init_cpu, init_early_console, init_interrupts, mmu, report, restore_interrupts,
+    enable_interrupts, halt_forever, init_cpu, init_early_console, init_interrupts, mmu, pl031_seconds, report, restore_interrupts,
     selftest_interrupts, set_io_bitmap, smp, stop_other_cpus, syscall, wait_for_interrupt,
 };
 
