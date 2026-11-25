@@ -267,6 +267,49 @@ pub const RANDOM_MAX: u64 = 1 << 20;
 /// bigger).
 pub const SIGNAL_STACK_MIN: u64 = 4096;
 
+/// A program's main stack (the kernel's elf.rs and process.rs; libc's
+/// pthread_getattr_np reads it from here): it ends just below `TOP`, and
+/// is `DEFAULT` bytes, or what the program's PT_GNU_STACK header asks
+/// for - at least `MIN` and at most `MAX`, rounded up to whole pages.
+pub mod stack {
+    pub const TOP: u64 = 0x0000_7FFF_FFFF_0000;
+    /// The least stack a program gets when it asks for one: 64 KiB.
+    pub const MIN: u64 = 64 << 10;
+    /// The stack a program gets when it does not ask: 8 MiB, as on Linux.
+    pub const DEFAULT: u64 = 8 << 20;
+    /// The most stack a program may ask for: 1 GiB - of address space;
+    /// only the pages it touches take memory.
+    pub const MAX: u64 = 1 << 30;
+
+    /// The stack a program whose PT_GNU_STACK header says `wanted`
+    /// bytes (0: no header, or no size) gets; None above MAX.
+    pub const fn size(wanted: u64) -> Option<u64> {
+        if wanted > MAX {
+            None
+        } else if wanted == 0 {
+            Some(DEFAULT)
+        } else {
+            let pages = (wanted + 4095) & !4095;
+            Some(if pages > MIN { pages } else { MIN })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_stack_a_program_gets() {
+            assert_eq!(size(0), Some(DEFAULT), "not asked: the default");
+            assert_eq!(size(100), Some(MIN), "a little: at least MIN");
+            assert_eq!(size(MIN + 1), Some(MIN + 4096), "whole pages");
+            assert_eq!(size(MAX), Some(MAX));
+            assert_eq!(size(MAX + 1), None, "too much");
+            assert!(TOP % 4096 == 0 && TOP - MAX > 0);
+        }
+    }
+}
+
 /// The longest alarm: a year.
 pub const ALARM_MAX: u64 = 366 * 24 * 3600 * 1_000_000_000;
 

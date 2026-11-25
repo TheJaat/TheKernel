@@ -49,7 +49,7 @@ use crate::{mm, threads};
 /// the program asked for (elf::STACK_DEFAULT, elf::STACK_MAX) - reserved,
 /// a page taken as it is touched. The page below it is never filled, so
 /// overflowing the stack faults.
-const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+const USER_STACK_TOP: u64 = abi::stack::TOP;
 
 /// Where memory objects are mapped, and reserved memory is put: far from
 /// the program (which sits low, near 4 MiB) and the stack (at the very
