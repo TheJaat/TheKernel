@@ -123,6 +123,38 @@ pub fn clock_hz() -> u64 {
     timer::frequency()
 }
 
+/// Whether the CPU has RNDR (FEAT_RNG): ID_AA64ISAR0_EL1's bits 63:60.
+fn has_rndr() -> bool {
+    let features: u64;
+    // SAFETY: an ID register, read-only.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) features, options(nomem, nostack, preserves_flags)) };
+    features >> 60 != 0
+}
+
+/// A random number from the CPU itself - RNDR - if it has it and gives
+/// one within a few tries; None otherwise. QEMU's cortex-a72 has none;
+/// `-cpu max` has it.
+pub fn hardware_random() -> Option<u64> {
+    if !has_rndr() {
+        return None;
+    }
+    for _ in 0..10 {
+        let (value, failed): (u64, u64);
+        // SAFETY: the CPU said it has RNDR (S3_3_C2_C4_0); it writes the
+        // register and the flags (Z set: no number this time).
+        unsafe { asm!("mrs {0}, s3_3_c2_c4_0", "cset {1}, eq", out(reg) value, out(reg) failed, options(nomem, nostack)) };
+        if failed == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The name of the instruction `hardware_random` uses, for the log.
+pub fn hardware_random_name() -> &'static str {
+    if has_rndr() { "RNDR" } else { "none" }
+}
+
 /// A PC has "I/O ports", a second address space for devices, and each
 /// process a list of the ports it may use. AArch64 has no such thing:
 /// every device is in memory, and page tables decide.

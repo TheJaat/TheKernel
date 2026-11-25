@@ -21,6 +21,7 @@ pub mod aarch64;
 pub mod account;
 pub mod acpi;
 pub mod bootinfo;
+pub mod chacha;
 pub mod cap;
 pub mod channel;
 pub mod devicetree;

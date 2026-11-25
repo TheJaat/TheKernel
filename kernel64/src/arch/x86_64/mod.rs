@@ -113,6 +113,44 @@ pub fn clock_hz() -> u64 {
     platform::tsc_hz()
 }
 
+/// A random number from the CPU itself - RDSEED, else RDRAND - if it
+/// has either (CPUID says), and it gives one within a few tries; None
+/// otherwise. QEMU's default CPU has neither; `-cpu max` and most PCs
+/// since 2012 have RDRAND.
+pub fn hardware_random() -> Option<u64> {
+    let (leaf1, leaf7) = (core::arch::x86_64::__cpuid(1), core::arch::x86_64::__cpuid_count(7, 0));
+    let has_rdrand = leaf1.ecx & (1 << 30) != 0;
+    let has_rdseed = leaf7.ebx & (1 << 18) != 0;
+    for _ in 0..10 {
+        let (value, ok): (u64, u8);
+        if has_rdseed {
+            // SAFETY: the CPU said it has RDSEED; it only writes the register and CF.
+            unsafe { asm!("rdseed {0}", "setc {1}", out(reg) value, out(reg_byte) ok, options(nomem, nostack)) };
+        } else if has_rdrand {
+            // SAFETY: as above, for RDRAND.
+            unsafe { asm!("rdrand {0}", "setc {1}", out(reg) value, out(reg_byte) ok, options(nomem, nostack)) };
+        } else {
+            return None;
+        }
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The name of the instruction `hardware_random` uses, for the log.
+pub fn hardware_random_name() -> &'static str {
+    let (leaf1, leaf7) = (core::arch::x86_64::__cpuid(1), core::arch::x86_64::__cpuid_count(7, 0));
+    if leaf7.ebx & (1 << 18) != 0 {
+        "RDSEED"
+    } else if leaf1.ecx & (1 << 30) != 0 {
+        "RDRAND"
+    } else {
+        "none"
+    }
+}
+
 /// The CPU's time-stamp counter: cycles since reset.
 pub fn tsc() -> u64 {
     let (low, high): (u32, u32);

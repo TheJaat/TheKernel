@@ -10,8 +10,9 @@
  *                             its printf flushed
  *   threads speed             the same work on 1 thread and on 4, timed
  *
- * Compiled with -femulated-tls, as C++ is: a _Thread_local variable is
- * found through __emutls_get_address (libc/src/threads.rs). */
+ * A _Thread_local variable is a real one (since journal entry 099): in
+ * each thread's own TLS block, at a fixed offset from its thread
+ * pointer (libc/src/threads.rs makes the blocks). */
 
 #include <errno.h>
 #include <fcntl.h>

@@ -84,6 +84,10 @@ pub struct Image {
     pub segments: Vec<Segment>,
     /// The stack's size in bytes: a whole number of pages.
     pub stack: u64,
+    /// The program headers, as in the file (56 bytes each): the program
+    /// may ask for them (PROGRAM_HEADERS), to find its thread-local
+    /// storage template (PT_TLS) and to answer dl_iterate_phdr.
+    pub headers: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,7 +249,7 @@ pub fn parse_for(source: &(impl Source + ?Sized), user_end: u64, machine: u16) -
     if !segments.iter().any(|s| s.executable && s.virtual_range.contains(&entry)) {
         return Err(ElfError::EntryNotExecutable);
     }
-    Ok(Image { entry, segments, stack })
+    Ok(Image { entry, segments, stack, headers })
 }
 
 #[cfg(test)]

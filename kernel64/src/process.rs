@@ -25,7 +25,7 @@
 //! against the process's limit (account.rs).
 
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -88,6 +88,16 @@ pub struct Process {
     signals_caught: AtomicU64,
     signals_ignored: AtomicU64,
     signal_entry: AtomicU64,
+    /// The caught signals delivered on a thread's signal stack, if it
+    /// has one (SA_ONSTACK).
+    signals_on_stack: AtomicU64,
+    /// Whom to send what when this process ends (PROCESS_NOTIFY): how
+    /// a program learns its child ended (SIGCHLD), the child having
+    /// been started by init. Weak: a process that went first is
+    /// skipped.
+    notify: IrqLock<Vec<(Weak<Process>, u64)>>,
+    /// Its ELF program headers (PROGRAM_HEADERS).
+    headers: Vec<u8>,
     /// Its threads that have not ended: whom a kill, or the end of the
     /// process, wakes. At most THREADS_MAX.
     threads: IrqLock<Vec<ThreadId>>,
@@ -507,6 +517,9 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         signals_caught: AtomicU64::new(0),
         signals_ignored: AtomicU64::new(0),
         signal_entry: AtomicU64::new(0),
+        signals_on_stack: AtomicU64::new(0),
+        notify: IrqLock::new(Vec::new()),
+        headers: image.headers,
         threads: IrqLock::new(Vec::new()),
         handles: IrqLock::new(CapTable::new(abi::HANDLES_MAX)),
         io_ports: IrqLock::new(PortBitmap::NONE),
@@ -624,6 +637,16 @@ fn end_current(code: i64, how: core::fmt::Arguments) -> ! {
             }
             stop_other_threads(&process);
             process.close_all_handles();
+            // Whoever asked to be told - before those waiting are woken,
+            // so that a program waiting for this child has its SIGCHLD
+            // by the time its wait returns. (Taken out of the lock
+            // first: sending can take the target's locks.)
+            let notify = core::mem::take(&mut *process.notify.lock());
+            for (watcher, signal) in notify {
+                if let Some(watcher) = watcher.upgrade() {
+                    send_signal(&watcher, signal);
+                }
+            }
             EXITS.wake_all();
         }
     }
@@ -748,7 +771,7 @@ pub fn stop_if_killed() {
 
 /// signal_setup: where caught signals go, and which are caught and
 /// which ignored. SIGKILL is neither, whatever the masks say.
-pub fn signal_setup(entry: u64, caught: u64, ignored: u64) -> Result<u64, Error> {
+pub fn signal_setup(entry: u64, caught: u64, ignored: u64, on_stack: u64) -> Result<u64, Error> {
     if entry >= abi::USER_END {
         return Err(Error::InvalidArgument);
     }
@@ -757,7 +780,42 @@ pub fn signal_setup(entry: u64, caught: u64, ignored: u64) -> Result<u64, Error>
     process.signal_entry.store(entry, Ordering::Release);
     process.signals_ignored.store(ignored & !never, Ordering::Release);
     process.signals_caught.store(if entry == 0 { 0 } else { caught & !never }, Ordering::Release);
+    process.signals_on_stack.store(on_stack & !never, Ordering::Release);
     Ok(0)
+}
+
+/// Whether the current process wants `signal` delivered on the
+/// thread's signal stack.
+pub fn signal_on_stack(signal: u64) -> bool {
+    current().is_some_and(|process| process.signals_on_stack.load(Ordering::Acquire) & abi::signal::bit(signal) != 0)
+}
+
+/// PROCESS_NOTIFY's work: `signal` to `watcher` when `target` ends - at
+/// once, if it has.
+pub fn notify_on_end(target: &Arc<Process>, watcher: &Arc<Process>, signal: u64) {
+    {
+        let mut list = target.notify.lock();
+        // Checked under the lock: end_current takes the list after the
+        // exit code is set, so either it finds this entry or this finds
+        // the code.
+        if target.exit_code().is_none() {
+            list.push((Arc::downgrade(watcher), signal));
+            return;
+        }
+    }
+    send_signal(watcher, signal);
+}
+
+/// PROGRAM_HEADERS: as many of the program headers as fit in `length`
+/// bytes at `buffer`; how many bytes they all take.
+pub fn program_headers(buffer: u64, length: u64) -> Result<u64, Error> {
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let n = (process.headers.len() as u64).min(length) as usize;
+    let n = n - n % 56;
+    if n > 0 {
+        copy_to_user(buffer, &process.headers[..n])?;
+    }
+    Ok(process.headers.len() as u64)
 }
 
 /// Sends `signal` to `target` (see above for what that does).
