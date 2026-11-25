@@ -264,9 +264,13 @@ fputs and putchar" ] || fail "\"pout\" is not, byte for byte, what the C program
             # than one CPU can do in that time - which is what "at
             # once" means. One and a half times is asked for, of a
             # possible four: on one CPU it cannot be more than once.
+            # The answers are counted wherever they are in a line, not
+            # only at its start: on a fast machine (KVM) the copies end
+            # while the next commands are still being typed, and the
+            # typed echo can come first in the line an answer ends.
             if [ -n "${CPRIMES_HOST:-}" ] && grep -q 'line: "time wait"' "$LOG"; then
                 want=$("$CPRIMES_HOST" "$CPRIMES_LIMIT")
-                [ "$(grep -c "^$want\s*\$" "$LOG")" -eq 4 ] \
+                [ "$(grep -oE "$want([^0-9]|\$)" "$LOG" | wc -l)" -eq 4 ] \
                     || fail "four copies of cprimes did not each print what it prints on this machine: $want"
                 times=$(sed -n '/line: "time wait"/,$p' "$LOG" | grep -m1 "^took .* in all")
                 took=$(echo "$times" | sed 's/^took \([0-9]*\)\.\([0-9][0-9]\) s.*/\1\2/; s/^0*//')
