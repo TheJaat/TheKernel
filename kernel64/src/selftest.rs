@@ -179,6 +179,7 @@ pub fn timer() {
     }
     let start_interrupts = interrupts::timer_interrupts();
     let start = arch::clock();
+    let start_ticks = interrupts::ticks();
     while interrupts::timer_interrupts() < start_interrupts + 10 {
         arch::wait_for_interrupt();
     }
@@ -188,10 +189,17 @@ pub fn timer() {
     assert!(ms >= expected / 2 && ms <= expected * 3, "10 timer interrupts took {ms} ms, expected {expected}");
     // And the clock: the ticks it counted in that time, and its two
     // readings agreeing with each other.
+    // Ten interrupts are ten periods; the clock's ticks are whole periods
+    // since boot, so rounding can lose one at an end: at least 9 across
+    // them. (It was "at least 10 since boot", which counted on the
+    // interrupt lined up with being past the first tick: 10 was the
+    // usual answer on AArch64, and 9 failed a boot once - journal entry
+    // NNN.)
     let ticks = interrupts::ticks();
+    let counted = ticks - start_ticks;
     let (monotonic, realtime) = (crate::clock::monotonic(), crate::clock::realtime());
     assert!(realtime >= monotonic, "the time of day is before boot");
-    assert!(ticks >= 10, "the clock counted {ticks} ticks in ten interrupts");
+    assert!(counted >= 9, "the clock counted {counted} ticks in ten interrupts");
     kprintln!(
         "[selftest] timer: 10 interrupts in {ms} ms (expected {expected}); the clock says {} ms since it started, {ticks} ticks",
         monotonic / 1_000_000
