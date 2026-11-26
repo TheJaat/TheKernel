@@ -1,2 +1,4 @@
 build/
 iso/
+# Python, when the boot scripts import typed_line.py
+__pycache__/

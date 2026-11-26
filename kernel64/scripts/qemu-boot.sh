@@ -19,7 +19,7 @@
 #              through QEMU's monitor (`sendkey`) - e.g. "shift-h i ret".
 #              A "/" waits until a new keyboard driver is ready (after a
 #              crash and restart) before typing on. A "~" waits until
-#              the shell has run every line typed so far - for ten
+#              the shell has run the line just entered - for ten
 #              seconds at most; "~~" waits up to ninety, for a line that
 #              is meant to take a while. The script then waits
 #              for the shell to echo a line. A token starting with "!"
@@ -144,30 +144,58 @@ if [ $finished -eq 0 ]; then
     if [ -n "$KEYS" ] && grep -q "\[kernel\] idle" "$LOG" && wait_for "\[kbd\] PS/2 keyboard ready" 50; then
         # One key at a time, with a pause: a real typist, not a burst.
         ready="\[kbd\] PS/2 keyboard ready"
+        # What the waits below compare with is counted *before* a key is
+        # sent, not when the wait begins: a driver that crashes at F12 is
+        # back within the 50 ms after it under KVM, and a line can have run
+        # by then too. Counted afterwards, the new line is already there,
+        # and the wait is for one more that never comes - 90 s at "/", 10
+        # at "~", every boot (journal entry 109).
+        ready_before=0
+        ran_before=0
+        # For each Enter, what the shell logs once it has run that line
+        # (typed_line.py; empty if its keys are not plain text).
+        python3 "$(dirname "$0")/typed_line.py" $KEYS > "$LOG.lines"
         entered=0
+        last=
+        last_before=0
+        # The line just entered has run: its own "[shell] ran" line if its
+        # text is known, else one "ran" more than at its Enter. Waits up to
+        # $1 tenths of a second; fails if it ran out.
+        has_run() {
+            ticks=$1
+            if [ -n "$last" ]; then
+                while [ "$(grep -acF -- "$last" "$LOG")" -le "$last_before" ] && [ $ticks -gt 0 ]; do
+                    sleep 0.1
+                    ticks=$((ticks - 1))
+                done
+            else
+                while [ "$(grep -c '\[shell\] ran' "$LOG")" -le "$ran_before" ] && [ $ticks -gt 0 ]; do
+                    sleep 0.1
+                    ticks=$((ticks - 1))
+                done
+            fi
+            [ $ticks -gt 0 ]
+        }
         for key in $KEYS; do
             if [ "$key" = "/" ]; then
-                # Wait for one more "ready" line than there is now. A new
-                # driver after a crash comes in a second or two; after a
-                # reboot the firmware and the loader run again first,
-                # printing nothing - FIRMWARE_SECONDS, as for the first
-                # boot (journal entry 105).
-                seen=$(grep -c "$ready" "$LOG")
+                # Wait for one more "ready" line than there was before the
+                # last key. A new driver after a crash comes in a second or
+                # two; after a reboot the firmware and the loader run again
+                # first, printing nothing - FIRMWARE_SECONDS, as for the
+                # first boot (journal entry 105).
                 ticks=$(( ${FIRMWARE_SECONDS:-90} * 10 ))
-                while [ "$(grep -c "$ready" "$LOG")" -le "$seen" ] && [ $ticks -gt 0 ]; do
+                while [ "$(grep -c "$ready" "$LOG")" -le "$ready_before" ] && [ $ticks -gt 0 ]; do
                     sleep 0.1
                     ticks=$((ticks - 1))
                 done
                 continue
             fi
             if [ "$key" = "~" ] || [ "$key" = "~~" ]; then
-                # "~~" is for a line that is meant to take a while.
-                ticks=100
-                [ "$key" = "~~" ] && ticks=900
-                while [ "$(grep -c '\[shell\] ran' "$LOG")" -lt "$entered" ] && [ $ticks -gt 0 ]; do
-                    sleep 0.1
-                    ticks=$((ticks - 1))
-                done
+                # Wait until the line just entered has run. (Not "every line
+                # entered so far": a line typed to a program that reads it is
+                # not the shell's, so that count is never reached.) "~~" is
+                # for a line that is meant to take a while.
+                if [ "$key" = "~~" ]; then has_run 900; else has_run 100; fi
                 continue
             fi
             case $key in
@@ -189,18 +217,19 @@ if [ $finished -eq 0 ]; then
                     continue
                     ;;
             esac
-            [ "$key" = "ret" ] && entered=$((entered + 1))
+            ready_before=$(grep -c "$ready" "$LOG")
+            if [ "$key" = "ret" ]; then
+                ran_before=$(grep -c '\[shell\] ran' "$LOG")
+                entered=$((entered + 1))
+                last=$(sed -n "${entered}p" "$LOG.lines")
+                last_before=0
+                [ -z "$last" ] || last_before=$(grep -acF -- "$last" "$LOG")
+            fi
             echo "sendkey $key" | nc -U -N "$MONITOR" > /dev/null
             sleep 0.05
         done
-        # Each Enter runs a command; wait until the shell has run them all.
-        commands=$(echo "$KEYS" | tr ' ' '\n' | grep -c '^ret$')
-        ticks=100
-        while [ "$(grep -c '\[shell\] ran' "$LOG")" -lt "$commands" ] && [ $ticks -gt 0 ]; do
-            sleep 0.1
-            ticks=$((ticks - 1))
-        done
-        [ $ticks -gt 0 ] || echo "qemu-boot: the shell did not run all $commands commands" >&2
+        # Wait until the last line typed has run.
+        has_run 100 || echo "qemu-boot: the last line typed did not run" >&2
     fi
     sleep 0.3   # let the rest of a fault report reach the log
     # A picture of the screen, for check-boot.sh to look at.

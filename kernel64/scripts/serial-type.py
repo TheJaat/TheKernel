@@ -10,7 +10,7 @@ LOG is the machine's serial output, read to know when to go on:
 
   /    wait until a new serial driver says it is ready (after a crash
        and restart) before typing on
-  ~    wait until the shell has run every line typed so far - ten
+  ~    wait until the shell has run the line just entered - ten
        seconds at most; "~~" up to ninety
   see:WORD
        wait until WORD is in the log more often than it was when Enter
@@ -23,36 +23,18 @@ Ctrl+C the pause is longer: what it stops is given time to start.
 import sys
 import time
 
+import typed_line
+
 READY = b"[serial] serial port ready"
 RAN = b"[shell] ran"
-
-NAMED = {
-    "spc": b" ", "ret": b"\r", "backspace": b"\x7f", "tab": b"\t", "esc": b"\x1b",
-    "dot": b".", "slash": b"/", "backslash": b"\\", "apostrophe": b"'", "comma": b",", "minus": b"-",
-    "shift-apostrophe": b'"', "shift-dot": b">", "shift-comma": b"<", "shift-backslash": b"|",
-    "shift-7": b"&", "shift-minus": b"_", "shift-5": b"%",
-    "up": b"\x1b[A", "down": b"\x1b[B", "right": b"\x1b[C", "left": b"\x1b[D",
-    "f11": b"\x1b[23~", "f12": b"\x1b[24~",
-}
-# The rest of a US keyboard's punctuation, as key-names.py names it, so
-# that anything it can spell can be typed here too: plain, and shifted.
-_PLAIN = {"equal": "=", "bracket_left": "[", "bracket_right": "]", "semicolon": ";", "grave_accent": "`"}
-_SHIFTED = {"1": "!", "2": "@", "3": "#", "4": "$", "6": "^", "8": "*", "9": "(", "0": ")", "equal": "+",
-            "bracket_left": "{", "bracket_right": "}", "semicolon": ":", "slash": "?", "grave_accent": "~"}
-NAMED.update({name: text.encode() for name, text in _PLAIN.items()})
-NAMED.update({"shift-" + name: text.encode() for name, text in _SHIFTED.items()})
-
+# init, starting a program a line asked for.
+STARTED = b"for the shell"
 
 def key_bytes(key):
-    if key in NAMED:
-        return NAMED[key]
-    if len(key) == 1:
-        return key.encode()
-    if key.startswith("shift-") and len(key) == 7 and key[6].isalpha():
-        return key[6].upper().encode()
-    if key.startswith("ctrl-") and len(key) == 6 and key[5].isalpha():
-        return bytes([ord(key[5].lower()) - ord("a") + 1])
-    sys.exit(f"serial-type: no bytes known for the key '{key}'")
+    typed = typed_line.key_bytes(key)
+    if typed is None:
+        sys.exit(f"serial-type: no bytes known for the key '{key}'")
+    return typed
 
 
 def count(log, what):
@@ -76,40 +58,66 @@ def main():
     for key in keys:
         if key not in ("/", "~", "~~") and not key.startswith("see:"):
             key_bytes(key)      # a key with no bytes: said before anything is typed
+    # Counted before a key is sent, not when a wait begins: a driver that
+    # crashes is back, and a line has run, within moments under KVM, and a
+    # count taken afterwards already has the new line in it - the wait is
+    # then for one more that never comes (journal entry 109).
+    ready_before = 0
+    ran_before = 0
+    started_before = 0
+    # For each Enter, what the shell logs once it has run that line.
+    expected = list(typed_line.lines(keys))
     entered = 0
+    last = None
+    last_before = 0
+
+    def has_run(seconds):
+        # The line just entered has run: its own "[shell] ran" line if its
+        # text is known, else one "ran" more than at its Enter.
+        if last is not None:
+            return wait_until(lambda: count(log, last) > last_before, seconds)
+        return wait_until(lambda: count(log, RAN) > ran_before, seconds)
+
     # The log as it was at the last Enter, for "see:".
     before = b""
     with open(fifo, "wb", buffering=0) as line:
         for key in keys:
             if key == "/":
-                seen = count(log, READY)
-                wait_until(lambda: count(log, READY) > seen, 10)
+                wait_until(lambda: count(log, READY) > ready_before, 10)
             elif key in ("~", "~~"):
-                wait_until(lambda: count(log, RAN) >= entered, 90 if key == "~~" else 10)
+                # The line just entered has run. (Not every line entered so
+                # far: one typed to a program that reads it is not the
+                # shell's, and that count is never reached.)
+                has_run(90 if key == "~~" else 10)
             elif key.startswith("see:"):
                 word = key[4:].encode()
                 wait_until(lambda: count(log, word) > before.count(word), 10)
             else:
+                ready_before = count(log, READY)
                 if key == "ret":
+                    ran_before = count(log, RAN)
+                    started_before = count(log, STARTED)
+                    last = expected[entered]
                     entered += 1
+                    last_before = count(log, last) if last is not None else 0
                     try:
                         before = open(log, "rb").read()
                     except OSError:
                         before = b""
                 if key == "ctrl-c":
-                    # Ctrl+C is pressed at something seen to be running.
-                    # A fiftieth of a second after Enter the program may
-                    # not have said its first line yet - and with other
-                    # CPUs free to run the shell meanwhile, it is ended
-                    # before it does.
+                    # Ctrl+C is pressed at something seen to be running:
+                    # a program started since the last Enter. A fixed
+                    # pause was not enough - an emulated machine sharing
+                    # the host with other tests took longer to start cat,
+                    # and the Ctrl+C meant for it stopped nothing (journal
+                    # entry 109). Then a moment more: just started, it may
+                    # not have said its first line yet.
+                    wait_until(lambda: count(log, STARTED) > started_before, 10)
                     time.sleep(0.3)
                 line.write(key_bytes(key))
                 time.sleep(0.02)
-        # Each Enter runs a command; wait until the shell has run them all.
-        commands = keys.count("ret")
-        # (Not every Enter is a command - a line typed to a program that
-        # reads one is not - so running out of time here says nothing.)
-        wait_until(lambda: count(log, RAN) >= commands, 10)
+        # Wait until the last line typed has run.
+        has_run(10)
         # Keep the line open a moment: closing it is an end of input.
         time.sleep(0.3)
 
