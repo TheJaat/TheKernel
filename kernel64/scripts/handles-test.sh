@@ -1,5 +1,5 @@
 #!/bin/sh
-# handles-test.sh - open files as handles (journal entry NNN, J60 and
+# handles-test.sh - open files as handles (journal entry 115, J60 and
 # J61): a descriptor follows its file through a rename, outlives a
 # removal and a replacing rename, and is handed to a child as the file.
 #

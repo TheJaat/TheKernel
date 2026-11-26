@@ -1,4 +1,4 @@
-/* handles.c - open files as handles (journal entry NNN, J60 and J61):
+/* handles.c - open files as handles (journal entry 115, J60 and J61):
  * a descriptor is the file, not its name. handles-test.sh boots TheTaaJ
  * and runs
  *
