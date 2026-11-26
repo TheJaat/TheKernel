@@ -1,5 +1,5 @@
 /* schedbench.c - the threads and scheduling benchmark (MaK-WSL/sched's K67
- * and K95, journal entry NNN). It measures; it does not judge: every line
+ * and K95, journal entry 116). It measures; it does not judge: every line
  * is a number for the journal, and the next scheduling item is measured
  * against it, on the same machine, before and after.
  *

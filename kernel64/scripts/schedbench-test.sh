@@ -1,6 +1,6 @@
 #!/bin/sh
 # schedbench-test.sh - the threads and scheduling benchmark (K67, K95;
-# journal entry NNN), run on 1, 2 and 4 CPUs.
+# journal entry 116), run on 1, 2 and 4 CPUs.
 #
 #   usage: schedbench-test.sh IMAGE DISK LOG SCHEDBENCH
 #
