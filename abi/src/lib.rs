@@ -635,16 +635,17 @@ pub mod startup {
 /// channel the parent fills and closes before the child starts.
 ///
 ///   [descriptor] [FILE] [flags, 4 bytes] [offset, 8 bytes] [path]
+///                             + one handle: the file's own channel
 ///   [descriptor] [READ]       + one handle: a stream to read from
 ///   [descriptor] [WRITE]      + one handle: a stream to write to
 ///
-/// A file is no more than its name, where the parent had got to, and
-/// how it was opened (a C library keeps nothing else for one: the file
-/// service remembers nothing between requests), so it travels as those,
-/// and the child's copy moves on its own from there. A pipe's end, or
-/// another stream, is a channel: the handle itself goes down. Numbers
-/// are little-endian; `flags` are open's (Linux's values); `path` is
-/// from the root.
+/// A file is its channel to the file service (J60), which stays that
+/// file through renames and removals; with it come where the parent had
+/// got to and how it was opened, and the child's place moves on its own
+/// from there. `path` is the name it was opened by, kept for what still
+/// goes by name (fchdir). A pipe's end, or another stream, is a
+/// channel: the handle itself goes down. Numbers are little-endian;
+/// `flags` are open's (Linux's values); `path` is from the root.
 pub mod descriptors {
     pub const FILE: u8 = 1;
     pub const READ: u8 = 2;
@@ -653,6 +654,9 @@ pub mod descriptors {
     /// One descriptor, as a message says it.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Entry<'a> {
+        /// An open file: its channel to the file service travels with
+        /// the message (J60); the name it was opened by, where it had
+        /// got to and its open flags are in it.
         File { descriptor: u8, flags: i32, offset: u64, path: &'a str },
         /// A stream end; its handle travels with the message.
         Read { descriptor: u8 },
@@ -710,9 +714,10 @@ pub mod descriptors {
             }
         }
 
-        /// Whether a handle comes with it.
+        /// Whether a handle comes with it: every kind has one (a file
+        /// its channel, since J60).
         pub fn has_handle(&self) -> bool {
-            !matches!(self, Entry::File { .. })
+            true
         }
     }
 }
@@ -950,8 +955,12 @@ pub const CHANNEL_QUEUE_MAX: usize = 32;
 /// process_wait may watch.
 pub const SPAWN_HANDLES_MAX: u64 = 8;
 /// Most handles one object_wait may watch. More than a process can be
-/// started with: init watches every service, and an answer from each.
-pub const WAIT_HANDLES_MAX: u64 = 32;
+/// started with: init watches every service, and an answer from each;
+/// and a file service watches every file its clients have open (J60).
+/// A wait joins the wait queue of each handle, so it costs in
+/// proportion: a port - one queue for many channels - is the way past
+/// that (lanes: ipc).
+pub const WAIT_HANDLES_MAX: u64 = 256;
 /// Longest program name.
 pub const PROGRAM_NAME_MAX: u64 = 64;
 
@@ -2508,7 +2517,7 @@ mod tests {
         let file = Entry::File { descriptor: 3, flags: 0o2101, offset: 1 << 40, path: "/docs/log" };
         let n = file.encode(&mut out).unwrap();
         assert_eq!(Entry::decode(&out[..n]), Some(file.clone()));
-        assert!(!file.has_handle());
+        assert!(file.has_handle(), "its channel travels with it");
         for entry in [Entry::Read { descriptor: 7 }, Entry::Write { descriptor: 31 }] {
             let n = entry.encode(&mut out).unwrap();
             assert_eq!(n, 2);
