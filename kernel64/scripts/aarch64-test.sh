@@ -97,11 +97,13 @@ need() {
 
 # ---- build ------------------------------------------------------------
 (cd "$HERE" && cargo build --release --quiet --target $TARGET)
+python3 "$HERE/scripts/fill-symbols.py" "$HERE/target/$TARGET/release/kernel64" > /dev/null
 # Put in place in one step: another test may be booting the image that
 # is there now (the same one, unless the sources changed in between).
 "$OBJCOPY" -O binary "$HERE/target/$TARGET/release/kernel64" "$OUT/Image.$$" && mv -f "$OUT/Image.$$" "$OUT/Image"
 for fault in null page rodata nx stack thread-stack; do
     (cd "$HERE" && cargo build --release --quiet --target $TARGET --features fault-$fault --target-dir target/aarch64-fault-$fault)
+    python3 "$HERE/scripts/fill-symbols.py" "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" > /dev/null
     "$OBJCOPY" -O binary "$HERE/target/aarch64-fault-$fault/$TARGET/release/kernel64" "$OUT/Image-fault-$fault"
 done
 
@@ -313,6 +315,10 @@ fault() {
     need "$log" "$what"
     need "$log" "from the kernel \(vector 4\)"
     need "$log" "    pc  0xffffffff"
+    # Where it happened, in words: the backtrace names kernel_main (the
+    # fault tests run there), from the kernel's own symbols (journal
+    # entry 122).
+    need "$log" "^    (#[0-3]|lr ) +0x[0-9a-f]+  (kernel64::)?kernel_main\\+0x"
     if grep -aEq "FAILED|\[kernel\] idle|\[kernel\] no programs can run" "$log"; then
         fail "the kernel carried on after the fault"
     fi
