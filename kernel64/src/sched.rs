@@ -6,14 +6,25 @@
 //! them apart means every scheduling rule here is tested on the host,
 //! where a wrong decision is an assertion failure rather than a hang.
 //!
-//! The policy is round-robin with time slices, on any number of CPUs:
-//!   - runnable threads wait in ONE FIFO queue, shared by all CPUs:
-//!     whichever CPU needs a thread next takes the one that has waited
-//!     longest. Work spreads over the CPUs by itself, and a thread runs
-//!     on whichever CPU is free - it does not belong to one.
+//! The policy is round-robin with time slices and priorities, on any
+//! number of CPUs:
+//!   - each thread has a priority, from HIGHEST (-20) to LOWEST (19),
+//!     DEFAULT 0, and an affinity: the CPUs it may run on (journal entry
+//!     NNN). Runnable threads wait in ONE set of FIFO queues, one per
+//!     priority, shared by all CPUs: a CPU that needs a thread takes the
+//!     most important one allowed on it, and of those the one that has
+//!     waited longest. Work spreads over the CPUs by itself, and a
+//!     thread runs on whichever allowed CPU is free.
 //!   - each CPU has a running thread, which gets SLICE timer ticks;
-//!     when they run out and someone is waiting, it goes to the back of
-//!     the queue
+//!     when they run out and someone at least as important is waiting,
+//!     it goes to the back of its queue. A less important thread never
+//!     takes a CPU from a more important one: priorities are strict, so
+//!     a busy important thread that never waits leaves nothing for the
+//!     less important ones (shares in proportion are K100's).
+//!   - a thread made ready that is more important than one running on a
+//!     CPU it may use, with no allowed CPU idling, takes that CPU at
+//!     once: the CPU is asked to choose again (and interrupted if it is
+//!     another), rather than the thread waiting out a slice
 //!   - a thread can also give up the CPU early (yield), sleep until a
 //!     tick, block until woken, or exit
 //!   - each CPU has an idle thread, which runs only when the queue is
@@ -53,6 +64,73 @@ pub enum State {
 /// How many ticks a thread may run before others get a turn.
 pub const SLICE: u64 = 2;
 
+/// Priorities: lower is more important, as with `nice`.
+pub type Priority = i8;
+pub const HIGHEST: Priority = -20;
+pub const LOWEST: Priority = 19;
+pub const DEFAULT: Priority = 0;
+/// How many priorities there are: one queue each.
+const LEVELS: usize = (LOWEST - HIGHEST + 1) as usize;
+/// Every CPU, as an affinity.
+pub const ANY_CPU: u64 = u64::MAX;
+
+/// What a thread asks of the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attributes {
+    priority: Priority,
+    /// One bit per CPU it may run on.
+    affinity: u64,
+}
+
+/// The runnable threads that are on no CPU: a FIFO queue per priority,
+/// the most important first.
+pub struct Ready {
+    levels: [VecDeque<ThreadId>; LEVELS],
+}
+
+impl Ready {
+    fn new() -> Ready {
+        Ready { levels: core::array::from_fn(|_| VecDeque::new()) }
+    }
+
+    fn push_back(&mut self, id: ThreadId, priority: Priority) {
+        self.levels[level(priority)].push_back(id);
+    }
+
+    /// Takes `id` out, wherever it is; false if it was not there.
+    fn remove(&mut self, id: ThreadId) -> bool {
+        for queue in &mut self.levels {
+            if let Some(at) = queue.iter().position(|&other| other == id) {
+                queue.remove(at);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn contains(&self, id: &ThreadId) -> bool {
+        self.levels.iter().any(|queue| queue.contains(id))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.levels.iter().all(VecDeque::is_empty)
+    }
+
+    pub fn len(&self) -> usize {
+        self.levels.iter().map(VecDeque::len).sum()
+    }
+
+    /// In the order they would be taken: the most important first, and
+    /// within a priority the longest waiting first.
+    pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
+        self.levels.iter().flatten()
+    }
+}
+
+fn level(priority: Priority) -> usize {
+    (priority.clamp(HIGHEST, LOWEST) - HIGHEST) as usize
+}
+
 /// What the scheduler keeps for each CPU.
 struct Cpu {
     /// The thread on this CPU now - until the next `pick_next`, even if
@@ -69,7 +147,9 @@ struct Cpu {
 
 pub struct Scheduler {
     states: BTreeMap<ThreadId, State>,
-    ready: VecDeque<ThreadId>,
+    /// Each thread's priority and affinity; an idle thread has none.
+    attributes: BTreeMap<ThreadId, Attributes>,
+    ready: Ready,
     cpus: Vec<Cpu>,
     /// The CPUs that must be interrupted, one bit each: idling CPUs
     /// that were offered a thread by another CPU and cannot know it.
@@ -100,7 +180,11 @@ impl Scheduler {
         states.insert(idle, State::Ready); // ready, but never queued
         states.insert(running, State::Running);
         let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false };
-        Scheduler { states, ready: VecDeque::new(), cpus: alloc::vec![cpu], pokes: 0 }
+        let mut attributes = BTreeMap::new();
+        if running != idle {
+            attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU });
+        }
+        Scheduler { states, attributes, ready: Ready::new(), cpus: alloc::vec![cpu], pokes: 0 }
     }
 
     /// One more CPU, running its idle thread `idle`. Returns its number:
@@ -141,11 +225,97 @@ impl Scheduler {
         self.states.len()
     }
 
-    /// A new thread, ready to run. `cpu` is the CPU this is called on:
-    /// if it is idling, it should take the thread at once.
+    /// A new thread, ready to run, at the default priority on any CPU.
+    /// `cpu` is the CPU this is called on: if it is idling, it should
+    /// take the thread at once.
     pub fn add(&mut self, id: ThreadId, cpu: usize) {
+        self.add_with(id, cpu, DEFAULT, ANY_CPU);
+    }
+
+    /// A new thread, ready to run, with its priority and affinity.
+    pub fn add_with(&mut self, id: ThreadId, cpu: usize, priority: Priority, affinity: u64) {
         assert!(self.states.insert(id, State::Ready).is_none(), "thread {id} added twice");
+        let priority = priority.clamp(HIGHEST, LOWEST);
+        self.attributes.insert(id, Attributes { priority, affinity });
         self.enqueue(id, cpu);
+    }
+
+    /// `id`'s priority; None for an idle thread or one not known.
+    pub fn priority(&self, id: ThreadId) -> Option<Priority> {
+        self.attributes.get(&id).map(|a| a.priority)
+    }
+
+    /// The CPUs `id` may run on.
+    pub fn affinity(&self, id: ThreadId) -> Option<u64> {
+        self.attributes.get(&id).map(|a| a.affinity)
+    }
+
+    /// Gives `id` a new priority. A queued thread moves to its new
+    /// queue (and may take a CPU from a less important one); a running
+    /// one that is now less important than someone waiting for its CPU
+    /// gives way at once. `cpu` is the CPU this is called on. False if
+    /// `id` is not a thread here (or is an idle thread).
+    pub fn set_priority(&mut self, id: ThreadId, priority: Priority, cpu: usize) -> bool {
+        let Some(attributes) = self.attributes.get_mut(&id) else { return false };
+        attributes.priority = priority.clamp(HIGHEST, LOWEST);
+        if self.ready.remove(id) {
+            self.ready.push_back(id, self.attributes[&id].priority);
+            self.offer(id, cpu);
+        } else if let Some(on) = self.cpu_of(id) {
+            if self.someone_waiting_for(on) {
+                self.ask(on, cpu);
+            }
+        }
+        true
+    }
+
+    /// Gives `id` the CPUs it may run on, one bit each. A running thread
+    /// on a CPU no longer allowed leaves it at once. The caller checks
+    /// that `affinity` names a CPU there is. False as for set_priority.
+    pub fn set_affinity(&mut self, id: ThreadId, affinity: u64, cpu: usize) -> bool {
+        let Some(attributes) = self.attributes.get_mut(&id) else { return false };
+        attributes.affinity = affinity;
+        if self.ready.contains(&id) {
+            self.offer(id, cpu);
+        } else if let Some(on) = self.cpu_of(id) {
+            if !self.allowed(id, on) {
+                self.ask(on, cpu);
+            }
+        }
+        true
+    }
+
+    /// Whether `id` may run on `cpu`. An idle thread runs only on its
+    /// own CPU, and is never asked.
+    fn allowed(&self, id: ThreadId, cpu: usize) -> bool {
+        self.attributes.get(&id).is_none_or(|a| a.affinity & (1u64 << cpu) != 0)
+    }
+
+    /// The thread `cpu` would take next: the most important allowed on
+    /// it, the longest waiting of those.
+    fn best_for(&self, cpu: usize) -> Option<ThreadId> {
+        self.ready.iter().copied().find(|&id| self.allowed(id, cpu))
+    }
+
+    /// Whether a thread waiting may take `cpu` from its current one at
+    /// the end of a slice: one at least as important that may run there
+    /// - or anyone at all, if the current one may no longer run there.
+    fn someone_waiting_for(&self, cpu: usize) -> bool {
+        let this = &self.cpus[cpu];
+        let Some(best) = self.best_for(cpu) else { return false };
+        if this.current == this.idle || !self.allowed(this.current, cpu) {
+            return true;
+        }
+        self.priority(best) <= self.priority(this.current)
+    }
+
+    /// Asks `cpu` to choose again; interrupted if it is not `from`, the
+    /// CPU this is decided on.
+    fn ask(&mut self, cpu: usize, from: usize) {
+        self.cpus[cpu].reschedule = true;
+        if cpu != from {
+            self.pokes |= 1 << cpu;
+        }
     }
 
     /// One timer tick at time `now`, on the CPU that keeps the time:
@@ -167,7 +337,7 @@ impl Scheduler {
     /// One timer tick on a CPU that does not keep the time: only the
     /// slice of the thread on `cpu`.
     pub fn tick_slice(&mut self, cpu: usize) {
-        let waiting = !self.ready.is_empty();
+        let waiting = self.someone_waiting_for(cpu);
         let this = &mut self.cpus[cpu];
         if this.current == this.idle {
             // An idling CPU has no slice to finish: work that arrived
@@ -203,28 +373,50 @@ impl Scheduler {
     fn enqueue(&mut self, id: ThreadId, cpu: usize) {
         debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
         self.states.insert(id, State::Ready);
-        self.ready.push_back(id);
-        self.offer(cpu);
+        let priority = self.priority(id).unwrap_or(DEFAULT);
+        self.ready.push_back(id, priority);
+        self.offer(id, cpu);
     }
 
-    /// One thread has just joined the queue, put there by `cpu`: finds
-    /// an idling CPU to take it. This CPU if it idles - it needs no
-    /// telling. Otherwise another, which does: it sits halted, and
-    /// without an interrupt would look at the queue only at its next
-    /// timer tick.
+    /// Thread `id` has just joined the queue, put there by `cpu`: finds
+    /// a CPU to take it. An idling CPU it may run on: this one if it
+    /// idles - it needs no telling - or another, which does: it sits
+    /// halted, and without an interrupt would look at the queue only at
+    /// its next timer tick.
     ///
     /// A CPU already offered a thread is passed over, so that two
     /// threads made ready one after the other get two CPUs, not the
-    /// same one twice. If every CPU is busy nothing is done: the
-    /// thread waits for a slice to end, as it always did.
-    fn offer(&mut self, cpu: usize) {
-        let free = |c: &Cpu| c.current == c.idle && !c.reschedule;
-        let chosen = if free(&self.cpus[cpu]) { Some(cpu) } else { self.cpus.iter().position(free) };
-        if let Some(chosen) = chosen {
-            self.cpus[chosen].reschedule = true;
-            if chosen != cpu {
-                self.pokes |= 1 << chosen;
+    /// same one twice.
+    ///
+    /// If no allowed CPU idles, the thread may still take one from a
+    /// less important thread: the allowed CPU running the least
+    /// important one, this CPU first among equals (no interrupt). If
+    /// none is less important, nothing is done: it waits for a slice to
+    /// end, as it always did.
+    fn offer(&mut self, id: ThreadId, cpu: usize) {
+        let free = |s: &Scheduler, c: usize| {
+            let this = &s.cpus[c];
+            this.current == this.idle && !this.reschedule && s.allowed(id, c)
+        };
+        let count = self.cpus.len();
+        if let Some(chosen) = (0..count).map(|n| (cpu + n) % count).find(|&c| free(self, c)) {
+            self.ask(chosen, cpu);
+            return;
+        }
+        let priority = self.priority(id).unwrap_or(DEFAULT);
+        let mut victim: Option<(usize, Priority)> = None;
+        for c in (0..count).map(|n| (cpu + n) % count) {
+            let this = &self.cpus[c];
+            if this.current == this.idle || this.reschedule || !self.allowed(id, c) {
+                continue;
             }
+            let theirs = self.priority(this.current).unwrap_or(DEFAULT);
+            if theirs > priority && victim.is_none_or(|(_, worst)| theirs > worst) {
+                victim = Some((c, theirs));
+            }
+        }
+        if let Some((chosen, _)) = victim {
+            self.ask(chosen, cpu);
         }
     }
 
@@ -287,14 +479,28 @@ impl Scheduler {
         // nobody made.
         self.cpus[cpu].reschedule = false;
         let still_running = self.states.get(&from) == Some(&State::Running);
+        // A running thread may stay only on a CPU it is allowed.
+        let may_stay = still_running && self.allowed(from, cpu);
 
-        let Some(to) = self.ready.pop_front() else {
-            if still_running {
+        // The best waiting thread - unless it is less important than the
+        // one running, which keeps the CPU (priorities are strict).
+        let candidate = self.best_for(cpu).filter(|&best| {
+            !(may_stay && from != idle && self.priority(best) > self.priority(from))
+        });
+        let Some(to) = candidate else {
+            if may_stay {
                 self.cpus[cpu].slice_left = SLICE;
-                return None; // nobody else wants the CPU
+                return None; // nobody else may have the CPU
             }
-            return self.switch_to(cpu, from, idle);
+            let switch = self.switch_to(cpu, from, idle);
+            if still_running && from != idle {
+                // No longer allowed here: back in the queue, for a CPU
+                // it may run on.
+                self.enqueue(from, cpu);
+            }
+            return switch;
         };
+        self.ready.remove(to);
         // The switch comes first: `from` is on no CPU from here on, and
         // only then may it be queued.
         let switch = self.switch_to(cpu, from, to);
@@ -302,10 +508,9 @@ impl Scheduler {
             if from == idle {
                 self.states.insert(from, State::Ready); // ready, never queued
             } else {
-                self.states.insert(from, State::Ready);
-                self.ready.push_back(from);
-                // It gave way on this CPU; another may be idling.
-                self.offer(cpu);
+                // It gave way on this CPU; another may be idling, or
+                // running someone less important.
+                self.enqueue(from, cpu);
             }
         }
         switch
@@ -326,6 +531,7 @@ impl Scheduler {
             return false;
         }
         self.states.remove(&id);
+        self.attributes.remove(&id);
         true
     }
 }
@@ -884,5 +1090,208 @@ mod tests {
             assert!(ran.get(&id).copied().unwrap_or(0) > 50, "thread {id} starved");
         }
         (moved, poked)
+    }
+    // ---- Priorities and affinity (journal entry NNN) ----------------------
+
+    #[test]
+    fn the_most_important_ready_thread_runs_first() {
+        let mut s = Scheduler::new(IDLE);
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.add_with(2, 0, 5, ANY_CPU);
+        s.add_with(3, 0, -5, ANY_CPU);
+        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [3, 1, 2], "the queue's order");
+        assert_eq!(next(&mut s), 3);
+    }
+
+    #[test]
+    fn a_less_important_thread_never_takes_the_cpu_from_a_more_important_one() {
+        let mut s = Scheduler::new(IDLE);
+        s.add_with(1, 0, -5, ANY_CPU);
+        s.add_with(2, 0, DEFAULT, ANY_CPU);
+        assert_eq!(next(&mut s), 1);
+        for _ in 0..10 * SLICE {
+            s.tick_slice(0);
+            assert!(!s.take_reschedule(0), "a slice ended for a less important thread");
+        }
+        assert_eq!(next(&mut s), 1, "a yield gave the CPU to a less important thread");
+        // Equals still take turns: round-robin within a priority.
+        s.add_with(3, 0, -5, ANY_CPU);
+        assert_eq!(next(&mut s), 3);
+        assert_eq!(next(&mut s), 1);
+    }
+
+    #[test]
+    fn a_woken_important_thread_takes_this_cpu_at_once() {
+        let mut s = Scheduler::new(IDLE);
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.add_with(2, 0, -5, ANY_CPU);
+        assert_eq!(next(&mut s), 2);
+        s.suspend_current(0, State::Blocked);
+        assert_eq!(next(&mut s), 1);
+        assert!(!s.take_reschedule(0));
+        s.wake(2, 0);
+        assert!(s.take_reschedule(0), "the woken thread waits out a slice behind a less important one");
+        assert_eq!(s.take_pokes(), 0, "nobody else needs telling");
+        assert_eq!(next(&mut s), 2);
+        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn a_woken_important_thread_takes_another_cpu_with_an_interrupt() {
+        let mut s = two_cpus();
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.add_with(2, 0, 3, ANY_CPU);
+        s.add_with(9, 0, -5, ANY_CPU);
+        s.take_pokes();
+        assert_eq!(next(&mut s), 9);
+        s.pick_next(1);
+        assert_eq!(s.current(1), 1);
+        s.suspend_current(0, State::Blocked);
+        assert_eq!(next(&mut s), 2);
+        s.take_pokes();
+        // Woken from CPU 1: CPU 0 runs the least important thread (3),
+        // so CPU 0 is the one interrupted.
+        s.wake(9, 1);
+        assert_eq!(s.take_pokes(), 1 << 0, "the CPU with the least important thread was not interrupted");
+        assert!(s.take_reschedule(0));
+        assert!(!s.take_reschedule(1));
+    }
+
+    #[test]
+    fn a_thread_runs_only_on_the_cpus_it_may() {
+        let mut s = two_cpus();
+        s.add_with(1, 0, DEFAULT, 1 << 1);
+        assert_eq!(s.take_pokes(), 1 << 1, "the idling CPU it may run on was not told");
+        assert!(!s.take_reschedule(0), "a CPU it may not run on was offered it");
+        assert_eq!(next(&mut s), IDLE, "CPU 0 took a thread pinned to CPU 1");
+        s.pick_next(1);
+        assert_eq!(s.current(1), 1);
+        assert_eq!(s.affinity(1), Some(1 << 1));
+    }
+
+    #[test]
+    fn a_running_thread_leaves_a_cpu_it_may_no_longer_use() {
+        let mut s = two_cpus();
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.take_pokes();
+        assert_eq!(next(&mut s), 1);
+        assert!(s.set_affinity(1, 1 << 1, 0));
+        assert!(s.take_reschedule(0), "the thread stayed on a CPU it may not use");
+        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(s.take_pokes(), 1 << 1, "CPU 1 was not told of it");
+        s.pick_next(1);
+        assert_eq!(s.current(1), 1);
+    }
+
+    #[test]
+    fn a_new_priority_moves_a_queued_thread_and_can_end_a_running_ones_turn() {
+        let mut s = Scheduler::new(IDLE);
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.add_with(2, 0, DEFAULT, ANY_CPU);
+        s.add_with(3, 0, DEFAULT, ANY_CPU);
+        assert_eq!(next(&mut s), 1);
+        assert!(s.set_priority(3, -1, 0));
+        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [3, 2], "the queued thread did not move up");
+        assert!(s.take_reschedule(0), "a more important thread waits behind a running one");
+        assert_eq!(next(&mut s), 3);
+        // 3 now lowers itself below the others: it gives way.
+        assert!(s.set_priority(3, 1, 0));
+        assert!(s.take_reschedule(0));
+        assert_eq!(next(&mut s), 2);
+        assert!(!s.set_priority(IDLE, -5, 0), "an idle thread has no priority to set");
+        assert!(!s.set_priority(77, -5, 0), "a thread that is not there has no priority to set");
+    }
+
+    #[test]
+    fn randomized_with_priorities_and_affinity() {
+        const CPUS: usize = 4;
+        let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };
+        let mut s = Scheduler::new(IDLE);
+        for cpu in 1..CPUS {
+            s.add_cpu(idle_of(cpu));
+        }
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let threads = 24u64;
+        for id in 1..=threads {
+            let priority = (random() % 7) as Priority - 3;
+            let affinity = if random() % 4 == 0 { 1 << (random() % CPUS as u64) } else { ANY_CPU };
+            s.add_with(id, 0, priority, affinity);
+        }
+        // After each thing CPU `by` does: whoever is to be interrupted for
+        // it has been asked to choose again, and is not `by` itself.
+        let check_pokes = |s: &mut Scheduler, by: usize, step: u32| {
+            let pokes = s.take_pokes();
+            for other in 0..CPUS {
+                if pokes & (1 << other) != 0 {
+                    assert!(s.cpus[other].reschedule, "step {step}: CPU {other} interrupted for nothing");
+                    assert_ne!(other, by, "step {step}: CPU {other} told itself");
+                }
+            }
+        };
+        check_pokes(&mut s, 0, 0);
+        let mut now = 0;
+        for step in 0..40_000u32 {
+            let cpu = (random() % CPUS as u64) as usize;
+            if step as usize % CPUS == 0 {
+                now += 1;
+                s.tick(now, 0);
+                check_pokes(&mut s, 0, step);
+            } else {
+                s.tick_slice(cpu);
+                check_pokes(&mut s, cpu, step);
+            }
+            let on_idle = s.current(cpu) == idle_of(cpu);
+            match random() % 16 {
+                0 if !on_idle => s.suspend_current(cpu, State::Sleeping(now + random() % 5)),
+                1 if !on_idle => s.suspend_current(cpu, State::Blocked),
+                2..=4 => {
+                    s.wake(1 + random() % threads, cpu);
+                }
+                5 => {
+                    s.set_priority(1 + random() % threads, (random() % 7) as Priority - 3, cpu);
+                }
+                6 => {
+                    let affinity = if random() % 2 == 0 { 1 << (random() % CPUS as u64) } else { ANY_CPU };
+                    s.set_affinity(1 + random() % threads, affinity, cpu);
+                }
+                _ => {}
+            }
+            check_pokes(&mut s, cpu, step);
+            if random() % 3 != 0 {
+                s.pick_next(cpu);
+                check_pokes(&mut s, cpu, step);
+                let current = s.current(cpu);
+                assert!(s.allowed(current, cpu), "step {step}: CPU {cpu} runs thread {current}, which may not run there");
+                // Strict: nobody allowed here and waiting is more
+                // important than the thread just chosen.
+                if let Some(best) = s.best_for(cpu) {
+                    if current != idle_of(cpu) {
+                        assert!(
+                            s.priority(best) >= s.priority(current),
+                            "step {step}: CPU {cpu} chose {current} over the more important {best}"
+                        );
+                    } else {
+                        panic!("step {step}: CPU {cpu} idles while {best} may run there");
+                    }
+                }
+            }
+            for a in 0..CPUS {
+                let current = s.current(a);
+                for b in a + 1..CPUS {
+                    assert_ne!(current, s.current(b), "one thread on CPUs {a} and {b}");
+                }
+                assert!(!s.ready.contains(&current), "thread {current} is on CPU {a} and in the queue");
+            }
+            for (n, id) in s.ready.iter().enumerate() {
+                assert!(!s.ready.iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
+                assert_eq!(s.state(*id), Some(State::Ready));
+            }
+        }
     }
 }
