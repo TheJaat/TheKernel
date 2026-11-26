@@ -273,6 +273,55 @@ pub mod call {
     /// again when next touched. madvise(MADV_DONTNEED). Whole pages, in
     /// one reservation, as for MEMORY_PROTECT.
     pub const MEMORY_DISCARD: u64 = 44;
+    /// sched_set(target, id, what, value) - sets a thread's or a
+    /// process's scheduling (`sched`): its priority, the CPUs it may run
+    /// on, or a process's ceiling. `target` is sched::THREAD (`id` 0 for
+    /// the calling thread, else a thread of the caller's own process, as
+    /// THREAD_CREATE named it) or sched::PROCESS (`id` 0 for the caller's
+    /// own, else a process handle with KILL: whoever started it). A
+    /// priority or ceiling more important than the caller's own ceiling
+    /// is AccessDenied; an affinity with no CPU there is, InvalidArgument
+    /// (journal entry NNN).
+    pub const SCHED_SET: u64 = 45;
+    /// sched_get(target, id, what) - what SCHED_SET sets, read back; and
+    /// sched::THREAD_ID, the calling thread's own number.
+    pub const SCHED_GET: u64 = 46;
+}
+
+/// SCHED_SET's and SCHED_GET's words (journal entry NNN). Priorities run
+/// from HIGHEST (-20, the most important) to LOWEST (19), DEFAULT 0, as
+/// `nice` counts; in the calls they travel as levels, 0 to 39 (`level`,
+/// `priority`), so that no value looks like an error.
+pub mod sched {
+    /// Targets.
+    pub const THREAD: u64 = 0;
+    pub const PROCESS: u64 = 1;
+    /// What is set or read.
+    pub const PRIORITY: u64 = 0;
+    /// One bit per CPU the thread (or each of the process's threads) may
+    /// run on.
+    pub const AFFINITY: u64 = 1;
+    /// A process's ceiling: the most important priority it may give
+    /// itself, its threads or a process it started. init's is HIGHEST,
+    /// every other process's DEFAULT until whoever started it changes
+    /// it - never above their own.
+    pub const CEILING: u64 = 2;
+    /// SCHED_GET only, target THREAD, id 0: the calling thread's number.
+    pub const THREAD_ID: u64 = 3;
+
+    pub const HIGHEST: i64 = -20;
+    pub const LOWEST: i64 = 19;
+    pub const DEFAULT: i64 = 0;
+
+    /// A priority as it travels in the calls.
+    pub fn level(priority: i64) -> u64 {
+        (priority.clamp(HIGHEST, LOWEST) - HIGHEST) as u64
+    }
+
+    /// A level back to its priority.
+    pub fn priority(level: u64) -> i64 {
+        level.min((LOWEST - HIGHEST) as u64) as i64 + HIGHEST
+    }
 }
 
 /// MEMORY_PROTECT's `access`.
@@ -2483,6 +2532,15 @@ pub mod net {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_priority_survives_its_level() {
+        for priority in super::sched::HIGHEST..=super::sched::LOWEST {
+            assert_eq!(super::sched::priority(super::sched::level(priority)), priority);
+        }
+        assert_eq!(super::sched::level(-100), 0, "clamped to HIGHEST");
+        assert_eq!(super::sched::priority(1000), super::sched::LOWEST, "clamped to LOWEST");
+    }
+
     #[test]
     fn a_process_entry_survives_its_words() {
         let mut name = [0u8; 16];

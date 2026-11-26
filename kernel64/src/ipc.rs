@@ -401,6 +401,96 @@ fn spawn_from(
     table.insert(Object::Process(Arc::clone(&loaded)), Rights(rights::TRANSFER | rights::KILL))
 }
 
+/// SCHED_SET's and SCHED_GET's target process: this one (`id` 0), or
+/// the one `id` names - with KILL for setting, as whoever started it
+/// holds: who may end a process may as well say when it runs.
+fn sched_process(id: Handle, setting: bool) -> Result<Arc<process::Process>, Error> {
+    if id == 0 {
+        return me();
+    }
+    let needed = if setting { Rights(rights::KILL) } else { Rights(0) };
+    match me()?.handles.lock().get(id, needed)? {
+        Object::Process(target) => Ok(Arc::clone(target)),
+        _ => Err(Error::WrongType),
+    }
+}
+
+/// SCHED_SET/SCHED_GET's target thread: the calling one (`id` 0) or one
+/// of this process's own.
+fn sched_thread(id: u64) -> Result<kernel64::sched::ThreadId, Error> {
+    if id == 0 {
+        return Ok(crate::threads::current());
+    }
+    if me()?.thread_ids().contains(&id) { Ok(id) } else { Err(Error::NotFound) }
+}
+
+/// An affinity limited to the CPUs there are; InvalidArgument if it
+/// names none of them.
+fn sched_affinity(value: u64) -> Result<u64, Error> {
+    let cpus = crate::threads::cpus();
+    let there = if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+    if value & there == 0 { Err(Error::InvalidArgument) } else { Ok(value & there) }
+}
+
+/// SCHED_SET (journal entry NNN): a thread's or a process's priority or
+/// CPUs, or a process's ceiling. Nothing more important than the
+/// caller's own ceiling can be given, to anyone: a program cannot start
+/// a child and make it more important than itself is allowed to be.
+pub fn sched_set(target: u64, id: u64, what: u64, value: u64) -> Result<u64, Error> {
+    use abi::sched;
+    let ceiling = me()?.sched_ceiling();
+    let priority = |value: u64| {
+        let priority = sched::priority(value);
+        if priority < ceiling { Err(Error::AccessDenied) } else { Ok(priority) }
+    };
+    match (target, what) {
+        (sched::THREAD, sched::PRIORITY) => {
+            let (thread, priority) = (sched_thread(id)?, priority(value)?);
+            crate::threads::set_priority(thread, priority);
+        }
+        (sched::THREAD, sched::AFFINITY) => {
+            let (thread, affinity) = (sched_thread(id)?, sched_affinity(value)?);
+            crate::threads::set_affinity(thread, affinity);
+        }
+        (sched::PROCESS, sched::PRIORITY) => {
+            let (process, priority) = (sched_process(id, true)?, priority(value)?);
+            process.set_sched_priority(priority);
+            for thread in process.thread_ids() {
+                crate::threads::set_priority(thread, priority);
+            }
+        }
+        (sched::PROCESS, sched::AFFINITY) => {
+            let (process, affinity) = (sched_process(id, true)?, sched_affinity(value)?);
+            process.set_sched_affinity(affinity);
+            for thread in process.thread_ids() {
+                crate::threads::set_affinity(thread, affinity);
+            }
+        }
+        (sched::PROCESS, sched::CEILING) => {
+            let (process, ceiling) = (sched_process(id, true)?, priority(value)?);
+            process.set_sched_ceiling(ceiling);
+        }
+        _ => return Err(Error::InvalidArgument),
+    }
+    Ok(0)
+}
+
+/// SCHED_GET: what SCHED_SET sets, and the calling thread's number.
+pub fn sched_get(target: u64, id: u64, what: u64) -> Result<u64, Error> {
+    use abi::sched;
+    match (target, what) {
+        (sched::THREAD, sched::THREAD_ID) if id == 0 => Ok(crate::threads::current()),
+        (sched::THREAD, sched::PRIORITY | sched::AFFINITY) => {
+            let (priority, affinity) = crate::threads::scheduling(sched_thread(id)?).ok_or(Error::NotFound)?;
+            Ok(if what == sched::PRIORITY { sched::level(priority) } else { affinity })
+        }
+        (sched::PROCESS, sched::PRIORITY) => Ok(sched::level(sched_process(id, false)?.sched_priority())),
+        (sched::PROCESS, sched::AFFINITY) => Ok(sched_process(id, false)?.sched_affinity()),
+        (sched::PROCESS, sched::CEILING) => Ok(sched::level(sched_process(id, false)?.sched_ceiling())),
+        _ => Err(Error::InvalidArgument),
+    }
+}
+
 /// Asks for a process to be ended.
 pub fn kill(handle: Handle) -> Result<u64, Error> {
     let target = match me()?.handles.lock().get(handle, Rights(rights::KILL))? {
