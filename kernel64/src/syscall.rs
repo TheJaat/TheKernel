@@ -76,6 +76,8 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::PROGRAM_HEADERS => process::program_headers(args[0], args[1]),
         call::SIGNAL_STACK => threads::set_signal_stack(args[0], args[1]),
         call::PROCESS_NOTIFY => ipc::notify(args[0], args[1]),
+        call::MEMORY_PROTECT => process::protect_memory(args[0], args[1], args[2]),
+        call::MEMORY_DISCARD => process::discard_memory(args[0], args[1]),
         // Taken before dispatch, by the architecture's own code: it
         // changes every register. Here only if that code did not.
         call::SIGNAL_RETURN => Err(Error::UnknownCall),

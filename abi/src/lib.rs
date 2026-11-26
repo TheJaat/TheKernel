@@ -256,6 +256,34 @@ pub mod call {
     /// program that started a child through init learns of its end -
     /// libc asks for SIGCHLD. Any right to the handle will do.
     pub const PROCESS_NOTIFY: u64 = 42;
+    /// memory_protect(start, length, access) - what this process may do
+    /// with the pages of `start..start+length` in its reserved memory
+    /// (MEMORY_RESERVE): one of `access`'s values - nothing, read, or
+    /// read and write; never run. Pages already touched keep their bytes
+    /// whatever the access: a page with no access is still the
+    /// program's, only out of its reach (and of every system call's)
+    /// until it is given access again. `start` and `length` whole pages,
+    /// all in one reservation: InvalidArgument if not aligned,
+    /// BadAddress if not reserved memory. mprotect.
+    pub const MEMORY_PROTECT: u64 = 43;
+    /// memory_discard(start, length) - gives back the pages of
+    /// `start..start+length` in this process's reserved memory: their
+    /// frames go back to the machine and stop counting against the
+    /// limit, and the address space stays reserved, each page zeroed
+    /// again when next touched. madvise(MADV_DONTNEED). Whole pages, in
+    /// one reservation, as for MEMORY_PROTECT.
+    pub const MEMORY_DISCARD: u64 = 44;
+}
+
+/// MEMORY_PROTECT's `access`.
+pub mod access {
+    /// No access: any touch faults (SIGSEGV), and system calls refuse
+    /// the memory (BadAddress).
+    pub const NONE: u64 = 0;
+    /// Read only: a write faults.
+    pub const READ: u64 = 1;
+    /// Read and write.
+    pub const READ_WRITE: u64 = 2;
 }
 
 /// The most RANDOM gives in one call.

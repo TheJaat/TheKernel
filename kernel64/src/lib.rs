@@ -36,6 +36,7 @@ pub mod memory;
 pub mod paging;
 pub mod pci;
 pub mod psci;
+pub mod protections;
 pub mod queue;
 pub mod regions;
 pub mod rtc;
