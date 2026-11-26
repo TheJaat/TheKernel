@@ -195,7 +195,7 @@ pub fn stop_other_cpus() {
     if STOPPING.swap(true, Ordering::AcqRel) {
         halt_forever();
     }
-    apic::nmi_others();
+    smp::nmi_others();
     // Long enough for them to get there. Not `delay_us`: it needs the
     // clock's speed, and this may be called before that is measured.
     for _ in 0..200_000 {

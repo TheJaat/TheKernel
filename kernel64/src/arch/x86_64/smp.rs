@@ -219,6 +219,24 @@ const ABANDONED: usize = 2;
 /// Where to send a message for each CPU, by the kernel's number for
 /// it: its local APIC id. Filled in as the CPUs answer.
 static APIC_IDS: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+/// How many of APIC_IDS are filled in: the boot CPU, and every CPU that
+/// has answered so far.
+static ANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Sends a non-maskable interrupt to every CPU this kernel started but
+/// this one - to stop them (`stop_other_cpus`). Only those: the CPUs it
+/// left asleep are the firmware's, and an NMI is a triple fault there
+/// (kernel64::smp::nmi_message). Nothing happens before the APIC is
+/// mapped: no other CPU runs then.
+pub fn nmi_others() {
+    let Some(me) = apic::local_id_if_mapped() else { return };
+    for id in APIC_IDS.iter().take(ANSWERED.load(Ordering::Acquire)) {
+        let id = id.load(Ordering::Relaxed);
+        if id != me {
+            apic::nmi(id);
+        }
+    }
+}
 
 /// Interrupts each CPU whose bit is set in `cpus`, so that it chooses
 /// again which thread to run. May be called with interrupts off and
@@ -270,6 +288,7 @@ unsafe fn set_field(page: u64, field: *const u8, value: u64) {
 pub unsafe fn start(madt: &Madt) {
     let plan = smp::plan(&madt.processors, apic::local_id(), MAX_CPUS);
     APIC_IDS[0].store(apic::local_id(), Ordering::Relaxed);
+    ANSWERED.store(1, Ordering::Release);
     if plan.left_asleep > 0 {
         kprintln!("[smp] {} more CPU(s) than the {MAX_CPUS} this kernel uses: left asleep", plan.left_asleep);
     }
@@ -367,6 +386,7 @@ pub unsafe fn start(madt: &Madt) {
         // answered in this very moment, and then it did answer.
         if start.state.compare_exchange(STARTING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_err() {
             APIC_IDS[cpu.index].store(cpu.apic_id, Ordering::Relaxed);
+            ANSWERED.store(cpu.index + 1, Ordering::Release);
             awake.push(cpu.index);
         } else {
             kprintln!("[smp] the CPU with APIC id {} did not answer: left out", cpu.apic_id);

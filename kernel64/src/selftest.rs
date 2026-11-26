@@ -224,6 +224,10 @@ pub fn threads() {
     assert_ne!(log, b"aaabbb", "yield did not hand over the CPU");
     kprintln!("[selftest] threads: two yielding threads ran as {:?}", core::str::from_utf8(&log).unwrap());
 
+    // Rule 3 of threads.rs: waking does not take a waiter out of its
+    // queue. (Rule 1 is checked at every switch.)
+    assert!(threads::rule_3_holds(), "rule 3 of threads.rs: a wake-up took a waiter out of its queue");
+
     // 2. Preemption: this thread never yields. If the timer did not take
     // the CPU from it, nothing else - including this test - would ever
     // run again; it gives up after two seconds and says so.
