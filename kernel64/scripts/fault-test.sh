@@ -13,10 +13,16 @@ STAGE1=$1
 STAGE2=$2
 BUILD=$3
 shift 3
-TESTS=${*:-page double rodata nx stack thread-stack init}
+TESTS=${*:-page page@20 double rodata nx stack thread-stack init}
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 
+# A test is a fault-* feature, and after an @ how many CPUs to boot with
+# (otherwise qemu-boot.sh's 4). page@20: the page fault with 20 CPUs, 4
+# more than the kernel uses - which the firmware keeps parked, and which
+# the NMI that stops the other CPUs must not reach: it was a triple
+# fault, and nothing of the report got out (journal entry 119).
+#
 # What each test must print. grep -E patterns.
 expected() {
     case $1 in
@@ -33,13 +39,17 @@ expected() {
 
 failed=0
 for test in $TESTS; do
-    pattern=$(expected "$test")
-    target="$HERE/target/fault-$test"   # separate, so builds don't evict each other
-    iso_dir="$BUILD/fault64-$test"
-    iso="$BUILD/fault64-$test.iso"
-    log="$BUILD/fault64-$test.log"
+    feature=${test%@*}
+    cpus=
+    [ "$feature" = "$test" ] || cpus=${test#*@}
+    name=$(echo "$test" | tr @ -)
+    pattern=$(expected "$feature")
+    target="$HERE/target/fault-$feature"   # separate, so builds don't evict each other
+    iso_dir="$BUILD/fault64-$name"
+    iso="$BUILD/fault64-$name.iso"
+    log="$BUILD/fault64-$name.log"
 
-    (cd "$HERE" && cargo build --release --quiet --features "fault-$test" --target-dir "$target")
+    (cd "$HERE" && cargo build --release --quiet --features "fault-$feature" --target-dir "$target")
 
     rm -rf "$iso_dir"
     mkdir -p "$iso_dir/kernel"
@@ -56,10 +66,10 @@ for test in $TESTS; do
     LIMIT=40
     # In the init test the kernel goes idle first, and init ends after:
     # the boot is over at the stop itself, not at "idle".
-    if [ "$test" = init ]; then
-        FINISHED_ONLY="THE SYSTEM HAS STOPPED" "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
+    if [ "$feature" = init ]; then
+        FINISHED_ONLY="THE SYSTEM HAS STOPPED" SMP=${cpus:-${SMP:-4}} "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     else
-        "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
+        SMP=${cpus:-${SMP:-4}} "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     fi
     # Every one of these ends with the kernel stopped - and it must have
     # said so on the screen too, where a real machine's user would look.

@@ -563,6 +563,7 @@ fn schedule() {
             unsafe { context::switch(save, load) };
             // Running again - possibly much later, possibly on another
             // CPU - holding the lock some other `schedule` took.
+            rule_1_holds();
             // SAFETY: that `schedule` forgot its guard for exactly this.
             unsafe { THREADS.force_unlock() };
         }
@@ -641,6 +642,7 @@ pub fn preempt_if_needed() {
 /// Where every new thread starts (from `thread_trampoline`).
 pub extern "C" fn thread_entry() -> ! {
     // The `schedule` that switched here left the lock held (rule 1).
+    rule_1_holds();
     // SAFETY: it forgot its guard so that this thread would unlock.
     unsafe { THREADS.force_unlock() };
     // A thread may first be switched to from inside an interrupt, with
@@ -712,6 +714,41 @@ impl WaitQueue {
             wake(id);
         }
     }
+
+    fn holds(&self, id: ThreadId) -> bool {
+        self.waiters.lock().contains(&id)
+    }
+}
+
+/// Rule 1, checked at every switch: the thread switched to finds the lock
+/// still held - by the `schedule` that switched here, which forgot its
+/// guard. Released before the switch (the mistake rule 1 is about), the
+/// lock is free when the first thread lands, while the boot thread is
+/// still the only one switching: a panic at the first switch, every boot,
+/// instead of two CPUs on one stack once in a long while (journal entry
+/// 046 broke it on purpose, and twelve boots passed). One atomic load.
+fn rule_1_holds() {
+    assert!(THREADS.is_locked(), "rule 1 of threads.rs: the lock was released before the switch");
+}
+
+/// Rule 3, checked where the harm is done: a wake-up that lands between
+/// a waiter joining a queue and saying it waits. No test can make a
+/// wake-up land in that gap on purpose - it is two neighbouring steps of
+/// `wait_any_until` (journal entry 046 tried) - but what the wake-up
+/// leaves behind can be checked: the waiter must still be in the queue,
+/// or its own wake-up later finds it in none and it sleeps for ever.
+/// Here, as `wait_any_until` does: join the queue, and before saying
+/// "I am waiting", be woken. (Waking a thread that is running does
+/// nothing else: the policy's `wake` answers false.) For the boot
+/// self-test (selftest.rs).
+pub fn rule_3_holds() -> bool {
+    let queue = WaitQueue::new();
+    let me = current();
+    queue.add(me);
+    queue.wake_all();
+    let held = queue.holds(me);
+    queue.remove(me);
+    held
 }
 
 /// Blocks for as long as `condition` holds, woken by any of `queues` -
