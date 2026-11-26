@@ -7,7 +7,7 @@ device, so keys go in as QEMU's own key events (the monitor's
 `sendkey`, run through QMP) - the same names the PC's boot test types:
 "shift-h i spc ret". The other tokens:
 
-  ~    wait until the shell has run every line typed so far - ten
+  ~    wait until the shell has run the line just entered - ten
        seconds at most; "~~" up to ninety
   !COMMAND,ARG,...
        a monitor command, its commas standing for spaces
@@ -52,6 +52,8 @@ import re
 import socket
 import sys
 import time
+
+import typed_line
 
 RAN = b"[shell] ran"
 
@@ -156,10 +158,26 @@ def absolute(pixel, size):
 def main():
     log, path, screen, tokens = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
     qmp = Qmp(path)
+    # Counted at the last Enter, not when a wait begins: the line may have
+    # run already, and "every line so far" is never reached once a line has
+    # gone to a program that reads it (journal entry NNN).
+    ran_before = 0
+    # For each Enter, what the shell logs once it has run that line.
+    expected = list(typed_line.lines(tokens))
     entered = 0
+    last = None
+    last_before = 0
+
+    def has_run(seconds):
+        # The line just entered has run: its own "[shell] ran" line if its
+        # text is known, else one "ran" more than at its Enter.
+        if last is not None:
+            return wait_until(lambda: count(log, last) > last_before, seconds)
+        return wait_until(lambda: count(log, RAN) > ran_before, seconds)
+
     for token in tokens:
         if token in ("~", "~~"):
-            wait_until(lambda: count(log, RAN) >= entered, 90 if token == "~~" else 10)
+            has_run(90 if token == "~~" else 10)
         elif token.startswith("see:"):
             want = token[4:].replace(",", " ").encode()
             if not wait_until(lambda: count(log, want) > 0, 10):
@@ -174,11 +192,14 @@ def main():
             time.sleep(0.2)
         else:
             if token == "ret":
+                ran_before = count(log, RAN)
+                last = expected[entered]
                 entered += 1
+                last_before = count(log, last) if last is not None else 0
             qmp.monitor(f"sendkey {token}")
             time.sleep(0.05)
-    if not wait_until(lambda: count(log, RAN) >= entered, 10):
-        print(f"qmp-type: the shell did not run all {entered} commands", file=sys.stderr)
+    if not has_run(10):
+        print("qmp-type: the last line typed did not run", file=sys.stderr)
     time.sleep(0.3)
     qmp.monitor(f"screendump {screen}")
     time.sleep(0.3)
