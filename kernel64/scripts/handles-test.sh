@@ -5,7 +5,7 @@
 #     and a replacing rename, and is handed to a child as the file;
 #   - a namespace per process (journal entry 118, J62): a directory
 #     mounted at a path of the program's own, and handed to a child;
-#   - names from a directory descriptor (journal entry NNN, J63): the
+#   - names from a directory descriptor (journal entry 119, J63): the
 #     *at calls, and a child given one directory as its whole tree.
 #
 #   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT

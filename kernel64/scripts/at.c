@@ -1,4 +1,4 @@
-/* at.c - names from a directory descriptor (journal entry NNN, J63):
+/* at.c - names from a directory descriptor (journal entry 119, J63):
  * openat, fstatat, mkdirat, unlinkat, renameat, faccessat, utimensat;
  * and a program given one directory as its whole tree
  * (posix_spawn_file_actions_addroot_np). handles-test.sh boots TheTaaJ
