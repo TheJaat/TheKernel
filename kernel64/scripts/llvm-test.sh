@@ -1,7 +1,7 @@
 #!/bin/sh
 # llvm-test.sh - LLVM on TheTaaJ: llvm-tblgen, llc and llvm-mc,
 # cross-compiled from ports/llvm by tools/build-llvm.py, run there and
-# write byte for byte what the host's tools of the same release (18.1.3)
+# write byte for byte what the host's tools of the same release (23.1.5)
 # write: llvm-tblgen what LLVM's own build writes first, llc and
 # llvm-mc machine code for both of TheTaaJ's machines.
 #
@@ -15,11 +15,11 @@
 # LLVM_TBLGEN in the environment is the host's llvm-tblgen: it says
 # which .td files each job reads (its -d list), and writes the files
 # TheTaaJ's are compared with. The host's clang, llc and llvm-mc are
-# taken from the same directory, and must be 18.1.3 too.
+# taken from the same directory, and must be 23.1.5 too.
 #
 # The steps:
 #
-#   llvm-tblgen --version          "TheTaaJ LLVM version 18.1.3"
+#   llvm-tblgen --version          "TheTaaJ LLVM version 23.1.5"
 #   llvm-tblgen -gen-vt            the value types (GenVT.inc): the one
 #                                  job CodeGen's types need
 #   llvm-tblgen -gen-intrinsic-enums, -gen-intrinsic-impl
@@ -81,8 +81,8 @@ impl.inc include/llvm/IR/Intrinsics.td -gen-intrinsic-impl"
 rm -rf "$WORK" "$DISK"
 mkdir -p "$WORK"
 for tool in clang llc llvm-mc; do
-    "$HOST_BIN/$tool" --version 2>/dev/null | grep -q 'version 18\.1\.3' \
-        || fail "the host's $tool (in $HOST_BIN) is not LLVM 18.1.3, so its output is not what TheTaaJ's must match"
+    "$HOST_BIN/$tool" --version 2>/dev/null | grep -q 'version 23\.1\.5' \
+        || fail "the host's $tool (in $HOST_BIN) is not LLVM 23.1.5, so its output is not what TheTaaJ's must match"
 done
 # 32768 blocks, 128 MiB: llc alone is 29 MB (AArch64) or 34 MB (the PC).
 "$TFSTOOL" mkfs "$DISK" 32768 > /dev/null || fail "cannot make the disk"
@@ -159,12 +159,12 @@ else
 fi
 
 said '\[shell\] line: "with readonly llvm-tblgen --version"' "the keys did not reach the shell"
-said '^TheTaaJ LLVM version 18\.1\.3' "llvm-tblgen did not say its version"
+said '^TheTaaJ LLVM version 23\.1\.5' "llvm-tblgen did not say its version"
 [ "$(grep -ac '"llvm-tblgen" exited with code 0' "$LOG")" -eq 4 ] \
     || fail "llvm-tblgen did not finish all four of its jobs with exit code 0"
 said "^bad\.td:2:[0-9]+: error: Couldn't find class 'Nothing'" "llvm-tblgen did not say what is wrong in bad.td, and where"
 said '"llvm-tblgen" exited with code 1' "llvm-tblgen did not fail on bad.td"
-[ "$(grep -ac '^TheTaaJ LLVM version 18\.1\.3' "$LOG")" -ge 2 ] || fail "llvm-mc did not say its version"
+[ "$(grep -ac '^TheTaaJ LLVM version 23\.1\.5' "$LOG")" -ge 2 ] || fail "llvm-mc did not say its version"
 [ "$(grep -ac '"llc" exited with code 0' "$LOG")" -eq 2 ] || fail "llc did not compile both files with exit code 0"
 [ "$(grep -ac '"llvm-mc" exited with code 0' "$LOG")" -eq 3 ] \
     || fail "llvm-mc did not say its version and assemble both files with exit code 0"

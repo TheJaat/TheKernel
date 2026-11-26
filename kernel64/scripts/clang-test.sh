@@ -2,7 +2,7 @@
 # clang-test.sh - Clang and lld on TheTaaJ: clang and ld.lld,
 # cross-compiled from ports/llvm by tools/build-llvm.py, build TheTaaJ's
 # C programs there. clang writes byte for byte what the host's clang of
-# the same release (18.1.3) writes from the same files with the same
+# the same release (23.1.5) writes from the same files with the same
 # options, and ld.lld links them into the very programs TheTaaJ's own
 # build makes on the host - and one of them runs.
 #
@@ -18,12 +18,12 @@
 #
 # LLVM_TBLGEN in the environment names the host's LLVM directory, as for
 # llvm-test.sh: the host's clang is taken from beside it, and must be
-# 18.1.3 too.
+# 23.1.5 too.
 #
 # The disk is laid out as TheTaaJ's clang expects to find it:
 #
 #   /clang                     the program
-#   /lib/clang/18/include      its headers (stddef.h, stdarg.h, the
+#   /lib/clang/23/include      its headers (stddef.h, stdarg.h, the
 #                              intrinsics), found from /clang's own
 #                              file: TheTaaJ tells a program which it is
 #   /include                   the C library's headers
@@ -50,8 +50,8 @@
 #
 # The steps:
 #
-#   clang --version                     "TheTaaJ clang version 18.1.3"
-#   clang -print-resource-dir           "/lib/clang/18"
+#   clang --version                     "TheTaaJ clang version 23.1.5"
+#   clang -print-resource-dir           "/lib/clang/23"
 #   clang @cflags -c @sources                     all eleven programs, with the
 #                                       options TheTaaJ's own build gives
 #                                       them (the Makefile's TAAJ_CFLAGS
@@ -65,7 +65,7 @@
 #   clang -c nothere.c                  no such file: "clang: error: ...",
 #                                       signed with the name it was
 #                                       started by (argv[0])
-#   ld.lld --version                    "TheTaaJ LLD 18.1.3"
+#   ld.lld --version                    "TheTaaJ LLD 23.1.5"
 #   ld.lld @ldflags NAME.o lib/libc.a -o bin/NAME
 #                                       each of the eleven, linked
 #   bin/chello one two                  one of them, run
@@ -93,8 +93,8 @@
 # leaves .comment out, so a program says nothing of who linked it.
 #
 # -fno-ident: an object says in .comment which compiler wrote it -
-# "TheTaaJ clang version 18.1.3" or "Ubuntu clang version 18.1.3
-# (1ubuntu1)" - and -fno-ident leaves that out, so that what is compared
+# "TheTaaJ clang version 23.1.5" or "clang version 23.1.5 (the host's,
+# tools/build-host-llvm.sh)" - and -fno-ident leaves that out, so that what is compared
 # is what was compiled.
 
 set -u
@@ -109,7 +109,7 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 TFSTOOL=${TFSTOOL:-$ROOT/tools/tfstool-rs/target/release/tfstool}
 TBLGEN=${LLVM_TBLGEN:-llvm-tblgen}
 HOST_BIN=$(dirname "$(command -v "$TBLGEN")")
-RESOURCE=$BIN_DIR/../lib/clang/18/include
+RESOURCE=$BIN_DIR/../lib/clang/23/include
 WORK=$LOG.work
 PROGRAMS="chello cmem cprint cfile cstdio cwords cask cprimes cnet cfloat clib"
 
@@ -142,8 +142,8 @@ OTHER=aarch64
 
 rm -rf "$WORK" "$DISK"
 mkdir -p "$WORK/libc/programs"
-"$HOST_BIN/clang" --version 2>/dev/null | grep -q 'version 18\.1\.3' \
-    || fail "the host's clang (in $HOST_BIN) is not 18.1.3, so its output is not what TheTaaJ's must match"
+"$HOST_BIN/clang" --version 2>/dev/null | grep -q 'version 23\.1\.5' \
+    || fail "the host's clang (in $HOST_BIN) is not 23.1.5, so its output is not what TheTaaJ's must match"
 [ -d "$RESOURCE" ] || fail "no headers for clang in $RESOURCE (tools/build-llvm.py puts them there)"
 
 # 49152 blocks, 192 MiB: clang alone is 82 MB (the PC's) or 72 MB (AArch64's).
@@ -168,10 +168,10 @@ put_tree() { # put_tree FROM TO: every file under FROM, at TO on the disk
         "$TFSTOOL" put "$DISK" "$2/$file" "$1/$file" > /dev/null || fail "cannot put $2/$file on the disk"
     done
 }
-for directory in lib lib/clang lib/clang/18 lib/clang/18/include include libc libc/programs bin tmp; do
+for directory in lib lib/clang lib/clang/23 lib/clang/23/include include libc libc/programs bin tmp; do
     "$TFSTOOL" mkdir "$DISK" $directory > /dev/null || fail "cannot make $directory on the disk"
 done
-put_tree "$RESOURCE" lib/clang/18/include
+put_tree "$RESOURCE" lib/clang/23/include
 put_tree "$ROOT/libc/include" include
 sources=""
 for program in $PROGRAMS; do
@@ -243,10 +243,10 @@ else
 fi
 
 said '\[shell\] line: "with readonly clang --version"' "the keys did not reach the shell"
-said '^TheTaaJ clang version 18\.1\.3' "clang did not say its version"
+said '^TheTaaJ clang version 23\.1\.5' "clang did not say its version"
 said "^Target: $ARCH-unknown-taaj" "clang did not say it is for TheTaaJ on $ARCH"
-# Found from the file it was started from: /clang, so /lib/clang/18.
-said '^/lib/clang/18[[:space:]]*$' "clang did not find its headers from its own file (-print-resource-dir)"
+# Found from the file it was started from: /clang, so /lib/clang/23.
+said '^/lib/clang/23[[:space:]]*$' "clang did not find its headers from its own file (-print-resource-dir)"
 [ "$(grep -ac '"clang" exited with code 0' "$LOG")" -eq 7 ] \
     || fail "clang did not finish all seven of its jobs with exit code 0"
 said "^bad\.c:2:12: error: use of undeclared identifier 'x'" "clang did not say what is wrong in bad.c, and where"
@@ -255,7 +255,7 @@ said "^clang: error: no such file or directory: 'nothere\.c'" "clang did not sig
 [ "$(grep -ac '"clang" exited with code 1' "$LOG")" -eq 4 ] \
     || fail "clang did not fail on bad.c, on nothere.c, linking without the C library and without the right to start ld.lld"
 said '\[shell\] line: "echo done"' "the shell did not get its keys back"
-said '^TheTaaJ LLD 18\.1\.3 \(compatible with GNU linkers\)' "ld.lld did not say its version"
+said '^TheTaaJ LLD 23\.1\.5 \(compatible with GNU linkers\)' "ld.lld did not say its version"
 [ "$(grep -ac '"ld.lld" exited with code 0' "$LOG")" -eq 12 ] \
     || fail "ld.lld did not say its version and link all eleven programs with exit code 0"
 # The program linked on TheTaaJ, run there.

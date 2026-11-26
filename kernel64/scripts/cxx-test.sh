@@ -12,12 +12,15 @@
 #
 # The steps:
 #
+# Before booting: cxxlib's thread_local variable is ELF TLS (readelf).
+#
 #   cxxlib                     every check of the runtime and the library:
 #                              exceptions through frames with destructors,
 #                              rethrow, std::exception_ptr, bad_alloc;
 #                              virtual functions, dynamic_cast, typeid;
 #                              over-aligned new; strings, containers,
-#                              algorithms, streams, <format>, <regex>, ...
+#                              algorithms, streams, locales by name,
+#                              <format>, <regex>, ...
 #                              "c++: N checks, all passed" - and after
 #                              main, a destructor's last words
 #   cxxlib throw               nobody catches it: std::terminate says
@@ -50,6 +53,15 @@ said() {
 keys() {
     python3 -I "$HERE/key-names.py" "$1" || fail "no keys for: $1"
 }
+
+# Real thread-local storage, not emulated (entry 104): in cxxlib's
+# object per_thread is a TLS symbol, and nothing calls __emutls.
+READELF=$(command -v llvm-readelf || ls /usr/bin/llvm-readelf-* 2>/dev/null | sort -V | tail -1)
+if [ -n "$READELF" ]; then
+    "$READELF" -s "$BIN_DIR/cxxlib.o" | grep -Eq 'TLS .*per_thread' \
+        || fail "cxxlib's thread_local variable is not ELF thread-local storage"
+    "$READELF" -s "$BIN_DIR/cxxlib.o" | grep -q '__emutls' && fail "cxxlib still uses emulated TLS (__emutls)"
+fi
 
 rm -f "$DISK"
 "$TFSTOOL" mkfs "$DISK" 1024 > /dev/null && truncate -s 4M "$DISK" || fail "cannot make the disk"
