@@ -350,6 +350,25 @@ static void children_checks(void)
     check(r == 0 && info.si_pid == child && info.si_signo == SIGCHLD && info.si_code == CLD_EXITED && info.si_status == 5,
           "waitid: the child exited with code 5 (CLD_EXITED)");
     check(children_ended == 1, "its end sent SIGCHLD, handled before waitid returned");
+    /* The same, a hundred times over. Whether the handler has run by the
+     * time waitid returns is decided on two CPUs at once - the child
+     * ending, the parent waiting - so one try says little: under KVM the
+     * kernel once let waitid return first, once in twenty runs of
+     * test64 (journal entry 101). A hundred children show it every time
+     * the order is wrong. `expected` counts the children ended so far,
+     * so a late handler that runs during the next child is not counted
+     * twice. */
+    int late = 0, expected = children_ended;
+    for (int i = 0; i < 100 && late >= 0; i++) {
+        pid_t again = start("child-exit");
+        if (again <= 0 || waitid(P_PID, (id_t)again, &info, WEXITED) != 0)
+            late = -1;
+        else if (children_ended < ++expected)
+            late++;
+    }
+    check(late == 0, "a hundred more children: each SIGCHLD handled before its waitid returned");
+    if (late > 0)
+        printf("ground: %d of 100 SIGCHLDs were handled after waitid returned\n", late);
     errno = 0;
     check(waitid(P_PID, (id_t)child, &info, WEXITED) == -1 && errno == ECHILD, "a child waited for is gone");
 

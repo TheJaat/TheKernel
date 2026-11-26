@@ -155,20 +155,32 @@ pub fn kill() {
     };
     let run = || {
         for mode in ["spin", "yield", "sleep", "wait", "unborn"] {
-            let (process, thread) = start(mode);
-            if mode != "unborn" {
-                threads::sleep(3); // long enough to get where it is going
+            // "Promptly" is up to 3 ticks, measured up to three times:
+            // ticks follow the CPU's counter, so a host that stops this
+            // virtual machine for a moment makes one kill look slow
+            // (under KVM with every host CPU busy, 4 boots in 40 did);
+            // a kill that really is slow is slow every time (journal
+            // entry 101).
+            let mut took = 0;
+            for _ in 0..3 {
+                let (process, thread) = start(mode);
+                if mode != "unborn" {
+                    threads::sleep(3); // long enough to get where it is going
+                }
+                assert_eq!(process.exit_code(), None, "forever {mode} ended by itself");
+                let asked = interrupts::ticks();
+                process::kill(&process);
+                process::kill(&process); // asking twice is asking once
+                threads::join(thread);
+                took = interrupts::ticks() - asked;
+                assert_eq!(process.exit_code(), Some(abi::STOPPED), "forever {mode} after the kill");
+                process::kill(&process); // already ended: nothing happens
+                assert_eq!(process.exit_code(), Some(abi::STOPPED));
+                if took <= 3 {
+                    break;
+                }
             }
-            assert_eq!(process.exit_code(), None, "forever {mode} ended by itself");
-            let asked = interrupts::ticks();
-            process::kill(&process);
-            process::kill(&process); // asking twice is asking once
-            threads::join(thread);
-            let took = interrupts::ticks() - asked;
-            assert_eq!(process.exit_code(), Some(abi::STOPPED), "forever {mode} after the kill");
-            assert!(took <= 3, "forever {mode} took {took} ticks to end");
-            process::kill(&process); // already ended: nothing happens
-            assert_eq!(process.exit_code(), Some(abi::STOPPED));
+            assert!(took <= 3, "forever {mode} took {took} ticks to end, three times over");
         }
     };
 

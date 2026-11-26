@@ -77,6 +77,10 @@ pub struct Process {
     root: u64,
     tables: IrqLock<Option<PageTables>>,
     exit_code: AtomicI64,
+    /// Set by the first thread to end the process (`end_current`): it,
+    /// and only it, does the ending. Separate from `exit_code`, which is
+    /// published last, once the ending is done (see there).
+    ending: AtomicBool,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,
     /// The exit code that end will have: STOPPED, or a signal's.
@@ -94,8 +98,9 @@ pub struct Process {
     /// Whom to send what when this process ends (PROCESS_NOTIFY): how
     /// a program learns its child ended (SIGCHLD), the child having
     /// been started by init. Weak: a process that went first is
-    /// skipped.
-    notify: IrqLock<Vec<(Weak<Process>, u64)>>,
+    /// skipped. None once the process is ending and has sent them all:
+    /// a watcher who comes later is told at once (`notify_on_end`).
+    notify: IrqLock<Option<Vec<(Weak<Process>, u64)>>>,
     /// Its ELF program headers (PROGRAM_HEADERS).
     headers: Vec<u8>,
     /// Its threads that have not ended: whom a kill, or the end of the
@@ -511,6 +516,7 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         root: tables.root().as_u64(),
         tables: IrqLock::new(Some(tables)),
         exit_code: AtomicI64::new(RUNNING),
+        ending: AtomicBool::new(false),
         kill_requested: AtomicBool::new(false),
         kill_code: AtomicI64::new(abi::STOPPED),
         signals_pending: AtomicU64::new(0),
@@ -518,7 +524,7 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         signals_ignored: AtomicU64::new(0),
         signal_entry: AtomicU64::new(0),
         signals_on_stack: AtomicU64::new(0),
-        notify: IrqLock::new(Vec::new()),
+        notify: IrqLock::new(Some(Vec::new())),
         headers: image.headers,
         threads: IrqLock::new(Vec::new()),
         handles: IrqLock::new(CapTable::new(abi::HANDLES_MAX)),
@@ -630,23 +636,33 @@ fn end_current(code: i64, how: core::fmt::Arguments) -> ! {
     if let Some(process) = current() {
         let me = threads::current();
         process.threads.lock().retain(|&thread| thread != me);
-        if process.exit_code.compare_exchange(RUNNING, code, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if process.ending.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             kprintln!("[process] {} {:?} {how}", process.pid, process.name);
             if process.pid == ESSENTIAL.load(Ordering::Acquire) {
                 stop_the_system(&process.name, how);
             }
             stop_other_threads(&process);
             process.close_all_handles();
-            // Whoever asked to be told - before those waiting are woken,
-            // so that a program waiting for this child has its SIGCHLD
-            // by the time its wait returns. (Taken out of the lock
-            // first: sending can take the target's locks.)
-            let notify = core::mem::take(&mut *process.notify.lock());
+            // Whoever asked to be told (SIGCHLD to a parent): sent before
+            // the exit code is published. A parent waiting for this
+            // child (PROCESS_WAIT, object_wait) returns as soon as it
+            // sees the code - woken, or re-checking on another CPU at
+            // any moment - and must find its SIGCHLD already pending, so
+            // that the handler runs before its wait returns. Publishing
+            // the code first, as this once did, left a window between
+            // the two: under KVM a parent's waitid returned in it, its
+            // handler not yet run (journal entry 101). The list is taken
+            // out of the lock (sending can take the watcher's locks) and
+            // left None, so a watcher who comes now is told at once.
+            let notify = process.notify.lock().take().unwrap_or_default();
             for (watcher, signal) in notify {
                 if let Some(watcher) = watcher.upgrade() {
                     send_signal(&watcher, signal);
                 }
             }
+            // Only now is the end seen: the code, then the wake-up (a
+            // waker changes what the condition reads first).
+            process.exit_code.store(code, Ordering::Release);
             EXITS.wake_all();
         }
     }
@@ -794,11 +810,10 @@ pub fn signal_on_stack(signal: u64) -> bool {
 /// once, if it has.
 pub fn notify_on_end(target: &Arc<Process>, watcher: &Arc<Process>, signal: u64) {
     {
-        let mut list = target.notify.lock();
-        // Checked under the lock: end_current takes the list after the
-        // exit code is set, so either it finds this entry or this finds
-        // the code.
-        if target.exit_code().is_none() {
+        // Under the lock: end_current takes the list (leaving None) under
+        // it too, so either it finds this entry, or this finds the list
+        // gone and tells the watcher itself.
+        if let Some(list) = target.notify.lock().as_mut() {
             list.push((Arc::downgrade(watcher), signal));
             return;
         }

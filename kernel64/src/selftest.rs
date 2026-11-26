@@ -244,10 +244,23 @@ pub fn threads() {
     kprintln!("[selftest] threads: a thread that never yields was preempted");
 
     // 3. Sleeping.
-    let start = interrupts::ticks();
-    threads::sleep(5);
-    let slept = interrupts::ticks() - start;
-    assert!((5..=7).contains(&slept), "sleep(5) took {slept} ticks");
+    // Never shorter than asked, and not much longer: the upper bound is
+    // tried up to three times. Ticks follow the CPU's counter (clock.rs),
+    // so a host that stops this virtual machine for a moment - as a busy
+    // host running many of them does - makes one sleep late although the
+    // kernel did nothing wrong; a kernel that wakes sleepers late does it
+    // every time (journal entry 101).
+    let mut slept = 0;
+    for _ in 0..3 {
+        let start = interrupts::ticks();
+        threads::sleep(5);
+        slept = interrupts::ticks() - start;
+        assert!(slept >= 5, "sleep(5) took only {slept} ticks");
+        if slept <= 7 {
+            break;
+        }
+    }
+    assert!(slept <= 7, "sleep(5) took {slept} ticks, three times over");
 
     // 4. Churn: 100 threads come and go. Their stacks must be recycled -
     // no growth in slots or frames after the first round.
