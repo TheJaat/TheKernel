@@ -104,9 +104,9 @@ pub unsafe fn init(controller: InterruptController) -> Info {
     let dist = mm::map_mmio(controller.distributor.start, controller.distributor.size.max(0x1_0000)) as *mut u8;
     let version = controller.version;
 
-    // SAFETY (for the whole of this function): the registers were
-    // mapped a moment ago from the addresses the machine gave, and
-    // every offset is one the controller's manual defines.
+    // SAFETY: (this block is the whole of the set-up) the registers were
+    // mapped a moment ago from the addresses the machine gave, and every
+    // offset is one the controller's manual defines.
     let lines = unsafe {
         // Off while it is set up.
         write(dist, distributor::CONTROL, 0);

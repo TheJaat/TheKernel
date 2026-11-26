@@ -404,6 +404,11 @@ struct KernelHeap {
 static HEAP: KernelHeap =
     KernelHeap { state: IrqLock::new(HeapState { heap: Heap::empty(), end: HEAP_START }) };
 
+// SAFETY: `alloc` returns null or a block from the heap of at least
+// `layout`'s size and alignment, which the heap hands to no one else until
+// `dealloc` gives it back (heap crate, tested on the host); `dealloc` is
+// given only what `alloc` returned, with its layout - GlobalAlloc's own
+// contract on the caller. The lock keeps two CPUs out of the heap at once.
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut state = self.state.lock();
@@ -479,8 +484,9 @@ impl PhysicalMemory for DirectMap {
                 .all(|page| tables.translate(phys_to_virt(PhysAddr::new(page))).is_some())
         });
         if mapped {
-            // SAFETY: every page of the range is mapped, checked above.
             let source = phys_to_virt(PhysAddr::new(address)).as_ptr::<u8>();
+            // SAFETY: every page of the range is mapped, checked above;
+            // the buffer is ours, and cannot overlap the direct map.
             unsafe { core::ptr::copy_nonoverlapping(source, buffer.as_mut_ptr(), buffer.len()) };
         }
         mapped
