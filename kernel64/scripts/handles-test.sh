@@ -7,7 +7,7 @@
 #     mounted at a path of the program's own, and handed to a child;
 #   - names from a directory descriptor (journal entry 120, J63): the
 #     *at calls, and a child given one directory as its whole tree;
-#   - /tmp in memory (journal entry NNN, J64): a second file service,
+#   - /tmp in memory (journal entry 122, J64): a second file service,
 #     mounted at /tmp everywhere, and nothing of it on the disk.
 #
 #   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP

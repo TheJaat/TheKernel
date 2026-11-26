@@ -1,4 +1,4 @@
-/* tmp.c - /tmp in memory (journal entry NNN, J64): a second file
+/* tmp.c - /tmp in memory (journal entry 122, J64): a second file
  * service, its files in memory, mounted at /tmp in every program's
  * namespace. handles-test.sh boots TheTaaJ and runs
  *
