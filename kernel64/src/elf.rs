@@ -38,13 +38,10 @@ pub const LOWEST_ADDRESS: u64 = 0x1_0000;
 /// GiB. The program's memory limit (account.rs) is checked too, before
 /// a page is loaded; this only refuses nonsense early.
 pub const MEMORY_MAX: u64 = 1 << 30;
-/// The least stack a program gets when it asks for one: 64 KiB.
-pub const STACK_MIN: u64 = 64 << 10;
-/// The stack a program gets when it does not ask: 8 MiB, as on Linux.
-pub const STACK_DEFAULT: u64 = 8 << 20;
-/// The most stack a program may ask for: 1 GiB - of address space;
-/// only the pages it touches take memory.
-pub const STACK_MAX: u64 = 1 << 30;
+/// The stack sizes, from abi::stack (libc reads them there too).
+pub const STACK_MIN: u64 = abi::stack::MIN;
+pub const STACK_DEFAULT: u64 = abi::stack::DEFAULT;
+pub const STACK_MAX: u64 = abi::stack::MAX;
 /// The most program headers a file may have. Real programs have fewer
 /// than a dozen; the limit keeps a hostile file from making the kernel
 /// read megabytes of them.
@@ -188,13 +185,7 @@ pub fn parse_for(source: &(impl Source + ?Sized), user_end: u64, machine: u16) -
     for h in headers.as_chunks::<56>().0 {
         if u32_at(h, 0) == PT_GNU_STACK {
             // Its size, if it has one, is the stack the program wants.
-            let wanted = u64_at(h, 40);
-            if wanted > STACK_MAX {
-                return Err(ElfError::TooBig);
-            }
-            if wanted > 0 {
-                stack = STACK_MIN.max((wanted + PAGE - 1) & !(PAGE - 1));
-            }
+            stack = abi::stack::size(u64_at(h, 40)).ok_or(ElfError::TooBig)?;
             continue;
         }
         if u32_at(h, 0) != PT_LOAD {

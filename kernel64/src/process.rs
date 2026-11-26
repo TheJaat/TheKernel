@@ -34,6 +34,7 @@ use kernel64::account::{self, Account};
 use kernel64::cap::{CapTable, Rights};
 use kernel64::elf::{self, ElfError};
 use kernel64::ioports::PortBitmap;
+use kernel64::protections::{Access, Protections};
 use kernel64::regions::Regions;
 use kernel64::memory::addr::{phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE};
 use kernel64::paging::{Flags, PageSize, PageTables};
@@ -49,7 +50,7 @@ use crate::{mm, threads};
 /// the program asked for (elf::STACK_DEFAULT, elf::STACK_MAX) - reserved,
 /// a page taken as it is touched. The page below it is never filled, so
 /// overflowing the stack faults.
-const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+const USER_STACK_TOP: u64 = abi::stack::TOP;
 
 /// Where memory objects are mapped, and reserved memory is put: far from
 /// the program (which sits low, near 4 MiB) and the stack (at the very
@@ -64,8 +65,9 @@ enum Mapping {
     /// (Held, never read: dropping it is what frees the frames.)
     Object(#[allow(dead_code)] Arc<MemoryObject>),
     /// Reserved memory (MEMORY_RESERVE): each page filled when first
-    /// touched, with a frame of the process's own.
-    Reserved { writable: bool },
+    /// touched, with a frame of the process's own; what each page
+    /// allows, as MEMORY_PROTECT last said (protections.rs).
+    Reserved(Protections),
 }
 
 const RUNNING: i64 = i64::MIN;
@@ -223,7 +225,7 @@ pub fn unmap_memory(start: u64) -> Result<u64, Error> {
             let frame = tables.unmap(VirtAddr::new(page));
             // This CPU's TLB; the others' below.
             mmu::flush(page);
-            if let (Some(frame), Mapping::Reserved { .. }) = (frame, &mapping) {
+            if let (Some(frame), Mapping::Reserved(_)) = (frame, &mapping) {
                 taken.push(frame);
             }
         }
@@ -250,8 +252,104 @@ pub fn reserve_memory(size: u64, writable: u64) -> Result<u64, Error> {
         return Err(Error::InvalidArgument);
     }
     let process = current().ok_or(Error::InvalidArgument)?;
-    let start = process.mappings.lock().allocate(size, Mapping::Reserved { writable });
+    let usual = if writable { Access::ReadWrite } else { Access::Read };
+    let start = process.mappings.lock().allocate(size, Mapping::Reserved(Protections::new(usual)));
     start.ok_or(Error::OutOfMemory)
+}
+
+/// The flags of a touched page of reserved memory with `access`. A
+/// page with no access keeps its frame, mapped for the kernel only:
+/// without USER the CPU refuses the program any access, and every
+/// system call refuses it too (`user_pages` asks for USER) - and its
+/// bytes are still there when access comes back.
+fn reserved_flags(access: Access) -> Flags {
+    let mut flags = Flags::OWNED | mm::no_execute();
+    match access {
+        Access::None => {}
+        Access::Read => flags |= Flags::USER,
+        Access::ReadWrite => flags |= Flags::USER | Flags::WRITABLE,
+    }
+    flags
+}
+
+/// The pages `start..start+length` of the current process, checked:
+/// whole pages, not empty, all in one reservation.
+fn reserved_range(mappings: &Regions<Mapping>, start: u64, length: u64) -> Result<core::ops::Range<u64>, Error> {
+    if !start.is_multiple_of(PAGE_SIZE) || !length.is_multiple_of(PAGE_SIZE) || length == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let end = start.checked_add(length).ok_or(Error::BadAddress)?;
+    match mappings.find(start) {
+        Some((range, Mapping::Reserved(_))) if end <= range.end => Ok(start..end),
+        _ => Err(Error::BadAddress),
+    }
+}
+
+/// MEMORY_PROTECT: gives the pages `start..start+length` of a
+/// reservation the access `access`. The record changes for every page;
+/// pages already touched get new flags at once, keeping their frames.
+/// Then every CPU forgets the old ones (tlb.rs), since a thread on
+/// another CPU may still have a page's old access cached.
+pub fn protect_memory(start: u64, length: u64, access: u64) -> Result<u64, Error> {
+    let access = Access::from_abi(access).ok_or(Error::InvalidArgument)?;
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let mut mappings = process.mappings.lock();
+    let range = reserved_range(&mappings, start, length)?;
+    if let Some((_, Mapping::Reserved(protections))) = mappings.find_mut(start) {
+        protections.set(range.clone(), access);
+    }
+    let mut changed = false;
+    {
+        let mut tables = process.tables.lock();
+        let tables = tables.as_mut().ok_or(Error::InvalidArgument)?;
+        let flags = reserved_flags(access);
+        mm::with_frames(|frames| {
+            for page in range.clone().step_by(PAGE_SIZE as usize) {
+                let Some(frame) = tables.unmap(VirtAddr::new(page)) else { continue };
+                mmu::flush(page);
+                // The tables for this page are there (it was mapped), so
+                // mapping it again takes no frame and cannot fail.
+                let _ = tables.map(VirtAddr::new(page), frame, PageSize::Size4K, flags, frames);
+                changed = true;
+            }
+        });
+        if changed {
+            mmu::commit_mappings();
+        }
+    }
+    drop(mappings);
+    if changed {
+        crate::tlb::shootdown(process.root);
+    }
+    Ok(0)
+}
+
+/// MEMORY_DISCARD: gives back the frames of the pages
+/// `start..start+length` of a reservation, which stays: each page is
+/// zeroed again when next touched. As `unmap_memory`, the pages leave
+/// the tables and every CPU forgets them before the frames are freed.
+pub fn discard_memory(start: u64, length: u64) -> Result<u64, Error> {
+    let process = current().ok_or(Error::InvalidArgument)?;
+    let mappings = process.mappings.lock();
+    let range = reserved_range(&mappings, start, length)?;
+    let mut taken = Vec::new();
+    {
+        let mut tables = process.tables.lock();
+        let tables = tables.as_mut().ok_or(Error::InvalidArgument)?;
+        for page in range.step_by(PAGE_SIZE as usize) {
+            if let Some(frame) = tables.unmap(VirtAddr::new(page)) {
+                mmu::flush(page);
+                taken.push(frame);
+            }
+        }
+    }
+    drop(mappings);
+    if !taken.is_empty() {
+        crate::tlb::shootdown(process.root);
+        mm::with_frames(|frames| taken.iter().for_each(|&frame| frames.free(frame)));
+        process.account.uncharge(taken.len() as u64);
+    }
+    Ok(0)
 }
 
 /// MEMORY_LIMIT: lowers the current process's limit to `bytes`, if
@@ -308,17 +406,20 @@ pub fn out_of_memory(fault: Fault) -> ! {
 
 /// `fault_in`'s work, with both locks held (mappings, then tables).
 fn fill(process: &Process, mappings: &Regions<Mapping>, tables: &mut PageTables, address: u64, write: bool) -> Fault {
-    let writable = if process.stack.contains(&address) {
-        true
+    let access = if process.stack.contains(&address) {
+        Access::ReadWrite
     } else {
         match mappings.find(address) {
-            Some((_, Mapping::Reserved { writable })) => *writable,
+            Some((_, Mapping::Reserved(protections))) => protections.at(address),
             _ => return Fault::NotOurs,
         }
     };
-    if write && !writable {
+    // A page with no access is never filled: the touch is a fault, and
+    // a system call's buffer there is refused.
+    if !access.allows(write) {
         return Fault::NotOurs;
     }
+    let writable = access == Access::ReadWrite;
     let page = address & !(PAGE_SIZE - 1);
     // Two threads may touch the same new page at once: both fault, and
     // the second to get here finds it filled.
@@ -899,13 +1000,17 @@ pub fn fault_signal(signal: u64) -> Option<u64> {
 /// filled here, as the program's own access would have filled it; if it
 /// cannot be (the limit), the call fails with OutOfMemory.
 ///
-/// What is returned are physical addresses, used after the locks are
-/// let go. Another thread of the process could unmap the memory
-/// meanwhile, and the frame be reused while the call still copies to
-/// it - a race the program would have to make on purpose, against its
-/// own memory, but one that touches a frame no longer its own. Closing
-/// it means holding the frames (or the lock) for the copy: still to do.
-fn user_pages(pointer: u64, length: u64, write: bool) -> Result<Vec<(u64, usize)>, Error> {
+/// `work` is given the physical addresses, and runs with the process's
+/// mappings and tables still locked. Another thread of the process
+/// cannot unmap the memory, discard it or take its access away
+/// meanwhile - each of those takes the mappings lock first - so no
+/// frame is freed, and reused by someone else, while the call still
+/// copies to it. (Until entry 102 the addresses were used after the
+/// locks were let go: a race a program would have had to make on
+/// purpose, against its own memory, but one that wrote to a frame no
+/// longer its own.) `work` must be short and take no lock of its own:
+/// it copies through the direct map, which never faults.
+fn with_user_pages<R>(pointer: u64, length: u64, write: bool, work: impl FnOnce(&[(u64, usize)]) -> R) -> Result<R, Error> {
     let end = pointer.checked_add(length).ok_or(Error::BadAddress)?;
     if end > abi::USER_END {
         return Err(Error::BadAddress);
@@ -950,18 +1055,21 @@ fn user_pages(pointer: u64, length: u64, write: bool) -> Result<Vec<(u64, usize)
         pieces.push((translation.physical.as_u64(), chunk as usize));
         address += chunk;
     }
-    Ok(pieces)
+    Ok(work(&pieces))
 }
 
 /// Copies `length` bytes from the current process's memory at `pointer`.
 pub fn copy_from_user(pointer: u64, length: u64) -> Result<Vec<u8>, Error> {
+    // Room first: allocating takes the heap's lock, which `work` may not.
     let mut bytes = Vec::with_capacity(length as usize);
-    for (physical, length) in user_pages(pointer, length, false)? {
-        let source = phys_to_virt(PhysAddr::new(physical)).as_ptr::<u8>();
-        // SAFETY: the page is mapped (checked), and read through the
-        // direct map, so it stays valid whatever the process does.
-        bytes.extend_from_slice(unsafe { core::slice::from_raw_parts(source, length) });
-    }
+    with_user_pages(pointer, length, false, |pieces| {
+        for &(physical, length) in pieces {
+            let source = phys_to_virt(PhysAddr::new(physical)).as_ptr::<u8>();
+            // SAFETY: the page is mapped (checked) and stays so while
+            // the locks are held; read through the direct map.
+            bytes.extend_from_slice(unsafe { core::slice::from_raw_parts(source, length) });
+        }
+    })?;
     Ok(bytes)
 }
 
@@ -969,48 +1077,49 @@ pub fn copy_from_user(pointer: u64, length: u64) -> Result<Vec<u8>, Error> {
 /// written - checked before a call commits to anything, so a bad buffer
 /// fails the call rather than losing, say, a received message.
 pub fn check_writable(pointer: u64, length: u64) -> Result<(), Error> {
-    user_pages(pointer, length, true).map(|_| ())
+    with_user_pages(pointer, length, true, |_| ())
 }
 
 /// Copies `bytes` into the current process's memory at `pointer`: all of
 /// them, or (if any page is not writable user memory) none.
 pub fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), Error> {
-    let mut offset = 0;
-    for (physical, length) in user_pages(pointer, bytes.len() as u64, true)? {
-        let target = phys_to_virt(PhysAddr::new(physical)).as_mut_ptr::<u8>();
-        // SAFETY: as above, and the page is user memory - never the
-        // kernel's own - so writing it cannot corrupt the kernel.
-        unsafe { target.copy_from_nonoverlapping(bytes[offset..].as_ptr(), length) };
-        offset += length;
-    }
-    Ok(())
+    with_user_pages(pointer, bytes.len() as u64, true, |pieces| {
+        let mut offset = 0;
+        for &(physical, length) in pieces {
+            let target = phys_to_virt(PhysAddr::new(physical)).as_mut_ptr::<u8>();
+            // SAFETY: as above, and the page is user memory - never the
+            // kernel's own - so writing it cannot corrupt the kernel.
+            unsafe { target.copy_from_nonoverlapping(bytes[offset..].as_ptr(), length) };
+            offset += length;
+        }
+    })
 }
 
-/// A u32 of the current process's memory, as one atomic access: a futex
-/// word, which the program's other threads change with atomic
-/// instructions at the same moment. `pointer` must be 4-byte aligned,
-/// so the word is all in one page; `write` asks for a writable page.
-fn user_word(pointer: u64, write: bool) -> Result<&'static core::sync::atomic::AtomicU32, Error> {
+/// `work` on the u32 of the current process's memory at `pointer`, as
+/// one atomic access: a futex word, which the program's other threads
+/// change with atomic instructions at the same moment. `pointer` must
+/// be 4-byte aligned, so the word is all in one page; `write` asks for
+/// a writable page. Run with the locks held, as every copy is
+/// (`with_user_pages`), so the word is still the program's own.
+fn with_user_word<R>(pointer: u64, write: bool, work: impl FnOnce(&core::sync::atomic::AtomicU32) -> R) -> Result<R, Error> {
     if !pointer.is_multiple_of(4) {
         return Err(Error::InvalidArgument);
     }
-    let pages = user_pages(pointer, 4, write)?;
-    let physical = pages.first().ok_or(Error::BadAddress)?.0;
-    // SAFETY: an aligned u32 of user memory, mapped for this process -
-    // never the kernel's own - reached through the direct map, which
-    // maps every frame for as long as the kernel runs. The program may
-    // unmap it later; then it is a frame of memory still, and an atomic
-    // access to it harms nothing.
-    Ok(unsafe { &*phys_to_virt(PhysAddr::new(physical)).as_ptr::<core::sync::atomic::AtomicU32>() })
+    with_user_pages(pointer, 4, write, |pieces| {
+        // SAFETY: an aligned u32 of user memory, mapped for this process
+        // - never the kernel's own - reached through the direct map, and
+        // kept mapped by the locks while `work` runs.
+        pieces.first().map(|&(physical, _)| work(unsafe { &*phys_to_virt(PhysAddr::new(physical)).as_ptr() }))
+    })?
+    .ok_or(Error::BadAddress)
 }
 
-/// Reads the u32 at `pointer` atomically (see `user_word`).
+/// Reads the u32 at `pointer` atomically (see `with_user_word`).
 pub fn read_user_word(pointer: u64) -> Result<u32, Error> {
-    Ok(user_word(pointer, false)?.load(Ordering::SeqCst))
+    with_user_word(pointer, false, |word| word.load(Ordering::SeqCst))
 }
 
-/// Writes the u32 at `pointer` atomically (see `user_word`).
+/// Writes the u32 at `pointer` atomically (see `with_user_word`).
 pub fn write_user_word(pointer: u64, value: u32) -> Result<(), Error> {
-    user_word(pointer, true)?.store(value, Ordering::SeqCst);
-    Ok(())
+    with_user_word(pointer, true, |word| word.store(value, Ordering::SeqCst))
 }

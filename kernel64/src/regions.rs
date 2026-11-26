@@ -76,6 +76,13 @@ impl<T> Regions<T> {
         range.contains(&address).then_some((range, value))
     }
 
+    /// As `find`, with what the region records open to change.
+    pub fn find_mut(&mut self, address: u64) -> Option<(&Range<u64>, &mut T)> {
+        let n = self.used.partition_point(|(range, _)| range.start <= address).checked_sub(1)?;
+        let (range, value) = &mut self.used[n];
+        if range.contains(&address) { Some((&*range, value)) } else { None }
+    }
+
     pub fn len(&self) -> usize {
         self.used.len()
     }
@@ -90,6 +97,15 @@ mod tests {
     use super::*;
 
     const AREA: Range<u64> = 0x10_0000..0x20_0000; // 256 pages
+
+    #[test]
+    fn what_a_region_records_can_be_changed_in_place() {
+        let mut r = Regions::new(AREA);
+        let a = r.allocate(3 * PAGE, 1).unwrap();
+        *r.find_mut(a + PAGE).unwrap().1 = 7;
+        assert_eq!(r.find(a).map(|(_, v)| *v), Some(7));
+        assert!(r.find_mut(a + 3 * PAGE).is_none(), "the guard page is no region's");
+    }
 
     #[test]
     fn regions_are_page_sized_and_guarded() {
