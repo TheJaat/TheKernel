@@ -160,7 +160,7 @@ def main():
     qmp = Qmp(path)
     # Counted at the last Enter, not when a wait begins: the line may have
     # run already, and "every line so far" is never reached once a line has
-    # gone to a program that reads it (journal entry NNN).
+    # gone to a program that reads it (journal entry 109).
     ran_before = 0
     # For each Enter, what the shell logs once it has run that line.
     expected = list(typed_line.lines(tokens))

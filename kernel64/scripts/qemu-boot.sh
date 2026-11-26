@@ -149,7 +149,7 @@ if [ $finished -eq 0 ]; then
         # back within the 50 ms after it under KVM, and a line can have run
         # by then too. Counted afterwards, the new line is already there,
         # and the wait is for one more that never comes - 90 s at "/", 10
-        # at "~", every boot (journal entry NNN).
+        # at "~", every boot (journal entry 109).
         ready_before=0
         ran_before=0
         # For each Enter, what the shell logs once it has run that line

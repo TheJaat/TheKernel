@@ -6,7 +6,7 @@ The typers (qemu-boot.sh, serial-type.py, qmp-type.py) send key names -
 QEMU's, as key-names.py spells them. A "~" in them waits until the line
 just entered has run. Counting the shell's "[shell] ran" lines cannot say
 which line ran: under emulation the shell falls behind the typing, and the
-"ran" of the line before arrives after the next Enter (journal entry NNN).
+"ran" of the line before arrives after the next Enter (journal entry 109).
 The shell logs each line it runs as `[shell] ran "TEXT"`, TEXT quoted as
 Rust quotes a string; this works out that line from the keys.
 

@@ -61,7 +61,7 @@ def main():
     # Counted before a key is sent, not when a wait begins: a driver that
     # crashes is back, and a line has run, within moments under KVM, and a
     # count taken afterwards already has the new line in it - the wait is
-    # then for one more that never comes (journal entry NNN).
+    # then for one more that never comes (journal entry 109).
     ready_before = 0
     ran_before = 0
     started_before = 0
@@ -110,7 +110,7 @@ def main():
                     # pause was not enough - an emulated machine sharing
                     # the host with other tests took longer to start cat,
                     # and the Ctrl+C meant for it stopped nothing (journal
-                    # entry NNN). Then a moment more: just started, it may
+                    # entry 109). Then a moment more: just started, it may
                     # not have said its first line yet.
                     wait_until(lambda: count(log, STARTED) > started_before, 10)
                     time.sleep(0.3)
