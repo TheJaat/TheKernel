@@ -50,10 +50,18 @@ LOG=$2
 LIMIT=${3:-20}
 KEYS=${KEYS:-}
 DISK=${DISK:-}
+# The test disks: cache=unsafe. The machine still sees a disk with a
+# write cache and still flushes it at every commit, but QEMU no longer
+# turns each flush into an fsync of the image on the host. A test's image
+# need not survive the host crashing, and with a dozen boots writing at
+# once an fsync could take over 2 s - long enough for init to stop the
+# disk driver as hung, mid-test (journal entry NNN).
 DISK_ARGS=
 if [ -n "$DISK" ]; then
-    DISK_ARGS="-drive file=$DISK,format=raw,if=none,id=disk0 -device virtio-blk-pci,drive=disk0"
+    DISK_ARGS="-drive file=$DISK,format=raw,if=none,cache=unsafe,id=disk0 -device virtio-blk-pci,drive=disk0"
 fi
+# (Only drives with a file: an empty CD drive refuses a cache mode.)
+QEMU_ARGS=$(printf '%s' "${QEMU_ARGS:-}" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /if=none/ && $i ~ /file=/ && $i !~ /cache=/) $i = $i ",cache=unsafe"; print }')
 
 FINISHED="\[kernel\] idle|KERNEL PANIC|CPU EXCEPTION|THE SYSTEM HAS STOPPED"
 # FINISHED_ONLY: wait for this instead (a boot that goes idle and then
@@ -152,6 +160,7 @@ if [ $finished -eq 0 ]; then
         # at "~", every boot (journal entry 109).
         ready_before=0
         ran_before=0
+        started_before=0
         # For each Enter, what the shell logs once it has run that line
         # (typed_line.py; empty if its keys are not plain text).
         python3 "$(dirname "$0")/typed_line.py" $KEYS > "$LOG.lines"
@@ -218,8 +227,22 @@ if [ $finished -eq 0 ]; then
                     ;;
             esac
             ready_before=$(grep -c "$ready" "$LOG")
+            if [ "$key" = "ctrl-c" ]; then
+                # Ctrl+C is pressed at something seen to be running: a
+                # program started since the last Enter, then a moment for it
+                # to say its first line. Sent sooner, under load, it reached
+                # the shell before cat had started, and stopped nothing
+                # (journal entry NNN).
+                ticks=100
+                while [ "$(grep -ac 'for the shell' "$LOG")" -le "$started_before" ] && [ $ticks -gt 0 ]; do
+                    sleep 0.1
+                    ticks=$((ticks - 1))
+                done
+                sleep 0.3
+            fi
             if [ "$key" = "ret" ]; then
                 ran_before=$(grep -c '\[shell\] ran' "$LOG")
+                started_before=$(grep -ac 'for the shell' "$LOG")
                 entered=$((entered + 1))
                 last=$(sed -n "${entered}p" "$LOG.lines")
                 last_before=0

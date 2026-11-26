@@ -67,6 +67,14 @@ rm -f "$LOG"
 # the image with the loader as a disk the firmware can read but the
 # kernel has no driver for (it is on PCI), so that the kernel sees only
 # the disks QEMU_ARGS gives it.
+# The test disks: cache=unsafe. The machine still sees a disk with a
+# write cache and still flushes it at every commit, but QEMU no longer
+# turns each flush into an fsync of the image on the host. A test's image
+# need not survive the host crashing, and with a dozen boots writing at
+# once an fsync could take over 2 s - long enough for init to stop the
+# disk driver as hung, mid-test (journal entry NNN).
+# (Only drives with a file: an empty CD drive refuses a cache mode.)
+QEMU_ARGS=$(printf '%s' "${QEMU_ARGS:-}" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /if=none/ && $i ~ /file=/ && $i !~ /cache=/) $i = $i ",cache=unsafe"; print }')
 MACHINE=${MACHINE:-}
 if [ -n "${UEFI:-}" ]; then
     FIRMWARE=${FIRMWARE:-/usr/share/AAVMF}
