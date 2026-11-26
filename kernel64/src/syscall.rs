@@ -88,7 +88,7 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
     // A call that woke a thread more important than this one, here on
     // this CPU (a futex, a channel), has asked this CPU to choose again:
     // it does so now, not at the next timer tick (journal entry NNN).
-    threads::preempt_if_needed();
+    threads::preempt_if_asked();
     // The way back to user mode: where a process someone asked to end,
     // ends. Every call comes through here - one that was waiting when
     // the kill came has just returned Interrupted - with nothing of the

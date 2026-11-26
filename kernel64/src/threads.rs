@@ -43,7 +43,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kernel64::ioports::PortBitmap;
 use kernel64::sched::{Scheduler, State, Switch, ThreadId};
@@ -231,12 +231,37 @@ pub fn process_cpu_ns() -> Option<u64> {
     answer
 }
 
+/// Set when something done on a CPU - a wake-up, a new priority - asked
+/// that CPU to choose again: what the end of a system call reads before
+/// it takes the lock (`preempt_if_asked`). Without it, every call took
+/// the lock once more on its way out, about 130 ns a switch on MaK-WSL;
+/// with it, only calls that need to (journal entry NNN).
+static ASKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
     let mut guard = THREADS.lock();
     let t = guard.as_mut().expect("threads not initialised");
     let result = f(t);
+    // The lock keeps interrupts off: this CPU is the one that did it.
+    let cpu = arch::cpu();
+    if t.policy.reschedule_pending(cpu) {
+        ASKED[cpu].store(true, Ordering::Relaxed);
+    }
     tell_idle_cpus(t);
     result
+}
+
+/// At the end of a system call: chooses again if the call asked this
+/// CPU to (a more important thread made ready here). Only the hint is
+/// read unless so; a request it misses - none should - is still taken
+/// at the next interrupt, which checks in full (`preempt_if_needed`).
+pub fn preempt_if_asked() {
+    let were_enabled = arch::disable_interrupts();
+    let asked = ASKED[arch::cpu()].swap(false, Ordering::Relaxed);
+    arch::restore_interrupts(were_enabled);
+    if asked {
+        preempt_if_needed();
+    }
 }
 
 /// Interrupts the idling CPUs the policy has just offered a thread to.

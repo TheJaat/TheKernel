@@ -83,37 +83,90 @@ struct Attributes {
 }
 
 /// The runnable threads that are on no CPU: a FIFO queue per priority,
-/// the most important first.
+/// the most important first. Each entry carries its thread's affinity,
+/// so that choosing - the scheduler's hottest path - looks nothing up.
 pub struct Ready {
-    levels: [VecDeque<ThreadId>; LEVELS],
+    levels: [VecDeque<(ThreadId, u64)>; LEVELS],
+    /// One bit per level that has anyone in it, so that finding the
+    /// first is one instruction (trailing_zeros), not forty looks.
+    occupied: u64,
 }
 
 impl Ready {
     fn new() -> Ready {
-        Ready { levels: core::array::from_fn(|_| VecDeque::new()) }
+        Ready { levels: core::array::from_fn(|_| VecDeque::new()), occupied: 0 }
     }
 
-    fn push_back(&mut self, id: ThreadId, priority: Priority) {
-        self.levels[level(priority)].push_back(id);
+    fn push_back(&mut self, id: ThreadId, priority: Priority, affinity: u64) {
+        let level = level(priority);
+        self.levels[level].push_back((id, affinity));
+        self.occupied |= 1 << level;
+    }
+
+    /// Clears `level`'s bit if it has emptied.
+    fn update(&mut self, level: usize) {
+        if self.levels[level].is_empty() {
+            self.occupied &= !(1 << level);
+        }
     }
 
     /// Takes `id` out, wherever it is; false if it was not there.
     fn remove(&mut self, id: ThreadId) -> bool {
-        for queue in &mut self.levels {
-            if let Some(at) = queue.iter().position(|&other| other == id) {
-                queue.remove(at);
+        for level in 0..LEVELS {
+            if let Some(at) = self.levels[level].iter().position(|&(other, _)| other == id) {
+                self.levels[level].remove(at);
+                self.update(level);
                 return true;
             }
         }
         false
     }
 
+    /// A queued thread's new affinity; false if it is not queued.
+    fn set_affinity(&mut self, id: ThreadId, affinity: u64) -> bool {
+        for queue in &mut self.levels {
+            if let Some(entry) = queue.iter_mut().find(|(other, _)| *other == id) {
+                entry.1 = affinity;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Where the thread `cpu` would take next is: its priority's level
+    /// and its place there - the most important allowed on `cpu`, the
+    /// longest waiting of those.
+    fn best_for(&self, cpu: usize) -> Option<(usize, usize)> {
+        let bit = 1u64 << cpu;
+        let mut left = self.occupied;
+        while left != 0 {
+            let level = left.trailing_zeros() as usize;
+            if let Some(at) = self.levels[level].iter().position(|&(_, affinity)| affinity & bit != 0) {
+                return Some((level, at));
+            }
+            left &= left - 1;
+        }
+        None
+    }
+
+    /// Takes the thread at `place` out: it, its priority and affinity.
+    fn take(&mut self, (level, at): (usize, usize)) -> (ThreadId, Priority, u64) {
+        let (id, affinity) = self.levels[level].remove(at).expect("best_for's place");
+        self.update(level);
+        (id, priority_of(level), affinity)
+    }
+
+    #[cfg(test)]
+    fn get(&self, (level, at): (usize, usize)) -> ThreadId {
+        self.levels[level][at].0
+    }
+
     pub fn contains(&self, id: &ThreadId) -> bool {
-        self.levels.iter().any(|queue| queue.contains(id))
+        self.levels.iter().any(|queue| queue.iter().any(|(other, _)| other == id))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.levels.iter().all(VecDeque::is_empty)
+        self.occupied == 0
     }
 
     pub fn len(&self) -> usize {
@@ -123,13 +176,21 @@ impl Ready {
     /// In the order they would be taken: the most important first, and
     /// within a priority the longest waiting first.
     pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
-        self.levels.iter().flatten()
+        self.levels.iter().flatten().map(|(id, _)| id)
     }
 }
 
 fn level(priority: Priority) -> usize {
     (priority.clamp(HIGHEST, LOWEST) - HIGHEST) as usize
 }
+
+fn priority_of(level: usize) -> Priority {
+    level as Priority + HIGHEST
+}
+
+/// What an idle thread counts as, against a priority: less important
+/// than any, so that anyone ready may take its CPU.
+const IDLE_PRIORITY: Priority = LOWEST + 1;
 
 /// What the scheduler keeps for each CPU.
 struct Cpu {
@@ -143,6 +204,10 @@ struct Cpu {
     /// it is also a promise: a thread in the queue has been offered to
     /// this CPU, so the next one is offered to somebody else.
     reschedule: bool,
+    /// The current thread's priority (IDLE_PRIORITY for the idle
+    /// thread) and affinity, kept here so that a switch looks nothing up.
+    priority: Priority,
+    affinity: u64,
 }
 
 pub struct Scheduler {
@@ -179,7 +244,8 @@ impl Scheduler {
         let mut states = BTreeMap::new();
         states.insert(idle, State::Ready); // ready, but never queued
         states.insert(running, State::Running);
-        let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false };
+        let priority = if running == idle { IDLE_PRIORITY } else { DEFAULT };
+        let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false, priority, affinity: ANY_CPU };
         let mut attributes = BTreeMap::new();
         if running != idle {
             attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU });
@@ -194,7 +260,7 @@ impl Scheduler {
         // A CPU that arrives when there is already work takes some at
         // its first chance.
         let reschedule = !self.ready.is_empty();
-        self.cpus.push(Cpu { current: idle, idle, slice_left: SLICE, reschedule });
+        self.cpus.push(Cpu { current: idle, idle, slice_left: SLICE, reschedule, priority: IDLE_PRIORITY, affinity: ANY_CPU });
         self.cpus.len() - 1
     }
 
@@ -258,10 +324,12 @@ impl Scheduler {
     pub fn set_priority(&mut self, id: ThreadId, priority: Priority, cpu: usize) -> bool {
         let Some(attributes) = self.attributes.get_mut(&id) else { return false };
         attributes.priority = priority.clamp(HIGHEST, LOWEST);
+        let Attributes { priority, affinity } = *attributes;
         if self.ready.remove(id) {
-            self.ready.push_back(id, self.attributes[&id].priority);
-            self.offer(id, cpu);
+            self.ready.push_back(id, priority, affinity);
+            self.offer(priority, affinity, cpu);
         } else if let Some(on) = self.cpu_of(id) {
+            self.cpus[on].priority = priority;
             if self.someone_waiting_for(on) {
                 self.ask(on, cpu);
             }
@@ -275,10 +343,12 @@ impl Scheduler {
     pub fn set_affinity(&mut self, id: ThreadId, affinity: u64, cpu: usize) -> bool {
         let Some(attributes) = self.attributes.get_mut(&id) else { return false };
         attributes.affinity = affinity;
-        if self.ready.contains(&id) {
-            self.offer(id, cpu);
+        let priority = attributes.priority;
+        if self.ready.set_affinity(id, affinity) {
+            self.offer(priority, affinity, cpu);
         } else if let Some(on) = self.cpu_of(id) {
-            if !self.allowed(id, on) {
+            self.cpus[on].affinity = affinity;
+            if affinity & (1u64 << on) == 0 {
                 self.ask(on, cpu);
             }
         }
@@ -286,15 +356,18 @@ impl Scheduler {
     }
 
     /// Whether `id` may run on `cpu`. An idle thread runs only on its
-    /// own CPU, and is never asked.
+    /// own CPU, and is never asked. (The scheduler itself reads the
+    /// affinities kept with each queued thread and each CPU.)
+    #[cfg(test)]
     fn allowed(&self, id: ThreadId, cpu: usize) -> bool {
         self.attributes.get(&id).is_none_or(|a| a.affinity & (1u64 << cpu) != 0)
     }
 
     /// The thread `cpu` would take next: the most important allowed on
     /// it, the longest waiting of those.
+    #[cfg(test)]
     fn best_for(&self, cpu: usize) -> Option<ThreadId> {
-        self.ready.iter().copied().find(|&id| self.allowed(id, cpu))
+        self.ready.best_for(cpu).map(|place| self.ready.get(place))
     }
 
     /// Whether a thread waiting may take `cpu` from its current one at
@@ -302,11 +375,11 @@ impl Scheduler {
     /// - or anyone at all, if the current one may no longer run there.
     fn someone_waiting_for(&self, cpu: usize) -> bool {
         let this = &self.cpus[cpu];
-        let Some(best) = self.best_for(cpu) else { return false };
-        if this.current == this.idle || !self.allowed(this.current, cpu) {
+        let Some((level, _)) = self.ready.best_for(cpu) else { return false };
+        if this.current == this.idle || this.affinity & (1u64 << cpu) == 0 {
             return true;
         }
-        self.priority(best) <= self.priority(this.current)
+        priority_of(level) <= this.priority
     }
 
     /// Asks `cpu` to choose again; interrupted if it is not `from`, the
@@ -358,6 +431,12 @@ impl Scheduler {
         }
     }
 
+    /// Whether `cpu` has been asked to choose again, the request left as
+    /// it is.
+    pub fn reschedule_pending(&self, cpu: usize) -> bool {
+        self.cpus[cpu].reschedule
+    }
+
     /// Whether `cpu` should choose again; clears the request.
     pub fn take_reschedule(&mut self, cpu: usize) -> bool {
         core::mem::take(&mut self.cpus[cpu].reschedule)
@@ -373,12 +452,20 @@ impl Scheduler {
     fn enqueue(&mut self, id: ThreadId, cpu: usize) {
         debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
         self.states.insert(id, State::Ready);
-        let priority = self.priority(id).unwrap_or(DEFAULT);
-        self.ready.push_back(id, priority);
-        self.offer(id, cpu);
+        let Attributes { priority, affinity } =
+            self.attributes.get(&id).copied().unwrap_or(Attributes { priority: DEFAULT, affinity: ANY_CPU });
+        self.enqueue_known(id, priority, affinity, cpu);
     }
 
-    /// Thread `id` has just joined the queue, put there by `cpu`: finds
+    /// `enqueue`, its attributes already known (a switch: no look-up).
+    fn enqueue_known(&mut self, id: ThreadId, priority: Priority, affinity: u64, cpu: usize) {
+        self.states.insert(id, State::Ready);
+        self.ready.push_back(id, priority, affinity);
+        self.offer(priority, affinity, cpu);
+    }
+
+    /// A thread (of `priority` and `affinity`) has just joined the queue,
+    /// put there by `cpu`: finds
     /// a CPU to take it. An idling CPU it may run on: this one if it
     /// idles - it needs no telling - or another, which does: it sits
     /// halted, and without an interrupt would look at the queue only at
@@ -393,24 +480,24 @@ impl Scheduler {
     /// important one, this CPU first among equals (no interrupt). If
     /// none is less important, nothing is done: it waits for a slice to
     /// end, as it always did.
-    fn offer(&mut self, id: ThreadId, cpu: usize) {
+    fn offer(&mut self, priority: Priority, affinity: u64, cpu: usize) {
+        let count = self.cpus.len();
+        let allowed = |c: usize| affinity & (1u64 << c) != 0;
         let free = |s: &Scheduler, c: usize| {
             let this = &s.cpus[c];
-            this.current == this.idle && !this.reschedule && s.allowed(id, c)
+            this.current == this.idle && !this.reschedule && allowed(c)
         };
-        let count = self.cpus.len();
         if let Some(chosen) = (0..count).map(|n| (cpu + n) % count).find(|&c| free(self, c)) {
             self.ask(chosen, cpu);
             return;
         }
-        let priority = self.priority(id).unwrap_or(DEFAULT);
         let mut victim: Option<(usize, Priority)> = None;
         for c in (0..count).map(|n| (cpu + n) % count) {
             let this = &self.cpus[c];
-            if this.current == this.idle || this.reschedule || !self.allowed(id, c) {
+            if this.current == this.idle || this.reschedule || !allowed(c) {
                 continue;
             }
-            let theirs = self.priority(this.current).unwrap_or(DEFAULT);
+            let theirs = this.priority;
             if theirs > priority && victim.is_none_or(|(_, worst)| theirs > worst) {
                 victim = Some((c, theirs));
             }
@@ -480,46 +567,50 @@ impl Scheduler {
         self.cpus[cpu].reschedule = false;
         let still_running = self.states.get(&from) == Some(&State::Running);
         // A running thread may stay only on a CPU it is allowed.
-        let may_stay = still_running && self.allowed(from, cpu);
+        let (mine, my_affinity) = (self.cpus[cpu].priority, self.cpus[cpu].affinity);
+        let may_stay = still_running && my_affinity & (1u64 << cpu) != 0;
 
         // The best waiting thread - unless it is less important than the
         // one running, which keeps the CPU (priorities are strict).
-        let candidate = self.best_for(cpu).filter(|&best| {
-            !(may_stay && from != idle && self.priority(best) > self.priority(from))
-        });
-        let Some(to) = candidate else {
+        let candidate = self
+            .ready
+            .best_for(cpu)
+            .filter(|&(level, _)| !(may_stay && from != idle && priority_of(level) > mine));
+        let Some(place) = candidate else {
             if may_stay {
                 self.cpus[cpu].slice_left = SLICE;
                 return None; // nobody else may have the CPU
             }
-            let switch = self.switch_to(cpu, from, idle);
+            let switch = self.switch_to(cpu, from, idle, IDLE_PRIORITY, ANY_CPU);
             if still_running && from != idle {
                 // No longer allowed here: back in the queue, for a CPU
                 // it may run on.
-                self.enqueue(from, cpu);
+                self.enqueue_known(from, mine, my_affinity, cpu);
             }
             return switch;
         };
-        self.ready.remove(to);
+        let (to, priority, affinity) = self.ready.take(place);
         // The switch comes first: `from` is on no CPU from here on, and
         // only then may it be queued.
-        let switch = self.switch_to(cpu, from, to);
+        let switch = self.switch_to(cpu, from, to, priority, affinity);
         if still_running {
             if from == idle {
                 self.states.insert(from, State::Ready); // ready, never queued
             } else {
                 // It gave way on this CPU; another may be idling, or
                 // running someone less important.
-                self.enqueue(from, cpu);
+                self.enqueue_known(from, mine, my_affinity, cpu);
             }
         }
         switch
     }
 
-    fn switch_to(&mut self, cpu: usize, from: ThreadId, to: ThreadId) -> Option<Switch> {
+    fn switch_to(&mut self, cpu: usize, from: ThreadId, to: ThreadId, priority: Priority, affinity: u64) -> Option<Switch> {
         self.states.insert(to, State::Running);
         let this = &mut self.cpus[cpu];
         this.current = to;
+        this.priority = priority;
+        this.affinity = affinity;
         this.slice_left = SLICE;
         (from != to).then_some(Switch { from, to })
     }
