@@ -202,7 +202,7 @@ static RUNNING_SINCE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_
 /// waits is on none and is not counted; an idle thread belongs to no
 /// process. Counting at each tick too keeps a thread that never leaves
 /// its CPU from being counted all at once, much later (journal entry
-/// NNN).
+/// 114).
 fn charge(t: &Threads, cpu: usize, now: u64) {
     let since = RUNNING_SINCE[cpu].swap(now, Ordering::Relaxed);
     if since == 0 || now <= since {

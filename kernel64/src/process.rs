@@ -85,7 +85,7 @@ pub struct Process {
     ending: AtomicBool,
     /// The CPU time its threads have used, in nanoseconds: added to by
     /// threads.rs when one of them leaves a CPU and at every tick
-    /// (clock::PROCESS_CPU, journal entry NNN).
+    /// (clock::PROCESS_CPU, journal entry 114).
     cpu_ns: AtomicU64,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,

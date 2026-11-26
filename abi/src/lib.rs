@@ -525,7 +525,7 @@ pub mod clock {
     pub const REALTIME: u64 = 1;
     /// The CPU time the calling process has used, all its threads
     /// together: the time they were on a CPU, user mode and system calls
-    /// alike (journal entry NNN). Counted when a thread leaves a CPU and
+    /// alike (journal entry 114). Counted when a thread leaves a CPU and
     /// at every tick, and read with the part now running added, so it is
     /// as fine as the other clocks. It is read from the CPU's counter, so
     /// a moment in which a host stops a virtual CPU counts to the thread
