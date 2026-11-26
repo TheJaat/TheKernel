@@ -55,7 +55,7 @@ DISK=${DISK:-}
 # turns each flush into an fsync of the image on the host. A test's image
 # need not survive the host crashing, and with a dozen boots writing at
 # once an fsync could take over 2 s - long enough for init to stop the
-# disk driver as hung, mid-test (journal entry NNN).
+# disk driver as hung, mid-test (journal entry 117).
 DISK_ARGS=
 if [ -n "$DISK" ]; then
     DISK_ARGS="-drive file=$DISK,format=raw,if=none,cache=unsafe,id=disk0 -device virtio-blk-pci,drive=disk0"
@@ -232,7 +232,7 @@ if [ $finished -eq 0 ]; then
                 # program started since the last Enter, then a moment for it
                 # to say its first line. Sent sooner, under load, it reached
                 # the shell before cat had started, and stopped nothing
-                # (journal entry NNN).
+                # (journal entry 117).
                 ticks=100
                 while [ "$(grep -ac 'for the shell' "$LOG")" -le "$started_before" ] && [ $ticks -gt 0 ]; do
                     sleep 0.1
