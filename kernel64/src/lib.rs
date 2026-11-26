@@ -43,3 +43,4 @@ pub mod rtc;
 pub mod sched;
 pub mod smp;
 pub mod sync;
+pub mod symbols;

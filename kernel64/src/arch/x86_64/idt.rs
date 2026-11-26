@@ -489,6 +489,11 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         kprintln!("    error code {:#x}", frame.error_code);
     }
     dump(frame);
+    // Not after a stack overflow: the frame pointer is on the stack that
+    // ran out, which is no place to walk.
+    if !((frame.vector == PAGE_FAULT || frame.vector == DOUBLE_FAULT) && is_stack_overflow()) {
+        crate::backtrace::report(Some(frame.rip), None, frame.rbp);
+    }
     super::halt_forever();
 }
 

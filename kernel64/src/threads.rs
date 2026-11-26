@@ -667,6 +667,19 @@ impl WaitQueue {
     }
 }
 
+/// The thread running on this CPU, by name and number - for a panic's
+/// report. None if the table's lock is held (by this CPU, or by one the
+/// panic has stopped) or there is no table yet: a panic must not wait.
+pub fn current_for_report() -> Option<(&'static str, ThreadId)> {
+    if THREADS.is_locked() {
+        return None;
+    }
+    let guard = THREADS.lock();
+    let t = guard.as_ref()?;
+    let id = t.policy.current(arch::cpu());
+    t.table.get(&id).map(|thread| (thread.name, id))
+}
+
 /// Rule 1, checked at every switch: the thread switched to finds the lock
 /// still held - by the `schedule` that switched here, which forgot its
 /// guard. Released before the switch (the mistake rule 1 is about), the

@@ -55,6 +55,7 @@ mod mmio_devices;
 mod programs;
 mod random;
 mod selftest;
+mod backtrace;
 mod syscall;
 mod threads;
 mod tlb;
@@ -999,5 +1000,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { console::break_lock() };
     kprintln!();
     kprintln!("*** KERNEL PANIC: {info}");
+    backtrace::report(None, None, arch::frame_pointer());
     arch::halt_forever()
 }

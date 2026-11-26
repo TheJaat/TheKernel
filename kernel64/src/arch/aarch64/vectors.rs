@@ -528,6 +528,7 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
     }
     kprintln!("    from {source} (vector {vector}), syndrome {:#010x}", syndrome.0);
     dump(frame);
+    crate::backtrace::report(Some(frame.elr), Some(frame.x[30]), frame.x[29]);
     crate::arch::halt_forever()
 }
 
