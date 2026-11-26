@@ -87,16 +87,20 @@ pub const fn startup_message(page: u64) -> Option<u32> {
     Some(KIND_STARTUP | ASSERT | (page >> 12) as u32)
 }
 
-/// "Everyone but me": bits 18-19 of the command register name a set of
-/// CPUs instead of one, and the destination is then ignored.
-const ALL_BUT_SELF: u32 = 0b11 << 18;
 const KIND_NMI: u32 = 0b100 << 8;
 
-/// A non-maskable interrupt to every other CPU: the one message a CPU
-/// cannot refuse, whatever it is doing - even with interrupts off,
-/// spinning on a lock that will never be released.
-pub const fn nmi_to_all_others() -> u32 {
-    KIND_NMI | ASSERT | ALL_BUT_SELF
+/// A non-maskable interrupt, to the one CPU `destination` names: the one
+/// message a CPU cannot refuse, whatever it is doing - even with
+/// interrupts off, spinning on a lock that will never be released.
+///
+/// Not "everyone but me" (the shorthand in bits 18-19), though that is
+/// one message instead of one per CPU: everyone includes the CPUs this
+/// kernel left asleep - more than MAX_CPUS - which the firmware parked
+/// in real mode, with an interrupt table in memory the kernel has used
+/// since. An NMI there is a triple fault, which resets the machine
+/// before a panic has said a word (journal entry 119).
+pub const fn nmi_message() -> u32 {
+    KIND_NMI | ASSERT
 }
 
 /// An ordinary interrupt, raised on another CPU as `vector`: delivery
@@ -193,8 +197,8 @@ mod tests {
         assert_eq!(startup_message(0x9F000), Some(0x469F));
         assert_eq!(destination(3), 0x0300_0000);
         assert_eq!(destination(255), 0xFF00_0000);
-        // Delivery mode 100 (NMI), level assert, shorthand 11.
-        assert_eq!(nmi_to_all_others(), 0x000C_4400);
+        // Delivery mode 100 (NMI), level assert, no shorthand: to one CPU.
+        assert_eq!(nmi_message(), 0x4400);
         // Delivery mode 000 (fixed): only the vector and the level.
         assert_eq!(interrupt_message(0xF0), 0x40F0);
         assert_eq!(interrupt_message(0x20), 0x4020);
