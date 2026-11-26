@@ -2,11 +2,18 @@
  * a program can put out of reach and back (mprotect), give back
  * (madvise MADV_DONTNEED, munmap of part of a mapping), a heap that
  * gives freed memory back, and system calls racing a thread that takes
- * their buffer away. pages-test.sh boots TheTaaJ and runs
+ * their buffer away; and, in part 2, shared file mappings that are
+ * written back, with pread and pwrite. pages-test.sh boots TheTaaJ and
+ * runs
  *
- *   with programs pages    the checks; "pages: N checks, all passed" */
+ *   with programs pages    the checks; "pages: N checks, all passed"
+ *
+ * which starts pages again as a child, to be
+ *   pages exit-shared      maps p.exit shared, writes "by exit" at 3
+ *                          and exits without unmapping it */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -15,8 +22,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <spawn.h>
 #include <sys/random.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define P 4096L
 #define MIB (1024L * 1024)
@@ -254,8 +266,134 @@ static void race_checks(void)
     munmap(target, P);
 }
 
-int main(void)
+/* ---- J28: shared file mappings, written back; pread and pwrite ----- */
+
+/* Makes `name` hold `size` bytes of `fill`. */
+static int make_file(const char *name, long size, char fill)
 {
+    int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    static char block[4096];
+    memset(block, fill, sizeof block);
+    for (long done = 0; done < size;) {
+        long n = size - done < (long)sizeof block ? size - done : (long)sizeof block;
+        if (write(fd, block, (size_t)n) != n) {
+            close(fd);
+            return -1;
+        }
+        done += n;
+    }
+    return close(fd);
+}
+
+/* The byte at `offset` of `name`, read anew; -1 if it cannot be. */
+static int byte_at(const char *name, long offset)
+{
+    int fd = open(name, O_RDONLY);
+    unsigned char byte;
+    int got = fd >= 0 && pread(fd, &byte, 1, offset) == 1;
+    if (fd >= 0)
+        close(fd);
+    return got ? byte : -1;
+}
+
+static long size_of(const char *name)
+{
+    struct stat status;
+    return stat(name, &status) == 0 ? (long)status.st_size : -1;
+}
+
+static void shared_checks(void)
+{
+    /* pread and pwrite first: mmap's write-back is made of them. */
+    check(make_file("p.file", 3 * P + 100, 'f') == 0, "a file of three pages and 100 bytes");
+    int fd = open("p.file", O_RDWR);
+    check(fd >= 0, "opened to read and write");
+    char got[4] = {0};
+    check(lseek(fd, 7, SEEK_SET) == 7, "its place set to 7");
+    check(pwrite(fd, "PW", 2, 2 * P) == 2 && pread(fd, got, 2, 2 * P) == 2 && memcmp(got, "PW", 2) == 0,
+          "pwrite and pread at 2 pages in");
+    check(lseek(fd, 0, SEEK_CUR) == 7, "and the place is still 7");
+    int ends[2];
+    errno = 0;
+    check(pipe(ends) == 0 && pread(ends[0], got, 1, 0) == -1 && errno == ESPIPE, "pread on a pipe: ESPIPE");
+    close(ends[0]);
+    close(ends[1]);
+    errno = 0;
+    check(pwrite(fd, "x", 1, -1) == -1 && errno == EINVAL, "a negative offset: EINVAL");
+
+    char *m = mmap(NULL, 4 * P, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check(m != MAP_FAILED, "mapped shared and writable");
+    if (m == MAP_FAILED)
+        return;
+    check(m[0] == 'f' && m[2 * P] == 'P' && m[3 * P + 99] == 'f' && m[3 * P + 100] == 0, "the file's bytes, then zeros");
+    m[10] = 'X';
+    m[2 * P + 5] = 'Y';
+    m[3 * P + 200] = 'Z'; /* past the end of the file */
+    check(byte_at("p.file", 10) == 'f', "not in the file before msync");
+    check(msync(m, 4 * P, MS_SYNC) == 0, "msync");
+    check(byte_at("p.file", 10) == 'X' && byte_at("p.file", 2 * P + 5) == 'Y', "in the file after it");
+    check(size_of("p.file") == 3 * P + 100, "and the file no longer for what was past its end");
+    m[20] = 'U';
+    close(fd); /* the mapping keeps a descriptor of its own */
+    check(munmap(m, 4 * P) == 0, "unmapped, after its descriptor was closed");
+    check(byte_at("p.file", 20) == 'U', "the change reached the file all the same");
+
+    fd = open("p.file", O_RDWR);
+    char *second = fd >= 0 ? mmap(NULL, P, PROT_READ | PROT_WRITE, MAP_SHARED, fd, P) : MAP_FAILED;
+    check(second != MAP_FAILED && second[0] == 'f', "a page from one page in");
+    if (second != MAP_FAILED) {
+        second[1] = 'O';
+        check(munmap(second, P) == 0 && byte_at("p.file", P + 1) == 'O', "written back to its place in the file");
+    }
+    if (fd >= 0)
+        close(fd);
+    errno = 0;
+    check(msync(m, P, MS_SYNC) == -1 && errno == ENOMEM, "msync of what is no longer mapped: ENOMEM");
+
+    char *private = MAP_FAILED;
+    fd = open("p.file", O_RDONLY);
+    if (fd >= 0)
+        private = mmap(NULL, P, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    check(private != MAP_FAILED, "a private mapping");
+    if (private != MAP_FAILED) {
+        private[0] = 'Q';
+        check(munmap(private, P) == 0 && byte_at("p.file", 0) == 'f', "is never written back");
+    }
+    if (fd >= 0)
+        close(fd);
+
+    /* Written back when the program exits, as on Unix. */
+    check(make_file("p.exit", 2 * P, 'e') == 0, "a file for a child to map");
+    pid_t child;
+    char *argv[] = {"pages", "exit-shared", NULL};
+    int status = 0;
+    check(posix_spawnp(&child, "pages", NULL, NULL, argv, environ) == 0 && waitpid(child, &status, 0) == child
+              && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "a child mapped it, wrote and exited");
+    check(byte_at("p.exit", 3) == 'b' && byte_at("p.exit", 9) == 't' && byte_at("p.exit", 10) == 'e',
+          "and what it wrote is in the file");
+    unlink("p.file");
+    unlink("p.exit");
+}
+
+/* The child: maps p.exit, writes, and exits without unmapping. */
+static int exit_shared(void)
+{
+    int fd = open("p.exit", O_RDWR);
+    char *m = fd >= 0 ? mmap(NULL, 2 * P, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    if (m == MAP_FAILED)
+        return 1;
+    memcpy(m + 3, "by exit", 7);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "exit-shared") == 0)
+        return exit_shared();
+
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = on_fault;
@@ -265,6 +403,7 @@ int main(void)
     discard_checks();
     heap_checks();
     race_checks();
+    shared_checks();
     if (failures == 0)
         printf("pages: %d checks, all passed\n", checks);
     else

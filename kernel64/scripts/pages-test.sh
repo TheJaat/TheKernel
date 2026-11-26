@@ -57,4 +57,4 @@ grep -a 'has not answered for' "$WORK" && fail "a service stopped answering duri
 grep -aiE 'panic|page fault in kernel|CPU EXCEPTION' "$WORK" && fail "the kernel failed"
 grep -a '"pages" killed' "$WORK" && fail "pages was killed: a fault it should have caught, or out of memory"
 rm -f "$WORK"
-echo "memory for big programs, part 1 ($ARCH): $CHECKS checks of mprotect, madvise, munmap of part of a mapping, a heap giving memory back and copies racing an unmap passed"
+echo "memory for big programs ($ARCH): $CHECKS checks of mprotect, madvise, munmap of part of a mapping, a heap giving memory back, copies racing an unmap, shared file mappings written back, pread and pwrite passed"
