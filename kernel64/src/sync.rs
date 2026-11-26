@@ -28,6 +28,8 @@ pub struct SpinLock<T> {
 // so sharing the lock between threads is sound whenever moving the value
 // between threads is.
 unsafe impl<T: Send> Sync for SpinLock<T> {}
+// SAFETY: the lock owns its value; moving the lock moves the value, which
+// is sound whenever T may move between threads.
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
