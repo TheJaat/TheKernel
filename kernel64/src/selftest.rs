@@ -194,7 +194,7 @@ pub fn timer() {
     // them. (It was "at least 10 since boot", which counted on the
     // interrupt lined up with being past the first tick: 10 was the
     // usual answer on AArch64, and 9 failed a boot once - journal entry
-    // NNN.)
+    // 119.)
     let ticks = interrupts::ticks();
     let counted = ticks - start_ticks;
     let (monotonic, realtime) = (crate::clock::monotonic(), crate::clock::realtime());

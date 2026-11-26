@@ -21,7 +21,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 # (otherwise qemu-boot.sh's 4). page@20: the page fault with 20 CPUs, 4
 # more than the kernel uses - which the firmware keeps parked, and which
 # the NMI that stops the other CPUs must not reach: it was a triple
-# fault, and nothing of the report got out (journal entry NNN).
+# fault, and nothing of the report got out (journal entry 119).
 #
 # What each test must print. grep -E patterns.
 expected() {

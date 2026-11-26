@@ -98,7 +98,7 @@ const KIND_NMI: u32 = 0b100 << 8;
 /// kernel left asleep - more than MAX_CPUS - which the firmware parked
 /// in real mode, with an interrupt table in memory the kernel has used
 /// since. An NMI there is a triple fault, which resets the machine
-/// before a panic has said a word (journal entry NNN).
+/// before a panic has said a word (journal entry 119).
 pub const fn nmi_message() -> u32 {
     KIND_NMI | ASSERT
 }
