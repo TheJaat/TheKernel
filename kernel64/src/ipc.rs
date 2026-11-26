@@ -647,7 +647,7 @@ pub fn process_list(system: Handle, out: u64, capacity: u64) -> Result<u64, Erro
         let mut name = [0u8; 16];
         let n = p.name.len().min(16);
         name[..n].copy_from_slice(&p.name.as_bytes()[..n]);
-        let entry = abi::ProcessEntry { pid: p.pid, name, exit_code: p.exit_code() };
+        let entry = abi::ProcessEntry { pid: p.pid, name, exit_code: p.exit_code(), cpu_ns: p.cpu_ns() };
         words.extend_from_slice(&entry.to_words());
     }
     process::copy_to_user(out, &words_to_bytes(&words))?;

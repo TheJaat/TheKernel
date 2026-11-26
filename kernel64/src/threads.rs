@@ -189,6 +189,48 @@ pub fn cpus_running(root: u64) -> u64 {
         .fold(0, |set, (cpu, _)| set | 1 << cpu)
 }
 
+/// When each CPU's current thread began to be counted (clock::monotonic,
+/// in nanoseconds): set at every switch and tick. 0 until the CPU's first.
+static RUNNING_SINCE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Counts the time since the last switch or tick to the process of the
+/// thread `cpu` is running (if it is a program's), and starts counting
+/// again from `now`. Called with the lock held, before the policy changes
+/// what `cpu` runs: at a switch it is still the thread that leaves.
+///
+/// CPU time is the time a thread was on a CPU. A thread that sleeps or
+/// waits is on none and is not counted; an idle thread belongs to no
+/// process. Counting at each tick too keeps a thread that never leaves
+/// its CPU from being counted all at once, much later (journal entry
+/// 114).
+fn charge(t: &Threads, cpu: usize, now: u64) {
+    let since = RUNNING_SINCE[cpu].swap(now, Ordering::Relaxed);
+    if since == 0 || now <= since {
+        return;
+    }
+    if let Some(process) = t.table.get(&t.policy.current(cpu)).and_then(|thread| thread.process.as_ref()) {
+        process.add_cpu(now - since);
+    }
+}
+
+/// The CPU time the current process has used: what its threads were
+/// counted up to their last switch or tick, and the calling thread's time
+/// since its own (clock::PROCESS_CPU). Another of its threads running on
+/// another CPU right now is counted up to its last tick, 10 ms at most.
+pub fn process_cpu_ns() -> Option<u64> {
+    let were_enabled = arch::disable_interrupts();
+    let cpu = arch::cpu();
+    let now = crate::clock::monotonic();
+    let answer = with(|t| {
+        let process = t.table.get(&t.policy.current(cpu)).and_then(|thread| thread.process.as_ref())?;
+        let since = RUNNING_SINCE[cpu].load(Ordering::Relaxed);
+        let running = if since != 0 && now > since { now - since } else { 0 };
+        Some(process.cpu_ns() + running)
+    });
+    arch::restore_interrupts(were_enabled);
+    answer
+}
+
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
     let mut guard = THREADS.lock();
     let t = guard.as_mut().expect("threads not initialised");
@@ -409,6 +451,8 @@ fn schedule() {
     let mut guard = THREADS.lock();
     let t = guard.as_mut().expect("threads not initialised");
     let cpu = arch::cpu();
+    // Count the leaving thread's time before the policy names the next.
+    charge(t, cpu, crate::clock::monotonic());
     let switch = t.policy.pick_next(cpu);
     // The thread that gives way here may be one an idling CPU can run.
     tell_idle_cpus(t);
@@ -513,6 +557,7 @@ fn count_if_busy(t: &Threads) {
 pub fn on_tick(now: u64) {
     if let Some(t) = THREADS.lock().as_mut() {
         count_if_busy(t);
+        charge(t, arch::cpu(), crate::clock::monotonic());
         t.policy.tick(now, arch::cpu());
         // Sleepers whose time came: this CPU keeps the time for all,
         // but need not run them all.
@@ -524,6 +569,7 @@ pub fn on_tick(now: u64) {
 pub fn on_tick_elsewhere() {
     if let Some(t) = THREADS.lock().as_mut() {
         count_if_busy(t);
+        charge(t, arch::cpu(), crate::clock::monotonic());
         t.policy.tick_slice(arch::cpu());
     }
 }

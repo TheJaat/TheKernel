@@ -74,6 +74,7 @@ pub fn read(which: u64) -> Result<u64, abi::Error> {
     match which {
         abi::clock::MONOTONIC => Ok(monotonic()),
         abi::clock::REALTIME => Ok(realtime()),
+        abi::clock::PROCESS_CPU => crate::threads::process_cpu_ns().ok_or(abi::Error::InvalidArgument),
         _ => Err(abi::Error::InvalidArgument),
     }
 }

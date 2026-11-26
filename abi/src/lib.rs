@@ -203,9 +203,9 @@ pub mod call {
     /// memory_used() - the bytes counted against this process now.
     pub const MEMORY_USED: u64 = 33;
     /// clock(which) - nanoseconds on one of the clocks in `clock`:
-    /// since boot, or since 1970 (the time of day). Read from the CPU's
-    /// counter, so finer than a tick; InvalidArgument for another
-    /// `which`.
+    /// since boot, since 1970 (the time of day), or the CPU time the
+    /// calling process has used. Read from the CPU's counter, so finer
+    /// than a tick; InvalidArgument for another `which`.
     pub const CLOCK: u64 = 34;
     /// signal_setup(entry, caught, ignored, on_stack) - how this
     /// process takes signals (see `signal`): `entry` is where a caught
@@ -523,6 +523,14 @@ pub mod clock {
     /// Since 1 January 1970, UTC: the machine's real-time clock at boot
     /// plus the time since. A machine without one reads boot as 1970.
     pub const REALTIME: u64 = 1;
+    /// The CPU time the calling process has used, all its threads
+    /// together: the time they were on a CPU, user mode and system calls
+    /// alike (journal entry 114). Counted when a thread leaves a CPU and
+    /// at every tick, and read with the part now running added, so it is
+    /// as fine as the other clocks. It is read from the CPU's counter, so
+    /// a moment in which a host stops a virtual CPU counts to the thread
+    /// that was on it.
+    pub const PROCESS_CPU: u64 = 2;
 }
 
 /// The most threads one process may have at once (THREAD_CREATE says
@@ -1268,22 +1276,25 @@ pub struct ProcessEntry {
     pub name: [u8; 16],
     /// None while it runs.
     pub exit_code: Option<i64>,
+    /// The CPU time its threads have used, in nanoseconds (as
+    /// clock::PROCESS_CPU); for an ended process, all it ever used.
+    pub cpu_ns: u64,
 }
 
 impl ProcessEntry {
-    pub const WORDS: usize = 4;
+    pub const WORDS: usize = 5;
     const RUNNING: u64 = i64::MIN as u64;
 
     pub fn to_words(&self) -> [u64; Self::WORDS] {
         let name = |half: usize| u64::from_le_bytes(self.name[half * 8..half * 8 + 8].try_into().unwrap());
-        [self.pid, name(0), name(1), self.exit_code.map_or(Self::RUNNING, |c| c as u64)]
+        [self.pid, name(0), name(1), self.exit_code.map_or(Self::RUNNING, |c| c as u64), self.cpu_ns]
     }
 
     pub fn from_words(w: [u64; Self::WORDS]) -> ProcessEntry {
         let mut name = [0; 16];
         name[..8].copy_from_slice(&w[1].to_le_bytes());
         name[8..].copy_from_slice(&w[2].to_le_bytes());
-        ProcessEntry { pid: w[0], name, exit_code: (w[3] != Self::RUNNING).then_some(w[3] as i64) }
+        ProcessEntry { pid: w[0], name, exit_code: (w[3] != Self::RUNNING).then_some(w[3] as i64), cpu_ns: w[4] }
     }
 
     pub fn name(&self) -> &str {
@@ -2472,6 +2483,17 @@ pub mod net {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_process_entry_survives_its_words() {
+        let mut name = [0u8; 16];
+        name[..7].copy_from_slice(b"cprimes");
+        for exit_code in [None, Some(0), Some(-1), Some(i64::MAX)] {
+            let entry = super::ProcessEntry { pid: 42, name, exit_code, cpu_ns: 1_234_567_890 };
+            assert_eq!(super::ProcessEntry::from_words(entry.to_words()), entry);
+        }
+        assert_eq!(super::ProcessEntry::default().name(), "");
+    }
+
     #[test]
     fn startup_handles_are_found_past_the_flags_that_bring_none() {
         use super::startup::*;
