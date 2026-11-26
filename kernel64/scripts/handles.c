@@ -155,6 +155,7 @@ static void what_open_refuses(void)
     close(fd);
     fd = open("f", O_RDONLY);
     check(write(fd, "x", 1) == -1 && errno == EBADF, "no writing what was opened to read");
+    check(futimens(fd, NULL) == 0, "but it may be stamped, as POSIX lets anyone who may write it");
     close(fd);
     check(open("f", O_CREAT | O_EXCL | O_WRONLY) == -1 && errno == EEXIST, "O_EXCL: it is there");
     check(open("f", O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR, "O_DIRECTORY on a file");
