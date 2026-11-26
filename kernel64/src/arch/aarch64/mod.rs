@@ -106,6 +106,17 @@ pub fn enable_interrupts() {
 /// thing: `TPIDR_EL1`, "thread ID register" for exception level 1,
 /// which the CPU itself never reads or changes. Each CPU's first
 /// instructions put its number there (entry.rs).
+/// This function's caller's frame pointer, for a backtrace: the frame
+/// record of whoever called this (always inlined, so: of the function it
+/// is written in).
+#[inline(always)]
+pub fn frame_pointer() -> u64 {
+    let frame: u64;
+    // SAFETY: reads a register; touches no memory.
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) frame, options(nomem, nostack, preserves_flags)) };
+    frame
+}
+
 pub fn cpu() -> usize {
     let number: u64;
     // SAFETY: reading a register that holds only what was put in it.

@@ -605,6 +605,24 @@ pub fn unused_frames() -> usize {
     with_memory(|_, frames| frames.free_frames()) + waiting * STACK_PAGES as usize
 }
 
+/// Whether a backtrace may read the word at `address`, having come from
+/// a frame at `from` (backtrace.rs): both on one thread's stack, above its
+/// guard page - a stack is mapped whole while it is in use - or both in
+/// the kernel image's data (the boot stack), not in the boot stack's guard
+/// page. A panic must not fault while it reports, so anything else is no.
+pub fn may_read_stack(from: u64, address: u64) -> bool {
+    let window = STACKS_START..STACKS_START + STACK_SLOTS * STACK_SLOT;
+    let slot = |a: u64| (window.contains(&a) && !is_stack_guard(a)).then(|| (a - STACKS_START) / STACK_SLOT);
+    let layout = kernel_layout();
+    let guard = layout.stack_guard..layout.stack_guard + PAGE_SIZE;
+    let in_image = |a: u64| layout.data.contains(&a) && !guard.contains(&a);
+    match (slot(from), slot(address)) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => in_image(from) && in_image(address),
+        _ => false,
+    }
+}
+
 /// Whether `address` is in the guard page of some thread's stack.
 pub fn is_stack_guard(address: u64) -> bool {
     (STACKS_START..STACKS_START + STACK_SLOTS * STACK_SLOT).contains(&address)

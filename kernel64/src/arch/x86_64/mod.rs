@@ -57,6 +57,17 @@ pub fn init_cpu() {
 ///
 /// Only as good as the moment it is asked: with interrupts on, the
 /// thread asking may be on another CPU by the time it uses the answer.
+/// This function's caller's frame pointer, for a backtrace: the frame
+/// record of whoever called this (always inlined, so: of the function it
+/// is written in).
+#[inline(always)]
+pub fn frame_pointer() -> u64 {
+    let frame: u64;
+    // SAFETY: reads a register; touches no memory.
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) frame, options(nomem, nostack, preserves_flags)) };
+    frame
+}
+
 pub fn cpu() -> usize {
     percpu::index()
 }
