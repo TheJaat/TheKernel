@@ -83,6 +83,10 @@ pub struct Process {
     /// and only it, does the ending. Separate from `exit_code`, which is
     /// published last, once the ending is done (see there).
     ending: AtomicBool,
+    /// The CPU time its threads have used, in nanoseconds: added to by
+    /// threads.rs when one of them leaves a CPU and at every tick
+    /// (clock::PROCESS_CPU, journal entry NNN).
+    cpu_ns: AtomicU64,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,
     /// The exit code that end will have: STOPPED, or a signal's.
@@ -135,6 +139,18 @@ pub enum LoadError {
 impl Process {
     pub fn root(&self) -> u64 {
         self.root
+    }
+
+    /// The CPU time its threads have used so far, in nanoseconds - up to
+    /// each one's last switch or tick (threads::process_cpu_ns adds the
+    /// part running now).
+    pub fn cpu_ns(&self) -> u64 {
+        self.cpu_ns.load(Ordering::Relaxed)
+    }
+
+    /// Counts `nanoseconds` more of CPU time (threads.rs, under its lock).
+    pub fn add_cpu(&self, nanoseconds: u64) {
+        self.cpu_ns.fetch_add(nanoseconds, Ordering::Relaxed);
     }
 
     /// The exit code, once the process has ended.
@@ -618,6 +634,7 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         tables: IrqLock::new(Some(tables)),
         exit_code: AtomicI64::new(RUNNING),
         ending: AtomicBool::new(false),
+        cpu_ns: AtomicU64::new(0),
         kill_requested: AtomicBool::new(false),
         kill_code: AtomicI64::new(abi::STOPPED),
         signals_pending: AtomicU64::new(0),
