@@ -627,16 +627,17 @@ pub mod startup {
 /// channel the parent fills and closes before the child starts.
 ///
 ///   [descriptor] [FILE] [flags, 4 bytes] [offset, 8 bytes] [path]
+///                             + one handle: the file's own channel
 ///   [descriptor] [READ]       + one handle: a stream to read from
 ///   [descriptor] [WRITE]      + one handle: a stream to write to
 ///
-/// A file is no more than its name, where the parent had got to, and
-/// how it was opened (a C library keeps nothing else for one: the file
-/// service remembers nothing between requests), so it travels as those,
-/// and the child's copy moves on its own from there. A pipe's end, or
-/// another stream, is a channel: the handle itself goes down. Numbers
-/// are little-endian; `flags` are open's (Linux's values); `path` is
-/// from the root.
+/// A file is its channel to the file service (J60), which stays that
+/// file through renames and removals; with it come where the parent had
+/// got to and how it was opened, and the child's place moves on its own
+/// from there. `path` is the name it was opened by, kept for what still
+/// goes by name (fchdir). A pipe's end, or another stream, is a
+/// channel: the handle itself goes down. Numbers are little-endian;
+/// `flags` are open's (Linux's values); `path` is from the root.
 pub mod descriptors {
     pub const FILE: u8 = 1;
     pub const READ: u8 = 2;
