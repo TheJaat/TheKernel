@@ -7,10 +7,11 @@
  *                            the machine was booted with (TheTaaJ's sysconf
  *                            does not know), only printed with the results
  *   schedbench exit          returns at once: what "spawn" starts
- *   schedbench busy FROM TO  waits until FROM, spins until TO (both in
+ *   schedbench busy FROM TO [NICE]
+ *                            waits until FROM, spins until TO (both in
  *                            nanoseconds of the monotonic clock), then
  *                            prints the CPU time it got in between: what
- *                            "fair" starts four of
+ *                            "fair" starts four of; at nice NICE if given
  *
  * The measurements, each printed as "schedbench: NAME VALUE UNIT ...":
  *
@@ -32,12 +33,24 @@
  *             one after another, and a window from each one's own start
  *             would give the first more time alone
  *
+ * And since K20 (priorities and affinity, journal entry NNN):
+ *
+ *   nice      as fair, two of the four at nice 10: on one or two CPUs the
+ *             two at nice 0 get the CPUs and the two at 10 next to nothing
+ *             (priorities are strict)
+ *   pinned    two busy threads for one second, pinned to CPU 0, then the
+ *             same two free: pinned, they share one CPU
+ *   loaded    wake-to-run latency with every CPU busy, the busy programs
+ *             at nice 0 (the woken thread waits its turn) and at nice 10
+ *             (it takes a CPU at once)
+ *
  * The clock is CLOCK_MONOTONIC (the CPU's counter, to the nanosecond);
  * CPU time is CLOCK_PROCESS_CPUTIME_ID (journal entry 114). */
 
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,10 +205,9 @@ static pthread_cond_t woken = PTHREAD_COND_INITIALIZER;
 static long long signalled_at, ran_at;
 static int wake_round, wake_seen;
 
-static void *sleeper(void *unused)
+static void *sleeper_n(void *rounds)
 {
-    (void)unused;
-    for (int round = 1; round <= WAKES; round++) {
+    for (int round = 1; round <= (int)(long)rounds; round++) {
         pthread_mutex_lock(&wake_lock);
         while (wake_round < round)
             pthread_cond_wait(&wake_up, &wake_lock);
@@ -218,7 +230,7 @@ static void bench_wake(void)
     static long long samples[WAKES];
     pthread_t other;
     wake_round = wake_seen = 0;
-    pthread_create(&other, NULL, sleeper, NULL);
+    pthread_create(&other, NULL, sleeper_n, (void *)(long)WAKES);
     for (int round = 1; round <= WAKES; round++) {
         /* Long enough for the sleeper to be asleep again, off its CPU. */
         struct timespec gap = {0, 2000000};
@@ -302,6 +314,124 @@ static void bench_fair(void)
     printf("schedbench: fair done (4 programs over the same 2 s; their lines say what each got)\n");
 }
 
+/* ---- K20: nice, pinned, loaded ------------------------------------------ */
+
+/* Starts `count` busy programs over [from, to], the first `at_nice` of
+ * them at nice `level`; returns how many started. */
+static int start_busy(pid_t *pids, int count, long long from, long long to, int at_nice, int level)
+{
+    char a[24], b[24], n[8];
+    snprintf(a, sizeof a, "%lld", from);
+    snprintf(b, sizeof b, "%lld", to);
+    snprintf(n, sizeof n, "%d", level);
+    int started = 0;
+    for (int i = 0; i < count; i++) {
+        char *with_nice[] = {"schedbench", "busy", a, b, n, NULL};
+        char *without[] = {"schedbench", "busy", a, b, NULL};
+        pids[i] = start(i < at_nice ? with_nice : without);
+        started += pids[i] > 0;
+    }
+    return started;
+}
+
+static void wait_all(pid_t *pids, int count)
+{
+    for (int i = 0; i < count; i++) {
+        int status;
+        if (pids[i] > 0)
+            waitpid(pids[i], &status, 0);
+    }
+}
+
+static void bench_nice(void)
+{
+    pid_t pids[4];
+    long long begin = now_ns() + 300000000LL;
+    start_busy(pids, 4, begin, begin + 2000000000LL, 2, 10);
+    wait_all(pids, 4);
+    printf("schedbench: nice done (4 programs over the same 2 s, two at nice 10)\n");
+}
+
+struct spinner {
+    long long until;
+    int pinned;
+};
+
+static void *spin_thread(void *arg)
+{
+    struct spinner *s = arg;
+    if (s->pinned) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(0, &one);
+        pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+    }
+    volatile unsigned long spins = 0;
+    while (now_ns() < s->until)
+        spins++;
+    return NULL;
+}
+
+/* Two threads spinning for a second; the process's CPU time in that
+ * second, in ms. */
+static long long spin_pair(int pinned)
+{
+    pthread_t t[2];
+    struct spinner s = {now_ns() + 1000000000LL, pinned};
+    long long cpu0 = cpu_ns();
+    for (int i = 0; i < 2; i++)
+        pthread_create(&t[i], NULL, spin_thread, &s);
+    for (int i = 0; i < 2; i++)
+        pthread_join(t[i], NULL);
+    return (cpu_ns() - cpu0) / 1000000;
+}
+
+static void bench_pinned(int cpus)
+{
+    if (cpus < 2) {
+        printf("schedbench: pinned skipped (one CPU)\n");
+        return;
+    }
+    long long pinned = spin_pair(1), free = spin_pair(0);
+    printf("schedbench: pinned 2 threads to CPU 0: %lld ms cpu in 1000 ms; free: %lld ms cpu\n", pinned, free);
+}
+
+/* Wake-to-run latency while `count` busy programs at nice `level` fill
+ * every CPU: the median and worst of 100, in us. */
+static void loaded_wake(int count, int level)
+{
+    pid_t pids[16];
+    long long begin = now_ns() + 300000000LL;
+    /* 4 s: 100 wake-ups 2 ms apart, even if each waits out a 20 ms slice. */
+    start_busy(pids, count, begin, begin + 4000000000LL, count, level);
+    while (now_ns() < begin + 100000000LL) {
+        struct timespec nap = {0, 10000000};
+        nanosleep(&nap, NULL);
+    }
+    enum { N = 100 };
+    static long long samples[N];
+    pthread_t other;
+    wake_round = wake_seen = 0;
+    pthread_create(&other, NULL, sleeper_n, (void *)(long)N);
+    for (int round = 1; round <= N; round++) {
+        struct timespec gap = {0, 2000000};
+        nanosleep(&gap, NULL);
+        pthread_mutex_lock(&wake_lock);
+        wake_round = round;
+        signalled_at = now_ns();
+        pthread_cond_signal(&wake_up);
+        while (wake_seen < round)
+            pthread_cond_wait(&woken, &wake_lock);
+        samples[round - 1] = ran_at - signalled_at;
+        pthread_mutex_unlock(&wake_lock);
+    }
+    pthread_join(other, NULL);
+    wait_all(pids, count); /* they end with their window */
+    qsort(samples, N, sizeof samples[0], by_value);
+    printf("schedbench: loaded wake, %d busy at nice %d: median %lld us, worst %lld us\n", count, level,
+           samples[N / 2] / 1000, samples[N - 1] / 1000);
+}
+
 static int busy(long long from, long long to)
 {
     while (now_ns() < from) {
@@ -312,7 +442,8 @@ static int busy(long long from, long long to)
     volatile unsigned long spins = 0;
     while (now_ns() < to)
         spins++;
-    printf("schedbench: busy %lld ms, %lld ms cpu\n", (to - from) / 1000000, (cpu_ns() - cpu0) / 1000000);
+    printf("schedbench: busy %lld ms, %lld ms cpu at nice %d\n", (to - from) / 1000000, (cpu_ns() - cpu0) / 1000000,
+           getpriority(PRIO_PROCESS, 0));
     return 0;
 }
 
@@ -320,8 +451,11 @@ int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "exit") == 0)
         return 0;
-    if (argc >= 4 && strcmp(argv[1], "busy") == 0)
+    if (argc >= 4 && strcmp(argv[1], "busy") == 0) {
+        if (argc >= 5)
+            setpriority(PRIO_PROCESS, 0, atoi(argv[4]));
         return busy(atoll(argv[2]), atoll(argv[3]));
+    }
     if (argc >= 3 && strcmp(argv[1], "all") == 0) {
         long long cpu0 = cpu_ns(), start = now_ns();
         printf("schedbench: on %s CPUs\n", argv[2]);
@@ -332,6 +466,12 @@ int main(int argc, char **argv)
         bench_wake();
         bench_scale();
         bench_fair();
+        int cpus = atoi(argv[2]);
+        bench_nice();
+        bench_pinned(cpus);
+        int count = cpus < 1 ? 1 : cpus > 16 ? 16 : cpus;
+        loaded_wake(count, 0);
+        loaded_wake(count, 10);
         printf("schedbench: done in %lld ms, %lld ms cpu\n", (now_ns() - start) / 1000000, (cpu_ns() - cpu0) / 1000000);
         return 0;
     }

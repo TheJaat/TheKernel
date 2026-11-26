@@ -424,11 +424,16 @@ fn sched_thread(id: u64) -> Result<kernel64::sched::ThreadId, Error> {
     if me()?.thread_ids().contains(&id) { Ok(id) } else { Err(Error::NotFound) }
 }
 
+/// The CPUs there are, one bit each.
+fn cpus_there() -> u64 {
+    let cpus = crate::threads::cpus();
+    if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 }
+}
+
 /// An affinity limited to the CPUs there are; InvalidArgument if it
 /// names none of them.
 fn sched_affinity(value: u64) -> Result<u64, Error> {
-    let cpus = crate::threads::cpus();
-    let there = if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+    let there = cpus_there();
     if value & there == 0 { Err(Error::InvalidArgument) } else { Ok(value & there) }
 }
 
@@ -482,10 +487,12 @@ pub fn sched_get(target: u64, id: u64, what: u64) -> Result<u64, Error> {
         (sched::THREAD, sched::THREAD_ID) if id == 0 => Ok(crate::threads::current()),
         (sched::THREAD, sched::PRIORITY | sched::AFFINITY) => {
             let (priority, affinity) = crate::threads::scheduling(sched_thread(id)?).ok_or(Error::NotFound)?;
-            Ok(if what == sched::PRIORITY { sched::level(priority) } else { affinity })
+            // An affinity is read as the CPUs there are: "any CPU" is
+            // kept as every bit, but a program sees only real ones.
+            Ok(if what == sched::PRIORITY { sched::level(priority) } else { affinity & cpus_there() })
         }
         (sched::PROCESS, sched::PRIORITY) => Ok(sched::level(sched_process(id, false)?.sched_priority())),
-        (sched::PROCESS, sched::AFFINITY) => Ok(sched_process(id, false)?.sched_affinity()),
+        (sched::PROCESS, sched::AFFINITY) => Ok(sched_process(id, false)?.sched_affinity() & cpus_there()),
         (sched::PROCESS, sched::CEILING) => Ok(sched::level(sched_process(id, false)?.sched_ceiling())),
         _ => Err(Error::InvalidArgument),
     }

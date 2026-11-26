@@ -49,14 +49,32 @@ for cpus in 1 2 4; do
     grep -aq '^== end ==$' "$T" || fail "the steps did not all run"
     for what in "on $cpus CPUs" "yield [0-9]+ ns each" "handoff [0-9]+ ns one way" "create [0-9]+ us each" \
         "spawn [0-9]+ us each" "wake median [0-9]+ us, 99% [0-9]+ us, worst [0-9]+ us" "scale 1 thread [0-9]+ ms" \
-        "scale 8 threads [0-9]+ ms" "fair done" "done in [0-9]+ ms"; do
+        "scale 8 threads [0-9]+ ms" "fair done" "nice done" "pinned (skipped|2 threads)" \
+        "loaded wake, [0-9]+ busy at nice 0: median" "loaded wake, [0-9]+ busy at nice 10: median" "done in [0-9]+ ms"; do
         grep -aEq "schedbench: $what" "$T" || fail "no \"schedbench: $what\""
     done
-    [ "$(grep -acE 'schedbench: busy 2000 ms, [0-9]+ ms cpu' "$T")" -eq 4 ] || fail "not all four busy programs reported"
+    [ "$(grep -acE 'schedbench: busy 2000 ms, [0-9]+ ms cpu' "$T")" -eq 8 ] || fail "not all eight busy programs (fair, nice) reported"
     grep -aEq 'schedbench: (create|spawn) failed' "$T" && fail "a thread or a program could not be started"
     grep -aq '"schedbench" exited with code 0' "$T" || fail "schedbench did not exit with code 0"
     grep -aE '"schedbench" (killed|ended by signal)' "$T" && fail "a schedbench program was killed"
     grep -aiE 'panic|page fault in kernel' "$T" && fail "the kernel failed"
+
+    # Priorities and affinity (K20, journal entry NNN) as behaviour, with
+    # generous limits: on one or two CPUs the two programs at nice 0 keep
+    # them, so the two at nice 10 get under a quarter of what they get;
+    # pinned to one CPU, two busy threads get at most three quarters of
+    # what they get free. (On four CPUs all four busy programs run.)
+    nice_section=$(sed -n '/schedbench: fair done/,/schedbench: nice done/p' "$T")
+    nice0=$(echo "$nice_section" | grep -aEo 'busy 2000 ms, [0-9]+ ms cpu at nice 0' | awk '{s += $4} END {print s + 0}')
+    nice10=$(echo "$nice_section" | grep -aEo 'busy 2000 ms, [0-9]+ ms cpu at nice 10' | awk '{s += $4} END {print s + 0}')
+    if [ $cpus -le 2 ]; then
+        [ $((nice10 * 4)) -lt "$nice0" ] || fail "at nice 10 two programs got $nice10 ms against $nice0 at nice 0: priorities did not hold"
+    fi
+    if [ $cpus -ge 2 ]; then
+        pinned=$(grep -aEo 'pinned 2 threads to CPU 0: [0-9]+ ms cpu in 1000 ms; free: [0-9]+' "$T" | grep -Eo '[0-9]+' | sed -n 3p)
+        free=$(grep -aEo 'pinned 2 threads to CPU 0: [0-9]+ ms cpu in 1000 ms; free: [0-9]+' "$T" | grep -Eo '[0-9]+' | sed -n 5p)
+        [ $((pinned * 4)) -le $((free * 3)) ] || fail "pinned to CPU 0 two threads got $pinned ms, free $free ms: the affinity did not hold"
+    fi
 
     # One column of the table: this boot's numbers.
     v() { grep -aEo "schedbench: $1" "$T" | head -1 | grep -Eo "[0-9]+(\.[0-9]+)?" | sed -n "${2:-1}p"; }
@@ -71,7 +89,11 @@ for cpus in 1 2 4; do
         echo "scale1_ms=$(v 'scale 1 thread [0-9]+' 2)"
         echo "scale4=$(grep -aEo 'scale 4 threads [0-9]+ ms, [0-9]+\.[0-9]+ times' "$T" | grep -Eo '[0-9]+\.[0-9]+')"
         echo "scale8=$(grep -aEo 'scale 8 threads [0-9]+ ms, [0-9]+\.[0-9]+ times' "$T" | grep -Eo '[0-9]+\.[0-9]+')"
-        echo "fair_cpu_ms=$cpu_shares"
+        echo "fair_cpu_ms=$(echo "$cpu_shares" | cut -d' ' -f1-4)"
+        echo "nice_cpu_ms=$(echo "$nice_section" | grep -aEo 'busy 2000 ms, [0-9]+ ms cpu at nice [0-9]+' | awk '{printf "%s%s(%s) ", sep, $4, $9}' | sed 's/ $//')"
+        echo "pinned_ms=$(grep -aEo 'pinned 2 threads to CPU 0: [0-9]+ ms cpu in 1000 ms; free: [0-9]+' "$T" | grep -Eo '[0-9]+' | awk 'NR==3{p=$1} NR==5{f=$1} END {print (p == "" ? "-" : p "/" f)}')"
+        echo "loaded0=$(grep -aEo 'loaded wake, [0-9]+ busy at nice 0: median [0-9]+ us, worst [0-9]+' "$T" | grep -Eo '[0-9]+' | awk 'NR==3{m=$1} NR==4{w=$1} END {print m "/" w}')"
+        echo "loaded10=$(grep -aEo 'loaded wake, [0-9]+ busy at nice 10: median [0-9]+ us, worst [0-9]+' "$T" | grep -Eo '[0-9]+' | awk 'NR==3{m=$1} NR==4{w=$1} END {print m "/" w}')"
     } >> "$SUMMARY"
 done
 
@@ -89,7 +111,11 @@ rows = [("CPUs", "cpus", ""), ("yield (a switch)", "yield_ns", " ns"), ("hand-of
         ("thread made and joined", "create_us", " us"), ("program started and waited for", "spawn_us", " us"),
         ("wake-to-run: median/99%/worst", "wake_us", " us"), ("arithmetic, 1 thread", "scale1_ms", " ms"),
         ("... on 4 threads: speed-up", "scale4", "x"), ("... on 8 threads: speed-up", "scale8", "x"),
-        ("4 busy programs, 2 s: CPU each", "fair_cpu_ms", " ms")]
+        ("4 busy programs, 2 s: CPU each", "fair_cpu_ms", " ms"),
+        ("same, two at nice 10: CPU each (nice)", "nice_cpu_ms", " ms"),
+        ("2 threads pinned to CPU 0 / free: CPU", "pinned_ms", " ms"),
+        ("wake, every CPU busy at nice 0: median/worst", "loaded0", " us"),
+        ("wake, every CPU busy at nice 10: median/worst", "loaded10", " us")]
 print(f"schedbench ({sys.argv[2]}):")
 print("| " + " | ".join(r[0] for r in rows[:1]) + " | " + " | ".join(f"{r['cpus']}" for r in runs) + " |")
 print("|---|" + "---|" * len(runs))
