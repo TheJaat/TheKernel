@@ -102,8 +102,11 @@ fi
 qemu=$!
 
 # Poll ten times a second: the boot is over when one of the patterns
-# appears, QEMU has gone, or the limit is reached.
+# appears, QEMU has gone, or nothing new has been printed for SECONDS -
+# the count starts again whenever the log grows, so a slow boot that is
+# still printing is not stopped, only a silent one (journal entry 105).
 ticks=0
+size=-1
 while [ $ticks -lt $((LIMIT * 10)) ]; do
     if grep -aEq "$FINISHED" "$LOG" 2>/dev/null; then
         # The line that ended the boot may be followed by more (a
@@ -112,6 +115,11 @@ while [ $ticks -lt $((LIMIT * 10)) ]; do
         break
     fi
     kill -0 $qemu 2>/dev/null || break
+    now=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+    if [ "$now" != "$size" ]; then
+        size=$now
+        ticks=0
+    fi
     sleep 0.1
     ticks=$((ticks + 1))
 done

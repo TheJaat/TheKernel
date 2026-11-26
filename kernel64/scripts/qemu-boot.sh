@@ -11,6 +11,9 @@
 # Environment:
 #   TAAJ_ACCEL kvm or tcg (default tcg): the Makefile sets it, kvm when
 #              /dev/kvm can be opened
+#   FIRMWARE_SECONDS  how long the firmware and the loader may take before
+#              the kernel's first byte (default 90); SECONDS counts only
+#              the silence after it
 #   QEMU_ARGS  extra QEMU options (for example the firmware)
 #   KEYS       QEMU key names to type once the keyboard driver is ready,
 #              through QEMU's monitor (`sendkey`) - e.g. "shift-h i ret".
@@ -86,16 +89,38 @@ died_in_firmware() {
 
 start_qemu
 
-# Polls (ten times a second) until PATTERN appears in the log or the
-# time runs out; true if it appeared.
+# Polls ten times a second until `pattern` appears in the log (true) or
+# the time runs out (false): for at most `ticks` tenths of a second
+# of SILENCE: the count starts again whenever the log grows. A kernel that
+# hangs prints nothing more and is stopped after SECONDS, as the usage
+# says; a slow one that is still printing is not. Counting the time from
+# the start instead, as this once did, stopped healthy boots under the
+# load of test64's own parallel parts (journal entry 105).
+#
+# Before the kernel's first byte there is nothing to count: the firmware
+# and the BIOS loader write nothing on the serial line, and emulated they
+# take most of a boot - 14 s of 18 on an idle host, up to 64 s on a busy
+# one (measured on MaK). That part gets FIRMWARE_SECONDS (default 90).
 wait_for() {
     pattern=$1
     ticks=$2
-    while [ "$ticks" -gt 0 ]; do
+    left=$ticks
+    firmware=$(( ${FIRMWARE_SECONDS:-90} * 10 ))
+    size=0
+    while [ "$left" -gt 0 ] && [ "$firmware" -gt 0 ]; do
         grep -qE "$pattern" "$LOG" && return 0
         kill -0 $qemu 2>/dev/null || return 1   # QEMU quit (a triple fault resets; -no-reboot quits)
+        now=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+        if [ "$now" -eq 0 ]; then
+            firmware=$((firmware - 1))           # still in the firmware or the loader
+        else
+            if [ "$now" != "$size" ]; then
+                size=$now
+                left=$ticks
+            fi
+            left=$((left - 1))
+        fi
         sleep 0.1
-        ticks=$((ticks - 1))
     done
     return 1
 }
@@ -122,9 +147,13 @@ if [ $finished -eq 0 ]; then
         entered=0
         for key in $KEYS; do
             if [ "$key" = "/" ]; then
-                # Wait for one more "ready" line than there is now.
+                # Wait for one more "ready" line than there is now. A new
+                # driver after a crash comes in a second or two; after a
+                # reboot the firmware and the loader run again first,
+                # printing nothing - FIRMWARE_SECONDS, as for the first
+                # boot (journal entry 105).
                 seen=$(grep -c "$ready" "$LOG")
-                ticks=100
+                ticks=$(( ${FIRMWARE_SECONDS:-90} * 10 ))
                 while [ "$(grep -c "$ready" "$LOG")" -le "$seen" ] && [ $ticks -gt 0 ]; do
                     sleep 0.1
                     ticks=$((ticks - 1))
@@ -179,7 +208,11 @@ if [ $finished -eq 0 ]; then
     sleep 0.3
 else
     if kill -0 $qemu 2>/dev/null; then
-        echo "qemu-boot: no end of output after ${LIMIT}s - killed" >&2
+        if [ -s "$LOG" ]; then
+            echo "qemu-boot: nothing new on the serial line for ${LIMIT}s, and no end - killed" >&2
+        else
+            echo "qemu-boot: not a byte on the serial line in ${FIRMWARE_SECONDS:-90}s (firmware or loader) - killed" >&2
+        fi
         # What was on the screen: the BIOS loader reports only there.
         echo "screendump $LOG.hang.ppm" | nc -U -N "$MONITOR" > /dev/null
         sleep 0.3
