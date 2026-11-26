@@ -561,11 +561,14 @@ fn ramfb(tree: &kernel64::devicetree::Tree) -> Option<(abi::FramebufferInfo, mem
         return None;
     }
     let base = mm::map_mmio(registers.start, registers.size);
-    // SAFETY (the three closures): registers of the fw_cfg device,
-    // mapped as device memory just above; volatile, because each access
-    // is an instruction to the device.
+    // The three closures reach registers of the fw_cfg device, mapped as
+    // device memory just above; volatile, because each access is an
+    // instruction to the device.
+    // SAFETY: the selector register, within the mapping.
     let select = |selector: u16| unsafe { ((base + fwcfg::SELECTOR) as *mut u16).write_volatile(selector.to_be()) };
+    // SAFETY: the data register, within the mapping.
     let byte = || unsafe { ((base + fwcfg::DATA) as *const u8).read_volatile() };
+    // SAFETY: the two halves of the DMA address register, within the mapping.
     let dma = |half: u64, value: u32| unsafe { ((base + fwcfg::DMA_ADDRESS + half) as *mut u32).write_volatile(value.to_be()) };
 
     // The directory: a count, then an entry per file. Read whole (it is
