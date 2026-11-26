@@ -75,14 +75,18 @@ pub fn enable_local(spurious_vector: u8) {
     write(SPURIOUS, SOFTWARE_ENABLE | u32::from(spurious_vector));
 }
 
-/// Sends a non-maskable interrupt to every CPU but this one. Does not
-/// wait for anything: the caller is stopping the system, and must not
-/// hang on the way. Nothing happens before the APIC is mapped - there
-/// are no other CPUs running then.
-pub fn nmi_others() {
-    if LOCAL_BASE.load(Ordering::Relaxed) != 0 {
-        write(COMMAND_HIGH, 0);
-        write(COMMAND_LOW, kernel64::smp::nmi_to_all_others());
+/// Sends a non-maskable interrupt to the CPU whose local APIC id is
+/// `apic_id`. Waits a little for it to leave this APIC, but not for
+/// ever: the caller is stopping the system, and must not hang on the
+/// way.
+pub fn nmi(apic_id: u8) {
+    write(COMMAND_HIGH, kernel64::smp::destination(apic_id));
+    write(COMMAND_LOW, kernel64::smp::nmi_message());
+    for _ in 0..100_000 {
+        if read(COMMAND_LOW) & SENDING == 0 {
+            break;
+        }
+        core::hint::spin_loop();
     }
 }
 
