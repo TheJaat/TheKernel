@@ -3,7 +3,7 @@
 #   - open files as handles (journal entry 115, J60 and J61): a
 #     descriptor follows its file through a rename, outlives a removal
 #     and a replacing rename, and is handed to a child as the file;
-#   - a namespace per process (journal entry NNN, J62): a directory
+#   - a namespace per process (journal entry 117, J62): a directory
 #     mounted at a path of the program's own, and handed to a child.
 #
 #   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE

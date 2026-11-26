@@ -1,4 +1,4 @@
-/* namespace.c - a namespace per process (journal entry NNN, J62):
+/* namespace.c - a namespace per process (journal entry 117, J62):
  * taaj_mount sees a directory at a path of this program's own, and
  * posix_spawn hands the mounts to a child. handles-test.sh boots
  * TheTaaJ and runs
