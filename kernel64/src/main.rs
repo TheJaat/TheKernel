@@ -718,7 +718,7 @@ fn report_machine(address: u64, tree: &kernel64::devicetree::Tree, machine: &ker
 /// refuse it. If the loader copied all of it to the right place, every
 /// byte is what the build script wrote. (512 KiB until the kernel itself
 /// passed 2.5 MiB, with its symbol table: then the big image crossed the
-/// 3 MiB wall - journal entry NNN. So this fails first, while the kernel
+/// 3 MiB wall - journal entry 122. So this fails first, while the kernel
 /// still has 256 KiB left under it: time for J51 or K130.)
 #[cfg(all(target_arch = "x86_64", feature = "big-image"))]
 fn check_big_image() {

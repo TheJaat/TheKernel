@@ -317,7 +317,7 @@ fault() {
     need "$log" "    pc  0xffffffff"
     # Where it happened, in words: the backtrace names kernel_main (the
     # fault tests run there), from the kernel's own symbols (journal
-    # entry NNN).
+    # entry 122).
     need "$log" "^    (#[0-3]|lr ) +0x[0-9a-f]+  (kernel64::)?kernel_main\\+0x"
     if grep -aEq "FAILED|\[kernel\] idle|\[kernel\] no programs can run" "$log"; then
         fail "the kernel carried on after the fault"

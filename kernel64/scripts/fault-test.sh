@@ -76,7 +76,7 @@ for test in $TESTS; do
     # said so on the screen too, where a real machine's user would look.
     screen=ok
     python3 -I "$HERE/scripts/check-last-words.py" "$log.ppm" > "$log.screen" 2>&1 || screen=bad
-    # Where it happened, in words (journal entry NNN): the backtrace names
+    # Where it happened, in words (journal entry 122): the backtrace names
     # kernel_main, which runs the fault tests - from the kernel's own
     # symbols. Not after a stack overflow (no stack to walk), nor for
     # init, which stops without a fault.
