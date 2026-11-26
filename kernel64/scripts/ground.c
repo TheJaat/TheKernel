@@ -354,7 +354,7 @@ static void children_checks(void)
      * time waitid returns is decided on two CPUs at once - the child
      * ending, the parent waiting - so one try says little: under KVM the
      * kernel once let waitid return first, once in twenty runs of
-     * test64 (journal entry 101). A hundred children show it every time
+     * test64 (journal entry 105). A hundred children show it every time
      * the order is wrong. `expected` counts the children ended so far,
      * so a late handler that runs during the next child is not counted
      * twice. */

@@ -249,7 +249,7 @@ pub fn threads() {
     // so a host that stops this virtual machine for a moment - as a busy
     // host running many of them does - makes one sleep late although the
     // kernel did nothing wrong; a kernel that wakes sleepers late does it
-    // every time (journal entry 101).
+    // every time (journal entry 105).
     let mut slept = 0;
     for _ in 0..3 {
         let start = interrupts::ticks();

@@ -752,7 +752,7 @@ fn end_current(code: i64, how: core::fmt::Arguments) -> ! {
             // that the handler runs before its wait returns. Publishing
             // the code first, as this once did, left a window between
             // the two: under KVM a parent's waitid returned in it, its
-            // handler not yet run (journal entry 101). The list is taken
+            // handler not yet run (journal entry 105). The list is taken
             // out of the lock (sending can take the watcher's locks) and
             // left None, so a watcher who comes now is told at once.
             let notify = process.notify.lock().take().unwrap_or_default();

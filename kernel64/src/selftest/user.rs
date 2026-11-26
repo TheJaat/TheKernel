@@ -160,7 +160,7 @@ pub fn kill() {
             // virtual machine for a moment makes one kill look slow
             // (under KVM with every host CPU busy, 4 boots in 40 did);
             // a kill that really is slow is slow every time (journal
-            // entry 101).
+            // entry 105).
             let mut took = 0;
             for _ in 0..3 {
                 let (process, thread) = start(mode);
