@@ -638,6 +638,12 @@ pub mod startup {
 ///                             + one handle: the file's own channel
 ///   [descriptor] [READ]       + one handle: a stream to read from
 ///   [descriptor] [WRITE]      + one handle: a stream to write to
+///   [0]          [MOUNT] [path] + one handle: a directory, mounted
+///
+/// A MOUNT is not a descriptor: it is one of the parent's mounts (J62,
+/// a namespace per process: `taaj::files::Files::mounted`), handed down
+/// with the descriptors because the same library reads both - a
+/// directory's channel, seen at `path` in the child's namespace too.
 ///
 /// A file is its channel to the file service (J60), which stays that
 /// file through renames and removals; with it come where the parent had
@@ -650,6 +656,7 @@ pub mod descriptors {
     pub const FILE: u8 = 1;
     pub const READ: u8 = 2;
     pub const WRITE: u8 = 3;
+    pub const MOUNT: u8 = 4;
 
     /// One descriptor, as a message says it.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +668,9 @@ pub mod descriptors {
         /// A stream end; its handle travels with the message.
         Read { descriptor: u8 },
         Write { descriptor: u8 },
+        /// A directory mounted at `path` (from the root) in the
+        /// parent's namespace; its channel travels with the message.
+        Mount { path: &'a str },
     }
 
     impl<'a> Entry<'a> {
@@ -678,6 +688,16 @@ pub mod descriptors {
                     out[2..6].copy_from_slice(&flags.to_le_bytes());
                     out[6..14].copy_from_slice(&offset.to_le_bytes());
                     out[14..length].copy_from_slice(path.as_bytes());
+                    Some(length)
+                }
+                Entry::Mount { path } => {
+                    let length = 2 + path.len();
+                    if length > out.len() {
+                        return None;
+                    }
+                    out[0] = 0;
+                    out[1] = MOUNT;
+                    out[2..length].copy_from_slice(path.as_bytes());
                     Some(length)
                 }
                 Entry::Read { descriptor } | Entry::Write { descriptor } => {
@@ -704,6 +724,10 @@ pub mod descriptors {
                 }
                 READ if rest.is_empty() => Some(Entry::Read { descriptor }),
                 WRITE if rest.is_empty() => Some(Entry::Write { descriptor }),
+                MOUNT if descriptor == 0 => {
+                    let path = core::str::from_utf8(rest).ok().filter(|path| path.starts_with('/'))?;
+                    Some(Entry::Mount { path })
+                }
                 _ => None,
             }
         }
@@ -711,11 +735,13 @@ pub mod descriptors {
         pub fn descriptor(&self) -> u8 {
             match *self {
                 Entry::File { descriptor, .. } | Entry::Read { descriptor } | Entry::Write { descriptor } => descriptor,
+                // Not a descriptor: 0, which no entry is ever for.
+                Entry::Mount { .. } => 0,
             }
         }
 
         /// Whether a handle comes with it: every kind has one (a file
-        /// its channel, since J60).
+        /// its channel, since J60; a mount its directory's).
         pub fn has_handle(&self) -> bool {
             true
         }
@@ -2533,6 +2559,24 @@ mod tests {
         assert_eq!(Entry::decode(&[3, 9]), None);
         assert_eq!(Entry::decode(&[3, READ, 0]), None);
         assert_eq!(Entry::decode(&[3, FILE, 0, 0]), None);
+    }
+
+    #[test]
+    fn a_mount_goes_with_the_descriptors() {
+        use super::descriptors::*;
+        let mount = Entry::Mount { path: "/data" };
+        let mut out = [0u8; 16];
+        let n = mount.encode(&mut out).unwrap();
+        assert_eq!(&out[..n], b"\0\x04/data");
+        assert_eq!(Entry::decode(&out[..n]), Some(mount.clone()));
+        assert!(mount.has_handle());
+        assert_eq!(mount.descriptor(), 0, "for no descriptor");
+        assert_eq!(Entry::decode(b"\x03\x04/data"), None, "a mount is for no descriptor");
+        assert_eq!(Entry::decode(b"\0\x04data"), None, "a path from the root");
+        assert_eq!(mount.encode(&mut [0u8; 6]), None);
+        let root = Entry::Mount { path: "/" };
+        let n = root.encode(&mut out).unwrap();
+        assert_eq!(Entry::decode(&out[..n]), Some(root), "the root itself can be mounted over");
     }
 
     #[test]
