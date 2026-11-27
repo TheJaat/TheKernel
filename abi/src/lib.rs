@@ -1191,6 +1191,19 @@ pub mod display {
     pub const KEYS: u8 = 6;
     /// The most keys one KEYS measures.
     pub const KEYS_MAX: u32 = 200;
+    /// Followed by a key code (u16 LE, Linux's numbering: 42 left Shift,
+    /// 29 left Control, 30 A) and 1 if it went down, 0 if up: every key
+    /// pressed or released, Shift and Control alone included - besides
+    /// the bytes the same key makes for a terminal (K42). Sent by the
+    /// keyboard drivers (kbd, hid, usb) on their copy of this channel.
+    pub const KEY: u8 = 7;
+    pub const KEY_SIZE: usize = 4;
+
+    /// A KEY message.
+    pub fn key_message(code: u16, down: bool) -> [u8; KEY_SIZE] {
+        let code = code.to_le_bytes();
+        [KEY, code[0], code[1], u8::from(down)]
+    }
 
     /// A pointer's report: moved by (x, y) pixels (`absolute` false,
     /// right and down positive), or is at (x, y), each 0..=ABSOLUTE_MAX
