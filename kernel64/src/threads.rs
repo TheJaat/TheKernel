@@ -423,6 +423,39 @@ pub fn yield_now() {
 /// next `schedule`. Interrupts must be off, and stay off until then.
 fn announce(state: State) {
     with(|t| t.policy.suspend_current(arch::cpu(), state));
+    if let State::Sleeping(until) = state {
+        // This CPU's timer, for this sleeper if it is due before the
+        // next tick (K24). Interrupts are off: callers announce so.
+        arch::timer_wake_by(crate::clock::counter_at(until));
+    }
+}
+
+/// Nanoseconds in a tick.
+const TICK_NS: u64 = 1_000_000_000 / interrupts::HZ;
+
+/// Now, as sleepers' deadlines are kept: nanoseconds since the clock
+/// started (K24, journal entry NNN) - before it starts, the ticks so far
+/// in nanoseconds, which is the same scale.
+pub fn now_ns() -> u64 {
+    if crate::clock::started() {
+        crate::clock::monotonic()
+    } else {
+        interrupts::ticks() * TICK_NS
+    }
+}
+
+/// Tick `tick`, as a deadline in nanoseconds: the tick count reaches it
+/// exactly when the clock reaches this.
+fn tick_ns(tick: u64) -> u64 {
+    tick.saturating_mul(TICK_NS)
+}
+
+/// Sets this CPU's timer for its first sleeper, if that is before the
+/// next tick. After a timer interrupt, which set it for the tick.
+fn arm_for_sleepers(t: &Threads) {
+    if let Some(until) = t.policy.first_wake_on(arch::cpu()) {
+        arch::timer_wake_by(crate::clock::counter_at(until));
+    }
 }
 
 /// Takes that back: the thread looked, and has nothing to wait for.
@@ -442,8 +475,14 @@ fn stay() {
 /// A caught signal cuts it short as a kill does (see `interrupted`).
 /// Returns whether the whole time was slept.
 pub fn sleep(ticks: u64) -> bool {
+    sleep_until_ns(tick_ns(interrupts::ticks() + ticks))
+}
+
+/// Sleeps until the clock reads `until` nanoseconds (`now_ns`), as
+/// `sleep` does: cut short by a kill or a caught signal. Returns whether
+/// the time came (K24, journal entry NNN).
+pub fn sleep_until_ns(until: u64) -> bool {
     let were_enabled = arch::disable_interrupts();
-    let until = interrupts::ticks() + ticks;
     announce(State::Sleeping(until));
     if interrupted() {
         stay();
@@ -451,7 +490,7 @@ pub fn sleep(ticks: u64) -> bool {
         schedule();
     }
     arch::restore_interrupts(were_enabled);
-    interrupts::ticks() >= until
+    now_ns() >= until
 }
 
 /// Ends the current thread.
@@ -606,16 +645,17 @@ fn count_if_busy(t: &Threads) {
     }
 }
 
-/// Called by the timer interrupt of the CPU that keeps the time: `now`
-/// is the new tick count.
-pub fn on_tick(now: u64) {
+/// Called by the timer interrupt of the CPU that keeps the time, at each
+/// tick: sleepers due by now (`now_ns`) are woken, and the slice counted.
+pub fn on_tick() {
     if let Some(t) = THREADS.lock().as_mut() {
         count_if_busy(t);
         charge(t, arch::cpu(), crate::clock::monotonic());
-        t.policy.tick(now, arch::cpu());
+        t.policy.tick(now_ns(), arch::cpu());
         // Sleepers whose time came: this CPU keeps the time for all,
         // but need not run them all.
         tell_idle_cpus(t);
+        arm_for_sleepers(t);
     }
 }
 
@@ -624,7 +664,22 @@ pub fn on_tick_elsewhere() {
     if let Some(t) = THREADS.lock().as_mut() {
         count_if_busy(t);
         charge(t, arch::cpu(), crate::clock::monotonic());
+        // Any CPU's tick wakes whoever is due (K24): a sleeper's own CPU
+        // may be this one, and its timer set for it.
+        t.policy.wake_sleepers(now_ns(), arch::cpu());
         t.policy.tick_slice(arch::cpu());
+        tell_idle_cpus(t);
+        arm_for_sleepers(t);
+    }
+}
+
+/// An early timer interrupt, set for a sleeper due before this CPU's
+/// tick (K24): wakes whoever is due, and sets the timer for the next.
+pub fn on_timer_early() {
+    if let Some(t) = THREADS.lock().as_mut() {
+        t.policy.wake_sleepers(now_ns(), arch::cpu());
+        tell_idle_cpus(t);
+        arm_for_sleepers(t);
     }
 }
 
@@ -822,7 +877,7 @@ pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, mut conditio
             queue.add(me);
         }
         // "I am waiting" - so that a wake-up from now on has an effect:
-        announce(deadline.map_or(State::Blocked, State::Sleeping));
+        announce(deadline.map_or(State::Blocked, |tick| State::Sleeping(tick_ns(tick))));
         // And only now, look. Whatever happens after this look comes
         // with a wake-up that finds the two steps above already done.
         let ended = if !condition() {

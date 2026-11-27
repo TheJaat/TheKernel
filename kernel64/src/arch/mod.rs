@@ -11,7 +11,7 @@ mod x86_64;
 pub use self::x86_64::{
     breakpoint, clock, clock_hz, cmos, hardware_random, hardware_random_name, console_write, console_write_bytes, cpu, disable_interrupts, frame_pointer, enable_interrupts, halt_forever, init_cpu,
     init_early_console, mmu, pci, platform, context, syscall, rearm_interrupt, restore_interrupts, set_io_bitmap, smp, stop_other_cpus,
-    wait_for_interrupt,
+    timer_wake_by, wait_for_interrupt,
 };
 
 #[cfg(all(target_arch = "x86_64", feature = "fault-tests"))]
@@ -28,7 +28,7 @@ pub use self::aarch64::{
     breakpoint, clock, clock_hz, console_write, console_write_bytes, context, cpu, device_interrupt, hardware_random, hardware_random_name, device_interrupts, device_tree,
     disable_interrupts, rearm_interrupt,
     enable_interrupts, frame_pointer, halt_forever, init_cpu, init_early_console, init_interrupts, mmu, pl031_seconds, report, restore_interrupts,
-    selftest_interrupts, set_io_bitmap, smp, stop_other_cpus, syscall, wait_for_interrupt,
+    selftest_interrupts, set_io_bitmap, smp, stop_other_cpus, syscall, timer_wake_by, wait_for_interrupt,
 };
 
 #[cfg(all(target_arch = "aarch64", feature = "fault-tests"))]

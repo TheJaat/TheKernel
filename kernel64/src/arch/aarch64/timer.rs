@@ -16,7 +16,9 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use kernel64::gic::{milliseconds, next_deadline, tick_interval};
+use kernel64::gic::{after_interrupt, milliseconds, tick_interval};
+
+use kernel64::smp::MAX_CPUS;
 
 use super::gic;
 
@@ -28,6 +30,11 @@ use crate::interrupts::HZ;
 static TAKEN: AtomicU64 = AtomicU64::new(0);
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
+/// Per CPU: when its next tick is due, and what its compare value is
+/// now - that tick, or a sleeper's time before it (K24, journal entry
+/// NNN). Only that CPU writes them, with interrupts masked.
+static NEXT_TICK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static ARMED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// The timer's interrupt number; 0 until `init`.
 static INTERRUPT: AtomicU32 = AtomicU32::new(0);
 
@@ -89,6 +96,9 @@ pub unsafe fn init(interrupt: u32) -> u64 {
 /// after its part of the interrupt controller is set up.
 pub unsafe fn start_here() {
     let first = counter() + INTERVAL.load(Ordering::Relaxed);
+    let cpu = super::cpu();
+    NEXT_TICK[cpu].store(first, Ordering::Relaxed);
+    ARMED[cpu].store(first, Ordering::Relaxed);
     // SAFETY: the compare value, then control: bit 0 enables the
     // timer, bit 1 (left clear) would mask its interrupt.
     unsafe {
@@ -105,18 +115,39 @@ pub unsafe fn start_here() {
     gic::enable(INTERRUPT.load(Ordering::Relaxed));
 }
 
-/// The timer's interrupt arrived. The timer goes on asking for as long
-/// as the counter is past the compare value, so the first thing is to
-/// move the value on.
+/// Sets this CPU's compare value: the timer interrupts when the counter
+/// reaches `at`, and stops asking once it is in the future again.
+fn set_compare(at: u64) {
+    // SAFETY: writing this CPU's own compare value; nothing else uses it.
+    unsafe { asm!("msr cntv_cval_el0, {}", "isb", in(reg) at, options(nomem, nostack, preserves_flags)) };
+}
+
+/// The timer's interrupt arrived: a tick, or (before the tick) a
+/// sleeper's time (K24). The timer goes on asking for as long as the
+/// counter is past the compare value, so the first thing is to move the
+/// value on - to the next tick; waking sleepers then sets it sooner if
+/// one is due before (`wake_by`).
 pub fn on_interrupt() {
-    let deadline: u64;
-    // SAFETY: reading the compare value changes nothing.
-    unsafe { asm!("mrs {}, cntv_cval_el0", out(reg) deadline, options(nomem, nostack, preserves_flags)) };
-    let (next, passed) = next_deadline(deadline, counter(), INTERVAL.load(Ordering::Relaxed));
-    // SAFETY: a compare value in the future: the timer stops asking.
-    unsafe { asm!("msr cntv_cval_el0, {}", "isb", in(reg) next, options(nomem, nostack, preserves_flags)) };
+    let cpu = super::cpu();
+    let (passed, next) = after_interrupt(NEXT_TICK[cpu].load(Ordering::Relaxed), counter(), INTERVAL.load(Ordering::Relaxed));
+    NEXT_TICK[cpu].store(next, Ordering::Relaxed);
+    ARMED[cpu].store(next, Ordering::Relaxed);
+    set_compare(next);
     TAKEN.fetch_add(1, Ordering::Relaxed);
+    if passed == 0 {
+        crate::interrupts::timer_early();
+    }
     for _ in 0..passed {
         crate::interrupts::timer_tick();
+    }
+}
+
+/// Makes this CPU's timer interrupt by the time the counter reads `at`,
+/// if it is set for later. With interrupts masked.
+pub fn wake_by(at: u64) {
+    let cpu = super::cpu();
+    if at < ARMED[cpu].load(Ordering::Relaxed) {
+        ARMED[cpu].store(at, Ordering::Relaxed);
+        set_compare(at);
     }
 }

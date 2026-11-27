@@ -252,6 +252,20 @@ pub fn next_deadline(deadline: u64, now: u64, interval: u64) -> (u64, u64) {
     (deadline + (behind + 1) * interval, behind + 1)
 }
 
+/// A one-shot timer's interrupt, when the counter reads `now` and the
+/// next tick was due at `next_tick` (K24, journal entry NNN): how many
+/// ticks have come (0 if this is an early interrupt, for a sleeper),
+/// and when the next tick is due. The timer is set again each time, for
+/// the next tick or a sleeper before it, whichever is first.
+pub fn after_interrupt(next_tick: u64, now: u64, interval: u64) -> (u64, u64) {
+    if now < next_tick {
+        (0, next_tick)
+    } else {
+        let (next, passed) = next_deadline(next_tick, now, interval);
+        (passed, next)
+    }
+}
+
 /// Counter steps as milliseconds.
 pub fn milliseconds(steps: u64, frequency: u64) -> u64 {
     if frequency == 0 {
@@ -263,6 +277,15 @@ pub fn milliseconds(steps: u64, frequency: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_early_interrupt_is_no_tick_and_a_late_one_counts_every_tick_passed() {
+        // Ticks due every 100 steps, the next at 1000.
+        assert_eq!(after_interrupt(1000, 950, 100), (0, 1000), "early: a sleeper's");
+        assert_eq!(after_interrupt(1000, 1000, 100), (1, 1100), "on time");
+        assert_eq!(after_interrupt(1000, 1001, 100), (1, 1100));
+        assert_eq!(after_interrupt(1000, 1250, 100), (3, 1300), "late by two and a half");
+    }
 
     #[test]
     fn a_bit_per_interrupt() {

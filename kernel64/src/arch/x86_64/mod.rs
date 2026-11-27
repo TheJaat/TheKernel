@@ -124,6 +124,12 @@ pub fn clock_hz() -> u64 {
     platform::tsc_hz()
 }
 
+/// Makes this CPU's timer interrupt by the time `clock()` reads `at`, if
+/// it is set for later (K24). With interrupts off.
+pub fn timer_wake_by(at: u64) {
+    platform::timer_wake_by(at);
+}
+
 /// A random number from the CPU itself - RDSEED, else RDRAND - if it
 /// has either (CPUID says), and it gives one within a few tries; None
 /// otherwise. QEMU's default CPU has neither; `-cpu max` and most PCs

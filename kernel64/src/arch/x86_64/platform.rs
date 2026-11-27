@@ -15,6 +15,9 @@
 //! and keyboard are lowest, which is fine while they are the only ones.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use kernel64::smp::MAX_CPUS;
 
 use kernel64::acpi::Madt;
 
@@ -130,14 +133,76 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
     report.tsc_hz = tsc_hz;
     TSC_HZ.store(tsc_hz, core::sync::atomic::Ordering::Relaxed);
     BUS_HZ.store(bus_hz, core::sync::atomic::Ordering::Relaxed);
-    apic::start_timer(TIMER_VECTOR, bus_hz, hz);
+    TICK_TSC.store((tsc_hz / hz).max(1), Ordering::Relaxed);
+    start_timer_here();
     report
 }
 
-/// Starts the timer of the CPU this runs on, at the boot CPU's rate.
-/// For every CPU after the first, once it is ready to be interrupted.
+// ---- The timer, one-shot (K24, journal entry NNN) -----------------------
+//
+// Each CPU's local APIC timer interrupts once, and is set again at every
+// interrupt: for its next tick (every TICK_TSC of the time-stamp
+// counter, stepped from the last so that ticks do not drift), or sooner
+// if a thread that went to sleep on this CPU is due before that. All in
+// time-stamp counter steps, the clock's own (`arch::clock`).
+
+
+/// A tick, in time-stamp counter steps.
+static TICK_TSC: AtomicU64 = AtomicU64::new(0);
+/// Per CPU: when its next tick is due, and what its timer is set for
+/// now (that tick, or a sleeper's time before it). Only that CPU writes
+/// them, with interrupts off.
+static NEXT_TICK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static ARMED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Sets this CPU's timer to interrupt when the time-stamp counter reads
+/// `at` (at once if that is past).
+fn set_timer_at(at: u64) {
+    let steps = at.saturating_sub(super::tsc());
+    let tsc_hz = TSC_HZ.load(Ordering::Relaxed).max(1);
+    let count = u128::from(steps) * u128::from(BUS_HZ.load(Ordering::Relaxed)) / u128::from(tsc_hz);
+    apic::set_timer(u32::try_from(count).unwrap_or(u32::MAX));
+}
+
+/// Starts the timer of the CPU this runs on: its first tick a tick from
+/// now. On the boot CPU from `init`, on every other once it is ready to
+/// be interrupted.
 pub fn start_timer_here() {
-    apic::start_timer(TIMER_VECTOR, BUS_HZ.load(core::sync::atomic::Ordering::Relaxed), interrupts::HZ);
+    let cpu = super::cpu();
+    let first = super::tsc() + TICK_TSC.load(Ordering::Relaxed);
+    NEXT_TICK[cpu].store(first, Ordering::Relaxed);
+    ARMED[cpu].store(first, Ordering::Relaxed);
+    apic::start_timer(TIMER_VECTOR);
+    set_timer_at(first);
+}
+
+/// The timer interrupted: a tick, or (before the tick) a sleeper's time.
+/// The timer is set for the next tick first; waking sleepers then sets
+/// it sooner if one is due before (`timer_wake_by`).
+fn on_timer() {
+    let cpu = super::cpu();
+    let (ticks, next) = kernel64::gic::after_interrupt(NEXT_TICK[cpu].load(Ordering::Relaxed), super::tsc(), TICK_TSC.load(Ordering::Relaxed));
+    NEXT_TICK[cpu].store(next, Ordering::Relaxed);
+    ARMED[cpu].store(next, Ordering::Relaxed);
+    set_timer_at(next);
+    if ticks == 0 {
+        interrupts::timer_early();
+    } else {
+        // One call however late: the tick count follows the counter, and
+        // a late interrupt catches up (interrupts.rs).
+        interrupts::timer_tick();
+    }
+}
+
+/// Makes this CPU's timer interrupt by the time the clock reads `at`
+/// (counter steps, `clock::counter_at`), if it is set for later. With
+/// interrupts off.
+pub fn timer_wake_by(at: u64) {
+    let cpu = super::cpu();
+    if at < ARMED[cpu].load(Ordering::Relaxed) {
+        ARMED[cpu].store(at, Ordering::Relaxed);
+        set_timer_at(at);
+    }
 }
 
 /// Called by the IDT stub for every vector from 32 up, with interrupts
@@ -149,7 +214,7 @@ pub fn handle_interrupt(vector: u8) {
         // APIC must be ready for the next interrupt even if this thread
         // does not run again for a while.
         TIMER_VECTOR => {
-            interrupts::timer_tick();
+            on_timer();
             apic::end_of_interrupt();
             interrupts::interrupt_done();
         }

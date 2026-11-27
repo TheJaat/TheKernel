@@ -134,6 +134,12 @@ pub fn clock_hz() -> u64 {
     timer::frequency()
 }
 
+/// Makes this CPU's timer interrupt by the time `clock()` reads `at`, if
+/// it is set for later (K24). With interrupts masked.
+pub fn timer_wake_by(at: u64) {
+    timer::wake_by(at);
+}
+
 /// Whether the CPU has RNDR (FEAT_RNG): ID_AA64ISAR0_EL1's bits 63:60.
 fn has_rndr() -> bool {
     let features: u64;
@@ -361,22 +367,28 @@ pub fn selftest_interrupts() {
     assert!(changed == 0, "{changed} of 28 registers were changed by interrupts");
     kprintln!("[selftest] interrupts: 5 taken with a known value in each of 28 registers, none changed");
 
-    // 2. Masked for 35 ms: three ticks' worth. None may arrive; and
-    // once unmasked, all three must be counted - by the one interrupt
-    // that was waiting.
+    // 2. Masked for 35 ms: three ticks' worth. No interrupt may arrive;
+    // and once unmasked, the one that was waiting must come at once, and
+    // the tick count must have all three. (Since K24 the count is read
+    // from the counter - journal entry NNN - so it has them even before
+    // that interrupt; what the interrupt still does is wake sleepers.)
+    let taken = timer::interrupts_taken();
     disable_interrupts();
     let (before, start) = (ticks(), timer::counter());
+    let interrupts_before = taken.load(Ordering::Relaxed);
     while timer::milliseconds_since(start) < 35 {
         core::hint::spin_loop();
     }
-    let during = ticks() - before;
+    let during = taken.load(Ordering::Relaxed) - interrupts_before;
     enable_interrupts();
     let start = timer::counter();
-    while ticks() < before + 3 && timer::milliseconds_since(start) < 5 {
+    while taken.load(Ordering::Relaxed) == interrupts_before + during && timer::milliseconds_since(start) < 5 {
         core::hint::spin_loop();
     }
+    let came = taken.load(Ordering::Relaxed) - interrupts_before;
     let after = ticks() - before;
-    assert!(during == 0, "{during} ticks arrived while interrupts were masked");
+    assert!(during == 0, "{during} timer interrupts arrived while interrupts were masked");
+    assert!(came >= 1, "no timer interrupt came within 5 ms of unmasking");
     assert!(after >= 3, "after 35 ms masked only {after} ticks were counted, not the 3 that passed");
     kprintln!("[selftest] interrupts masked for 35 ms: no tick arrived; unmasked: {after} counted at once");
 

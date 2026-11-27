@@ -32,13 +32,12 @@ pub fn timer_tick() {
     if crate::arch::cpu() == 0 {
         let interrupts = INTERRUPTS.fetch_add(1, Ordering::Relaxed) + 1;
         let counted = if crate::clock::started() { crate::clock::ticks() } else { interrupts };
-        // Only this CPU writes it, with interrupts off.
-        let now = counted.max(TICKS.load(Ordering::Relaxed));
-        TICKS.store(now, Ordering::Relaxed);
+        // Raised only: `ticks()` on any CPU raises it too.
+        TICKS.fetch_max(counted, Ordering::Relaxed);
         // When exactly the tick came, to the counter's step: a little
         // of the unpredictable, for the random numbers.
         crate::random::add(crate::arch::clock());
-        crate::threads::on_tick(now);
+        crate::threads::on_tick();
         // Programs' output waits in a queue for an idle moment; on a
         // busy machine this is the only moment there is.
         crate::console::write_on_tick();
@@ -67,8 +66,23 @@ pub fn interrupt_done() {
     crate::threads::preempt_if_needed();
 }
 
+/// The tick count, now. Read from the counter, not left at what the boot
+/// CPU's last interrupt wrote: a sleeper woken by its own CPU's timer, a
+/// hair before the boot CPU's tick, must not find the count a tick short
+/// (K24, journal entry NNN). It never goes back, whichever CPU reads it.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    if crate::clock::started() {
+        let counted = crate::clock::ticks();
+        TICKS.fetch_max(counted, Ordering::Relaxed).max(counted)
+    } else {
+        TICKS.load(Ordering::Relaxed)
+    }
+}
+
+/// A timer interrupt that is no tick: this CPU's timer was set for a
+/// sleeper due before its next tick (K24).
+pub fn timer_early() {
+    crate::threads::on_timer_early();
 }
 
 /// The boot CPU's timer interrupts so far.

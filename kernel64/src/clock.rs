@@ -58,6 +58,18 @@ pub fn monotonic() -> u64 {
     (u128::from(counted) * u128::from(NANOS) / u128::from(hz)) as u64
 }
 
+/// The counter's value at `ns` nanoseconds since `start`: what a timer is
+/// set to, to interrupt then. u64::MAX before the clock starts - no time
+/// can be reached yet.
+pub fn counter_at(ns: u64) -> u64 {
+    let hz = HZ.load(Ordering::Acquire);
+    if hz == 0 {
+        return u64::MAX;
+    }
+    let steps = u128::from(ns) * u128::from(hz) / u128::from(NANOS);
+    START.load(Ordering::Relaxed).saturating_add(u64::try_from(steps).unwrap_or(u64::MAX))
+}
+
 /// The time of day, in nanoseconds since 1 January 1970 UTC.
 pub fn realtime() -> u64 {
     EPOCH.load(Ordering::Relaxed) + monotonic()

@@ -33,7 +33,6 @@ const TIMER_DIVIDE: u64 = 0x3E0;
 
 const SOFTWARE_ENABLE: u32 = 1 << 8;
 const MASKED: u32 = 1 << 16;
-const TIMER_PERIODIC: u32 = 1 << 17;
 const DIVIDE_BY_16: u32 = 0b0011;
 /// In the command register: the last message has not left yet.
 const SENDING: u32 = 1 << 12;
@@ -161,11 +160,19 @@ pub fn stated_frequencies() -> Option<(u64, u64)> {
     Some((bus_hz / 16, tsc_hz))
 }
 
-/// Starts the timer raising `vector` `hz` times a second.
-pub fn start_timer(vector: u8, ticks_per_second: u64, hz: u64) {
+/// Makes the timer one-shot, raising `vector` when a count set by
+/// `set_timer` runs out. It was periodic until K24 (journal entry NNN):
+/// one-shot, it is set each time for the next tick or for a sleeper due
+/// before it, whichever is first (platform.rs).
+pub fn start_timer(vector: u8) {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
-    write(LVT_TIMER, TIMER_PERIODIC | u32::from(vector));
-    write(TIMER_INITIAL, (ticks_per_second / hz).max(1) as u32);
+    write(LVT_TIMER, u32::from(vector)); // mode bits 0: one-shot
+}
+
+/// Interrupts once, after `count` of the timer's steps (bus clock / 16),
+/// instead of whenever the count set before would have run out.
+pub fn set_timer(count: u32) {
+    write(TIMER_INITIAL, count.max(1));
 }
 
 /// One I/O APIC. Its registers sit behind a two-register window: write
