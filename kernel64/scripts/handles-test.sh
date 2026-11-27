@@ -8,18 +8,23 @@
 #   - names from a directory descriptor (journal entry 120, J63): the
 #     *at calls, and a child given one directory as its whole tree;
 #   - /tmp in memory (journal entry 126, J64): a second file service,
-#     mounted at /tmp everywhere, and nothing of it on the disk.
+#     mounted at /tmp everywhere, and nothing of it on the disk;
+#   - /dev (journal entry 127, J65): the devices' service, mounted at
+#     /dev, and libc's /dev/stdin, /dev/stdout, /dev/stderr, /dev/tty.
 #
-#   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP
+#   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP DEV
 #
-# HANDLES, NAMESPACE, AT and TMP are handles.c, namespace.c, at.c and
-# tmp.c (next to this script) built for ARCH. One boot; TheTaaJ runs
+# HANDLES, NAMESPACE, AT, TMP and DEV are handles.c, namespace.c, at.c,
+# tmp.c and dev.c (next to this script) built for ARCH. One boot;
+# TheTaaJ runs
 #   with programs handles     "handles: N checks, all passed"
 #   with programs namespace   "namespace: N checks, all passed"
 #   with programs at          "at: N checks, all passed"
 #   with programs tmptest     "tmp: N checks, all passed"
 #   echo tmp-says-hello > /tmp/s, then with programs tmptest show
 #   /tmp/s: the shell's /tmp is the programs'
+#   with programs devtest     "dev: N checks, all passed"
+#   echo dev-hidden > /dev/null: the shell's /dev, and nothing printed
 
 set -u
 ARCH=$1
@@ -30,6 +35,7 @@ HANDLES=$5
 NAMESPACE=$6
 AT=$7
 TMP=$8
+DEV=$9
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 TFSTOOL=${TFSTOOL:-$ROOT/tools/tfstool-rs/target/release/tfstool}
@@ -49,12 +55,15 @@ rm -f "$DISK"
 "$TFSTOOL" put "$DISK" namespace "$NAMESPACE" > /dev/null || fail "cannot put namespace on the disk"
 "$TFSTOOL" put "$DISK" at "$AT" > /dev/null || fail "cannot put at on the disk"
 "$TFSTOOL" put "$DISK" tmptest "$TMP" > /dev/null || fail "cannot put tmptest on the disk"
+"$TFSTOOL" put "$DISK" devtest "$DEV" > /dev/null || fail "cannot put devtest on the disk"
 
 steps="$(keys 'echo == checks ==') ret ~ $(keys 'with programs handles') ret ~~"
 steps="$steps $(keys 'with programs namespace') ret ~~"
 steps="$steps $(keys 'with programs at') ret ~~"
 steps="$steps $(keys 'with programs tmptest') ret ~~"
 steps="$steps $(keys 'echo tmp-says-hello > /tmp/s') ret ~ $(keys 'with programs tmptest show /tmp/s') ret ~~"
+steps="$steps $(keys 'with programs devtest') ret ~~"
+steps="$steps $(keys 'echo dev-hidden > /dev/null') ret ~ $(keys 'echo dev-after') ret ~"
 steps="$steps $(keys 'echo == end ==') ret ~ $(keys 'echo done') ret ~"
 echo "Booting $ARCH to check open files as handles (log: $LOG)..."
 if [ "$ARCH" = aarch64 ]; then
@@ -67,7 +76,7 @@ WORK=$LOG.clean
 tr -d '\r' < "$LOG" > "$WORK"
 
 grep -aq '^== end ==$' "$WORK" || fail "the steps did not all run"
-grep -aE '^(handles|namespace|at|tmp): (failed|the sandboxed)' "$WORK" | head -20
+grep -aE '^(handles|namespace|at|tmp|dev): (failed|the sandboxed)' "$WORK" | head -20
 # Every check(...) in each program but the function itself.
 CHECKS=$(($(grep -c 'check(' "$HERE/handles.c") - 1))
 grep -aq "^handles: $CHECKS checks, all passed$" "$WORK" || fail "the $CHECKS checks in handles.c did not all pass"
@@ -81,6 +90,13 @@ grep -aq '^\[init\] started: .* fs tmp ' "$WORK" || fail "init did not start /tm
 grep -aq '^tmp-says-hello$' "$WORK" || fail "the shell's /tmp: tmptest show /tmp/s did not print what echo put there"
 # /tmp is in memory: the disk has none of it, not even the directory.
 "$TFSTOOL" ls "$DISK" tmp > /dev/null 2>&1 && fail "/tmp's files went to the disk"
+DEVS=$(($(grep -c 'check(' "$HERE/dev.c") - 1))
+grep -aq "^dev: $DEVS checks, all passed$" "$WORK" || fail "the $DEVS checks in dev.c did not all pass"
+grep -aq '\[dev\] ready: full null random urandom zero$' "$WORK" || fail "init did not start /dev's service"
+grep -aq '^dev: written to /dev/stdout$' "$WORK" || fail "what devtest wrote to /dev/stdout did not appear"
+# The shell's > /dev/null: the line went nowhere, and the shell went on.
+grep -aq '^dev-hidden$' "$WORK" && fail "echo dev-hidden > /dev/null printed it"
+grep -aq '^dev-after$' "$WORK" || fail "the shell did not go on after > /dev/null"
 grep -aq 'not reached' "$WORK" && fail "$(grep -a 'not reached' "$WORK" | head -1)"
 grep -a 'has not answered for' "$WORK" && fail "a service stopped answering during the test"
 grep -aiE 'panic|page fault in kernel|CPU EXCEPTION' "$WORK" && fail "the kernel failed"
@@ -90,3 +106,4 @@ echo "open files as handles ($ARCH): $CHECKS checks of descriptors through renam
 echo "a namespace per process ($ARCH): $MOUNTS checks of mounts, .., EXDEV, a read-only mount and a child passed"
 echo "names from a directory ($ARCH): $ATS checks of the *at calls, a directory moved while open, and a child in a tree of its own passed"
 echo "/tmp in memory ($ARCH): $TMPS checks, the shell's /tmp, and nothing of it on the disk"
+echo "/dev ($ARCH): $DEVS checks of null, zero, full, random, urandom and the program's own, and the shell's > /dev/null"
