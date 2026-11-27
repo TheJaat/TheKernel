@@ -18,7 +18,9 @@ fn main() {
     // is repeated in main.rs.
     if std::env::var_os("CARGO_FEATURE_BIG_IMAGE").is_some() {
         let out = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
-        let ballast: Vec<u8> = (0..256 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        // 4 MiB (K130): the kernel ends near 7 MiB, past the 3 MiB the
+        // BIOS loader used to stage the whole file at.
+        let ballast: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
         std::fs::write(format!("{out}/ballast.bin"), ballast).expect("writing the ballast");
     }
 }
