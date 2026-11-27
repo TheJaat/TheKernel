@@ -60,6 +60,7 @@ grep -q "Hello from TheTaaJ" "$LOG"                || fail "no greeting"
 grep -q "resumed after the breakpoint" "$LOG"      || fail "exception path broken"
 grep -q "\[selftest\] memory: all passed" "$LOG"   || fail "memory self-test"
 grep -q "\[selftest\] timer" "$LOG"               || fail "timer self-test"
+grep -q "\[selftest\] late interrupts: 35 ms without any" "$LOG" || fail "late-interrupts self-test (J53): the tick count did not keep the time"
 CPUS=${SMP:-4}
 if [ "$CPUS" -eq 1 ]; then
     grep -q "\[smp\] 1 CPU: no others to start" "$LOG" || fail "one CPU: the kernel did not say there were no others"

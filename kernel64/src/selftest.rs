@@ -204,6 +204,34 @@ pub fn timer() {
         "[selftest] timer: 10 interrupts in {ms} ms (expected {expected}); the clock says {} ms since it started, {ticks} ticks",
         monotonic / 1_000_000
     );
+
+    // Late interrupts (J53, journal entry NNN). A virtual machine whose
+    // host is busy delivers timer interrupts late, two or three at once
+    // as one; the tick count must keep the time all the same - it is
+    // read from the counter (clock.rs), not counted from interrupts. Here
+    // the lateness is made on purpose: this CPU ignores interrupts for
+    // 35 ms, three ticks and a half, and then the tick count must have
+    // moved on by at least three, at once - one interrupt, waiting, comes
+    // then. Counting interrupts again (the mutation of entry 097, which
+    // no test caught) makes it one, on x86, where a late interrupt is one
+    // call of timer_tick.
+    let hz = arch::clock_hz().max(1);
+    let were_enabled = arch::disable_interrupts();
+    let (before, start) = (interrupts::ticks(), arch::clock());
+    while (arch::clock() - start) * 1000 / hz < 35 {
+        core::hint::spin_loop();
+    }
+    let interrupts_before = interrupts::timer_interrupts();
+    arch::restore_interrupts(were_enabled);
+    // The interrupt that waited, then the count.
+    let waited = arch::clock();
+    while interrupts::timer_interrupts() == interrupts_before && (arch::clock() - waited) * 1000 / hz < 20 {
+        core::hint::spin_loop();
+    }
+    let came = interrupts::timer_interrupts() - interrupts_before;
+    let moved = interrupts::ticks() - before;
+    assert!(moved >= 3, "after 35 ms without interrupts the tick count moved on by {moved}, not the 3 ticks that passed");
+    kprintln!("[selftest] late interrupts: 35 ms without any, then {came} came; the tick count moved on by {moved} (at least 3)");
 }
 
 /// Threads: they take turns, a thread that never yields is still

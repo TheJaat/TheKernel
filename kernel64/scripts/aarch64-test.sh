@@ -173,6 +173,7 @@ boot() {
         need "$log" "\[irq\] GIC version $gic: 288 interrupt lines, all off but the timer's"
         need "$log" "\[timer\] the CPU's own: counts at [0-9]+ Hz, interrupt 27, 100 ticks a second"
         need "$log" "\[selftest\] timer: 10 interrupts in (9[0-9]|[12][0-9][0-9]) ms \(expected 100\)"
+        need "$log" "\[selftest\] late interrupts: 35 ms without any, then [0-9]+ came; the tick count moved on by [3-9]"
         need "$log" "\[selftest\] context switch: there and back with a known value in each of 11 registers, none changed"
         need "$log" "\[selftest\] interrupts: 5 taken with a known value in each of 28 registers, none changed"
         need "$log" "\[selftest\] interrupts masked for 35 ms: no tick arrived; unmasked: [3-9] counted at once"
