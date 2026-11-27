@@ -52,6 +52,11 @@ steps="$steps $(keys 'echo == catch ==') ret ~ $(keys 'basics catch') ret see:in
 steps="$steps $(keys 'echo == speed ==') ret ~ $(keys 'with files basics speed') ret ~~"
 steps="$steps $(keys 'echo == end ==') ret ~ $(keys 'echo done') ret ~"
 
+# The host's time before the boot and after it: TheTaaJ's date, read
+# during the boot, must lie between them. Not "within 300 s of the
+# start": boot-slots.sh can make a boot wait minutes for a CPU before
+# QEMU starts (6.7 min on 2026-11-27, two boots run beside a race hunt),
+# and that wait is not a wrong clock (K193's entry, bug 11).
 HOST_DATE=$(date -u +%s)
 echo "Booting $ARCH to check the date, the clock, signals and flushes (log: $LOG)..."
 if [ "$ARCH" = aarch64 ]; then
@@ -60,6 +65,7 @@ if [ "$ARCH" = aarch64 ]; then
 else
     DISK="$DISK" KEYS="$steps" "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
 fi
+HOST_END=$(date -u +%s)
 
 tr -d '\r' < "$LOG" > "$WORK/log"
 part() { # part NAME: the lines after "== NAME ==", up to the next mark
@@ -72,13 +78,15 @@ has() { # has NAME PATTERN WHY
 grep -aq '^== end ==$' "$WORK/log" || fail "the steps did not all run"
 grep -aEq '^\[clock\] .* says [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} UTC; time is counted from here at [0-9]+ Hz' "$WORK/log" \
     || fail "the kernel did not read the real-time clock"
-# The date TheTaaJ says against the host's when the boot began: QEMU's
-# clock is the host's, so they are minutes apart at most.
+# The date TheTaaJ says against the host's: QEMU's clock is the host's,
+# so it lies between the host's time before the boot and after it, give
+# or take the RTC's whole seconds (5 s either side).
 SAID=$(part date | grep -aEo '[0-9]{2} [A-Z][a-z]+ [0-9]{4}, [0-9:]{8} UTC' | head -1)
 [ -n "$SAID" ] || fail "basics date said no date"
 SAID_SECONDS=$(date -u -d "$(echo "$SAID" | sed 's/,//; s/ UTC//')" +%s) || fail "cannot read the date: $SAID"
 APART=$((SAID_SECONDS - HOST_DATE))
-[ "$APART" -ge -5 ] && [ "$APART" -le 300 ] || fail "TheTaaJ's date ($SAID) is $APART s from the host's"
+[ "$SAID_SECONDS" -ge $((HOST_DATE - 5)) ] && [ "$SAID_SECONDS" -le $((HOST_END + 5)) ] \
+    || fail "TheTaaJ's date ($SAID) is not within the test's time: $APART s after its start, which was $((HOST_END - HOST_DATE)) s before its end"
 
 part checks | grep -a '^basics: failed' | head -20
 # Every check(...) in basics.c but the function itself.
