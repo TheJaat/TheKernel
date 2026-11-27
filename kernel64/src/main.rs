@@ -714,13 +714,12 @@ fn report_machine(address: u64, tree: &kernel64::devicetree::Tree, machine: &ker
     }
 }
 
-/// Only in a `big-image` build: the kernel carries 256 KiB it does not
-/// need, which keeps its end above 2 MiB - where the BIOS loader used to
-/// refuse it. If the loader copied all of it to the right place, every
-/// byte is what the build script wrote. (512 KiB until the kernel itself
-/// passed 2.5 MiB, with its symbol table: then the big image crossed the
-/// 3 MiB wall - journal entry 122. So this fails first, while the kernel
-/// still has 256 KiB left under it: time for J51 or K130.)
+/// Only in a `big-image` build: the kernel carries 4 MiB it does not
+/// need, which puts its end near 7 MiB - far past the 3 MiB wall the BIOS
+/// loader had until K130 (it staged the whole file at 3 MiB, and the
+/// segments had to fit below). If the loader read all of it to the right
+/// place, every byte is what the build script wrote. (256 KiB from entry
+/// 122 until K130, to stay under that wall.)
 #[cfg(all(target_arch = "x86_64", feature = "big-image"))]
 fn check_big_image() {
     static BALLAST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ballast.bin"));
@@ -736,9 +735,9 @@ fn check_big_image() {
     let end = start + ballast.len() as u64;
     let image_end = mm::kernel_layout().data.end - mm::KERNEL_WINDOW;
     kprintln!();
-    if wrong == 0 && image_end > 0x20_0000 {
+    if wrong == 0 && image_end > 0x30_0000 {
         kprintln!(
-            "[test] big image: the kernel ends at {image_end:#x}, above 2 MiB; {} KiB of it at {start:#x}-{end:#x} is byte for byte what was built",
+            "[test] big image: the kernel ends at {image_end:#x}, above 3 MiB; {} KiB of it at {start:#x}-{end:#x} is byte for byte what was built",
             ballast.len() / 1024
         );
     } else {
