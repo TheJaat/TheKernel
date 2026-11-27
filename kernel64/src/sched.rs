@@ -215,11 +215,16 @@ pub struct Scheduler {
     /// Each thread's priority and affinity; an idle thread has none.
     attributes: BTreeMap<ThreadId, Attributes>,
     ready: Ready,
-    /// The sleepers, sorted by when they wake (then by number): a tick
-    /// looks at the first, not at every thread (K96, journal entry NNN).
-    /// Kept by `set_state`, the only way a state changes once a thread
-    /// is added, so it always holds exactly the Sleeping threads.
-    sleepers: BTreeSet<(u64, ThreadId)>,
+    /// The sleepers, one set per CPU - the CPU each went to sleep on -
+    /// sorted by when they wake (then by number): a tick looks at the
+    /// first, not at every thread (K96, journal entry NNN), and each CPU
+    /// can set its timer for its own first sleeper, so that a sleep costs
+    /// one interrupt, not one on every CPU (K24). Kept by `set_state`,
+    /// the only way a state changes once a thread is added, so together
+    /// they hold exactly the Sleeping threads; `asleep_on` says which
+    /// set each is in.
+    sleepers: Vec<BTreeSet<(u64, ThreadId)>>,
+    asleep_on: BTreeMap<ThreadId, usize>,
     cpus: Vec<Cpu>,
     /// The CPUs that must be interrupted, one bit each: idling CPUs
     /// that were offered a thread by another CPU and cannot know it.
@@ -255,7 +260,7 @@ impl Scheduler {
         if running != idle {
             attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU });
         }
-        Scheduler { states, attributes, ready: Ready::new(), sleepers: BTreeSet::new(), cpus: alloc::vec![cpu], pokes: 0 }
+        Scheduler { states, attributes, ready: Ready::new(), sleepers: alloc::vec![BTreeSet::new()], asleep_on: BTreeMap::new(), cpus: alloc::vec![cpu], pokes: 0 }
     }
 
     /// One more CPU, running its idle thread `idle`. Returns its number:
@@ -266,6 +271,7 @@ impl Scheduler {
         // its first chance.
         let reschedule = !self.ready.is_empty();
         self.cpus.push(Cpu { current: idle, idle, slice_left: SLICE, reschedule, priority: IDLE_PRIORITY, affinity: ANY_CPU });
+        self.sleepers.push(BTreeSet::new());
         self.cpus.len() - 1
     }
 
@@ -404,32 +410,44 @@ impl Scheduler {
         self.tick_slice(cpu);
     }
 
-    /// Wakes every sleeper whose time is `now` or before: the first ones
-    /// of the sorted set, so this looks at no thread that is not due and
-    /// allocates nothing.
+    /// Wakes every sleeper whose time is `now` or before, whichever CPU
+    /// it slept on: the first ones of each sorted set, so this looks at
+    /// no thread that is not due and allocates nothing. Any CPU's timer
+    /// interrupt may do it; `cpu` is the one deciding.
     pub fn wake_sleepers(&mut self, now: u64, cpu: usize) {
-        while let Some(&(until, id)) = self.sleepers.first() {
-            if until > now {
-                break;
+        for on in 0..self.sleepers.len() {
+            while let Some(&(until, id)) = self.sleepers[on].first() {
+                if until > now {
+                    break;
+                }
+                self.make_runnable(id, cpu); // takes it out of the set
             }
-            self.make_runnable(id, cpu); // takes it out of the set
         }
     }
 
-    /// When the first sleeper wakes, if anyone sleeps: what a one-shot
-    /// timer is set for.
+    /// When the first sleeper that went to sleep on `cpu` wakes: what
+    /// that CPU's one-shot timer is set for, if it is before its tick.
+    pub fn first_wake_on(&self, cpu: usize) -> Option<u64> {
+        self.sleepers[cpu].first().map(|&(until, _)| until)
+    }
+
+    /// When the first sleeper of all wakes.
     pub fn first_wake(&self) -> Option<u64> {
-        self.sleepers.first().map(|&(until, _)| until)
+        self.sleepers.iter().filter_map(|set| set.first().map(|&(until, _)| until)).min()
     }
 
     /// Changes `id`'s state, keeping `sleepers` right. Every change of an
-    /// added thread's state goes through here.
+    /// added thread's state goes through here. A thread goes to sleep
+    /// only from a CPU (suspend_current), which is the set it joins.
     fn set_state(&mut self, id: ThreadId, state: State) {
         if let Some(State::Sleeping(until)) = self.states.insert(id, state) {
-            self.sleepers.remove(&(until, id));
+            let on = self.asleep_on.remove(&id).expect("a sleeper's CPU");
+            self.sleepers[on].remove(&(until, id));
         }
         if let State::Sleeping(until) = state {
-            self.sleepers.insert((until, id));
+            let on = self.cpu_of(id).expect("a thread goes to sleep from its CPU");
+            self.sleepers[on].insert((until, id));
+            self.asleep_on.insert(id, on);
         }
     }
 
@@ -797,7 +815,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(s.sleepers, sleeping, "the sleeper set and the states disagree");
+        let sets: BTreeSet<(u64, ThreadId)> = s.sleepers.iter().flatten().copied().collect();
+        assert_eq!(sets, sleeping, "the sleeper sets and the states disagree");
+        assert_eq!(s.sleepers.iter().map(BTreeSet::len).sum::<usize>(), sleeping.len(), "a sleeper in two sets");
+        for (on, set) in s.sleepers.iter().enumerate() {
+            for (_, id) in set {
+                assert_eq!(s.asleep_on.get(id), Some(&on));
+            }
+        }
     }
 
     #[test]
@@ -816,11 +841,11 @@ mod tests {
         sleepers_match(&s);
         // Thread 4 is woken early, as a futex or a message would.
         assert!(s.wake(4, 0));
-        assert_eq!(s.sleepers.len(), 3);
+        assert_eq!(s.sleepers[0].len(), 3);
         sleepers_match(&s);
         // At 9 nobody is due; at 10 both of that time are, not thread 1.
         s.tick(9, 0);
-        assert_eq!(s.sleepers.len(), 3);
+        assert_eq!(s.sleepers[0].len(), 3);
         s.tick(10, 0);
         assert_eq!(s.state(2), Some(State::Ready));
         assert_eq!(s.state(3), Some(State::Ready));
@@ -1307,6 +1332,29 @@ mod tests {
         assert_eq!(s.take_pokes(), 0, "nobody else needs telling");
         assert_eq!(next(&mut s), 2);
         assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn a_sleeper_joins_the_set_of_its_cpu_and_any_cpu_may_wake_it() {
+        let mut s = two_cpus();
+        s.add_with(1, 0, DEFAULT, ANY_CPU);
+        s.add_with(2, 0, DEFAULT, ANY_CPU);
+        s.pick_next(0);
+        s.pick_next(1);
+        let (on0, on1) = (s.current(0), s.current(1));
+        assert!(on0 != IDLE && on1 != IDLE);
+        s.suspend_current(0, State::Sleeping(50));
+        s.suspend_current(1, State::Sleeping(20));
+        assert_eq!(s.first_wake_on(0), Some(50));
+        assert_eq!(s.first_wake_on(1), Some(20));
+        assert_eq!(s.first_wake(), Some(20));
+        sleepers_match(&s);
+        // CPU 0's interrupt at 20 wakes the sleeper of CPU 1, not its own.
+        s.wake_sleepers(20, 0);
+        assert_eq!(s.state(on1), Some(State::Running), "still on CPU 1 until it switches");
+        assert_eq!(s.state(on0), Some(State::Sleeping(50)));
+        assert_eq!(s.first_wake_on(1), None);
+        sleepers_match(&s);
     }
 
     #[test]
