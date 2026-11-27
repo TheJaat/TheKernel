@@ -34,12 +34,15 @@ pub struct MemoryObject {
     /// The account its pages are counted against, if any: its maker's
     /// (MEMORY_CREATE). They are given back when it goes.
     account: Option<Arc<Account>>,
+    /// Its maker's priority (MEMORY_CREATE), for a program started from
+    /// it: a child takes its parent's `nice` (K190, journal entry NNN).
+    maker_priority: Option<i64>,
 }
 
 impl MemoryObject {
     /// `pages` fresh, zeroed frames. None if memory runs out.
     pub fn new(pages: u64) -> Option<MemoryObject> {
-        let mut object = MemoryObject { frames: Vec::new(), owned: true, cache: Flags::NONE, account: None };
+        let mut object = MemoryObject { frames: Vec::new(), owned: true, cache: Flags::NONE, account: None, maker_priority: None };
         mm::with_frames(|frames| {
             for _ in 0..pages {
                 let frame = frames.allocate()?;
@@ -62,7 +65,7 @@ impl MemoryObject {
         let frames: Vec<PhysAddr> = (0..pages).map(|n| PhysAddr::new(start.as_u64() + n * PAGE_SIZE)).collect();
         // SAFETY: fresh frames, through the direct map.
         unsafe { phys_to_virt(start).as_mut_ptr::<u8>().write_bytes(0, (pages * PAGE_SIZE) as usize) };
-        Some((MemoryObject { frames, owned: true, cache: Flags::NONE, account: None }, start.as_u64()))
+        Some((MemoryObject { frames, owned: true, cache: Flags::NONE, account: None, maker_priority: None }, start.as_u64()))
     }
 
     /// Fixed physical memory - a device's - starting at `physical`.
@@ -70,13 +73,23 @@ impl MemoryObject {
         let first = physical & !(PAGE_SIZE - 1);
         let end = (physical + bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let frames = (first..end).step_by(PAGE_SIZE as usize).map(PhysAddr::new).collect();
-        MemoryObject { frames, owned: false, cache, account: None }
+        MemoryObject { frames, owned: false, cache, account: None, maker_priority: None }
     }
 
     /// Counts its pages against `account` from now on - they were
     /// charged to it already - until it is dropped.
     pub fn charged_to(&mut self, account: Arc<Account>) {
         self.account = Some(account);
+    }
+
+    /// Records its maker's priority, for a program started from it.
+    pub fn made_at(&mut self, priority: i64) {
+        self.maker_priority = Some(priority);
+    }
+
+    /// Its maker's priority, if a program made it.
+    pub fn maker_priority(&self) -> Option<i64> {
+        self.maker_priority
     }
 
     /// The account its pages are counted against: its maker's.

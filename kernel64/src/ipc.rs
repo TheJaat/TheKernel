@@ -346,6 +346,9 @@ fn spawn_from(
     // first, into fresh frames, so that what is checked is what runs.
     // Either way nothing goes through the kernel's heap, which never
     // gives memory back: a 40 MB program would leave it 40 MB bigger.
+    // The priority of whoever made the program file's object, if a
+    // program did (below).
+    let mut inherited = None;
     let loaded = match image {
         None => {
             let (program, file) = name.and_then(crate::programs::find).ok_or(Error::NotFound)?;
@@ -363,6 +366,7 @@ fn spawn_from(
             // The limit of whoever made the file's object: the program
             // that asked for this one (process::load_limited says why).
             let limit = object.account().map(|account| account.limit());
+            inherited = object.maker_priority();
             if Arc::strong_count(&object) == 2 {
                 process::load_limited(program, &*object, limit)
             } else {
@@ -388,6 +392,16 @@ fn spawn_from(
             Error::OutOfMemory
         }
     })?;
+
+    // A child takes the priority of the one who asked for it - its
+    // `nice` (K190, journal entry NNN) - the way it takes its memory
+    // limit: from whoever made the program file's object, not from init,
+    // which loads every program. Never above the child's own ceiling (0):
+    // a program at nice 10 starts its children at 10, but the shell, whom
+    // init puts at -5, does not start everything at -5.
+    if let Some(priority) = inherited {
+        loaded.set_sched_priority(priority.clamp(loaded.sched_ceiling(), abi::sched::LOWEST));
+    }
 
     // 3. Nothing fails from here on.
     let mut table = process.handles.lock();
@@ -602,6 +616,7 @@ pub fn memory_create(size: u64) -> Result<u64, Error> {
         return Err(Error::OutOfMemory);
     };
     object.charged_to(Arc::clone(&process.account));
+    object.made_at(process.sched_priority());
     let handle = process.handles.lock().insert(Object::Memory(Arc::new(object)), Rights::ALL);
     handle
 }

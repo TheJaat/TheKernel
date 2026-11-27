@@ -49,7 +49,7 @@ for cpus in 1 2 4; do
     grep -aq '^== end ==$' "$T" || fail "the steps did not all run"
     for what in "on $cpus CPUs" "yield [0-9]+ ns each" "handoff [0-9]+ ns one way" "create [0-9]+ us each" \
         "spawn [0-9]+ us each" "wake median [0-9]+ us, 99% [0-9]+ us, worst [0-9]+ us" "scale 1 thread [0-9]+ ms" \
-        "scale 8 threads [0-9]+ ms" "fair done" "nice done" "pinned (skipped|2 threads)" \
+        "scale 8 threads [0-9]+ ms" "fair done" "nice done" "inherit: a child of a program at nice 7 runs at nice 7" "pinned (skipped|2 threads)" \
         "loaded wake, [0-9]+ busy at nice 0: median" "loaded wake, [0-9]+ busy at nice 10: median" "done in [0-9]+ ms"; do
         grep -aEq "schedbench: $what" "$T" || fail "no \"schedbench: $what\""
     done

@@ -386,6 +386,22 @@ static long long spin_pair(int pinned)
     return (cpu_ns() - cpu0) / 1000000;
 }
 
+/* A child takes its parent's nice (K190, journal entry NNN): at nice 7,
+ * this program starts one that says its priority in its exit code. */
+static void bench_inherit(void)
+{
+    char *argv[] = {"schedbench", "priority", NULL};
+    setpriority(PRIO_PROCESS, 0, 7);
+    int status = 0;
+    pid_t pid = start(argv);
+    int ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+    setpriority(PRIO_PROCESS, 0, 0);
+    if (ok)
+        printf("schedbench: inherit: a child of a program at nice 7 runs at nice %d\n", WEXITSTATUS(status));
+    else
+        printf("schedbench: inherit failed\n");
+}
+
 static void bench_pinned(int cpus)
 {
     if (cpus < 2) {
@@ -451,6 +467,8 @@ int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "exit") == 0)
         return 0;
+    if (argc >= 2 && strcmp(argv[1], "priority") == 0)
+        return getpriority(PRIO_PROCESS, 0);
     if (argc >= 4 && strcmp(argv[1], "busy") == 0) {
         if (argc >= 5)
             setpriority(PRIO_PROCESS, 0, atoi(argv[4]));
@@ -468,6 +486,7 @@ int main(int argc, char **argv)
         bench_fair();
         int cpus = atoi(argv[2]);
         bench_nice();
+        bench_inherit();
         bench_pinned(cpus);
         int count = cpus < 1 ? 1 : cpus > 16 ? 16 : cpus;
         loaded_wake(count, 0);
