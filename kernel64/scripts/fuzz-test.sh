@@ -1,5 +1,5 @@
 #!/bin/sh
-# fuzz-test.sh - the system-call fuzzer (K104, journal entry NNN): the
+# fuzz-test.sh - the system-call fuzzer (K104, journal entry 123): the
 # kernel takes random calls from programs with no handles, and is still
 # there afterwards.
 #
