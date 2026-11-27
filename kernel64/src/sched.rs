@@ -177,7 +177,7 @@ impl Queue {
 }
 
 /// The runnable threads that are on no CPU: a queue per CPU (K68,
-/// journal entry NNN). A thread waits in one CPU's queue - the CPU that
+/// journal entry 129). A thread waits in one CPU's queue - the CPU that
 /// is to take it, or the one it last ran on (K101) - and that CPU takes
 /// from its own queue first. Priorities stay strict across the machine:
 /// a CPU takes a thread from another CPU's queue when it is more
@@ -215,7 +215,7 @@ impl Ready {
     /// queue; among equals, the one that joined first, whichever queue
     /// it is in. As fair as one queue for all: a CPU taking from its own
     /// queue first among equals let a thread keep a CPU nearly to itself
-    /// (journal entry NNN, bug 1).
+    /// (journal entry 129, bug 1).
     fn best_for(&self, cpu: usize) -> Option<(usize, usize, usize)> {
         let mut best: Option<(usize, usize, usize, u64)> = None;
         for (q, queue) in self.queues.iter().enumerate() {
@@ -1031,7 +1031,7 @@ mod tests {
         s
     }
 
-    // ---- A run queue per CPU (K68, K101; journal entry NNN) ----------
+    // ---- A run queue per CPU (K68, K101; journal entry 129) ----------
 
     /// Runs `cpu`'s slice out: SLICE ticks, then it chooses if asked.
     fn end_slice(s: &mut Scheduler, cpu: usize) {
