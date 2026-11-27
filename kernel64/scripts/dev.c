@@ -1,4 +1,4 @@
-/* dev.c - /dev (journal entry NNN, J65): null, zero, full, random and
+/* dev.c - /dev (journal entry 127, J65): null, zero, full, random and
  * urandom from a service of their own, mounted at /dev in every program
  * given files; /dev/stdin, /dev/stdout, /dev/stderr and /dev/tty from
  * libc. handles-test.sh boots TheTaaJ and runs

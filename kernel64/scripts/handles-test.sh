@@ -9,7 +9,7 @@
 #     *at calls, and a child given one directory as its whole tree;
 #   - /tmp in memory (journal entry 126, J64): a second file service,
 #     mounted at /tmp everywhere, and nothing of it on the disk;
-#   - /dev (journal entry NNN, J65): the devices' service, mounted at
+#   - /dev (journal entry 127, J65): the devices' service, mounted at
 #     /dev, and libc's /dev/stdin, /dev/stdout, /dev/stderr, /dev/tty.
 #
 #   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP DEV
