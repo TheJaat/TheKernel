@@ -426,7 +426,7 @@ impl Scheduler {
     /// added thread's state goes through here.
     fn set_state(&mut self, id: ThreadId, state: State) {
         if let Some(State::Sleeping(until)) = self.states.insert(id, state) {
-            let _ = until;
+            self.sleepers.remove(&(until, id));
         }
         if let State::Sleeping(until) = state {
             self.sleepers.insert((until, id));
