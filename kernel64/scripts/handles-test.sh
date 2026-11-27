@@ -10,13 +10,15 @@
 #   - /tmp in memory (journal entry 126, J64): a second file service,
 #     mounted at /tmp everywhere, and nothing of it on the disk;
 #   - /dev (journal entry 127, J65): the devices' service, mounted at
-#     /dev, and libc's /dev/stdin, /dev/stdout, /dev/stderr, /dev/tty.
+#     /dev, and libc's /dev/stdin, /dev/stdout, /dev/stderr, /dev/tty;
+#   - /proc (journal entry NNN, J66): the kernel's numbers as files,
+#     mounted at /proc, and libc's /proc/self, /proc/self/exe, /proc/self/fd.
 #
-#   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP DEV
+#   usage: handles-test.sh ARCH IMAGE DISK LOG HANDLES NAMESPACE AT TMP DEV PROC
 #
-# HANDLES, NAMESPACE, AT, TMP and DEV are handles.c, namespace.c, at.c,
-# tmp.c and dev.c (next to this script) built for ARCH. One boot;
-# TheTaaJ runs
+# HANDLES, NAMESPACE, AT, TMP, DEV and PROC are handles.c, namespace.c,
+# at.c, tmp.c, dev.c and proc.c (next to this script) built for ARCH.
+# One boot; TheTaaJ runs
 #   with programs handles     "handles: N checks, all passed"
 #   with programs namespace   "namespace: N checks, all passed"
 #   with programs at          "at: N checks, all passed"
@@ -25,6 +27,8 @@
 #   /tmp/s: the shell's /tmp is the programs'
 #   with programs devtest     "dev: N checks, all passed"
 #   echo dev-hidden > /dev/null: the shell's /dev, and nothing printed
+#   with programs proctest    "proc: N checks, all passed"
+#   cat /proc/uptime: the shell's /proc
 
 set -u
 ARCH=$1
@@ -36,6 +40,7 @@ NAMESPACE=$6
 AT=$7
 TMP=$8
 DEV=$9
+PROC=${10}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 TFSTOOL=${TFSTOOL:-$ROOT/tools/tfstool-rs/target/release/tfstool}
@@ -56,6 +61,7 @@ rm -f "$DISK"
 "$TFSTOOL" put "$DISK" at "$AT" > /dev/null || fail "cannot put at on the disk"
 "$TFSTOOL" put "$DISK" tmptest "$TMP" > /dev/null || fail "cannot put tmptest on the disk"
 "$TFSTOOL" put "$DISK" devtest "$DEV" > /dev/null || fail "cannot put devtest on the disk"
+"$TFSTOOL" put "$DISK" proctest "$PROC" > /dev/null || fail "cannot put proctest on the disk"
 
 steps="$(keys 'echo == checks ==') ret ~ $(keys 'with programs handles') ret ~~"
 steps="$steps $(keys 'with programs namespace') ret ~~"
@@ -64,6 +70,8 @@ steps="$steps $(keys 'with programs tmptest') ret ~~"
 steps="$steps $(keys 'echo tmp-says-hello > /tmp/s') ret ~ $(keys 'with programs tmptest show /tmp/s') ret ~~"
 steps="$steps $(keys 'with programs devtest') ret ~~"
 steps="$steps $(keys 'echo dev-hidden > /dev/null') ret ~ $(keys 'echo dev-after') ret ~"
+steps="$steps $(keys 'with programs proctest') ret ~~"
+steps="$steps $(keys 'echo == proc ==') ret ~ $(keys 'cat /proc/uptime') ret ~"
 steps="$steps $(keys 'echo == end ==') ret ~ $(keys 'echo done') ret ~"
 echo "Booting $ARCH to check open files as handles (log: $LOG)..."
 if [ "$ARCH" = aarch64 ]; then
@@ -76,7 +84,7 @@ WORK=$LOG.clean
 tr -d '\r' < "$LOG" > "$WORK"
 
 grep -aq '^== end ==$' "$WORK" || fail "the steps did not all run"
-grep -aE '^(handles|namespace|at|tmp|dev): (failed|the sandboxed)' "$WORK" | head -20
+grep -aE '^(handles|namespace|at|tmp|dev|proc): (failed|the sandboxed)' "$WORK" | head -20
 # Every check(...) in each program but the function itself.
 CHECKS=$(($(grep -c 'check(' "$HERE/handles.c") - 1))
 grep -aq "^handles: $CHECKS checks, all passed$" "$WORK" || fail "the $CHECKS checks in handles.c did not all pass"
@@ -97,6 +105,12 @@ grep -aq '^dev: written to /dev/stdout$' "$WORK" || fail "what devtest wrote to 
 # The shell's > /dev/null: the line went nowhere, and the shell went on.
 grep -aq '^dev-hidden$' "$WORK" && fail "echo dev-hidden > /dev/null printed it"
 grep -aq '^dev-after$' "$WORK" || fail "the shell did not go on after > /dev/null"
+PROCS=$(($(grep -c 'check(' "$HERE/proc.c") - 1))
+grep -aq "^proc: $PROCS checks, all passed$" "$WORK" || fail "the $PROCS checks in proc.c did not all pass"
+grep -aq '^\[proc\] ready: ' "$WORK" || fail "init did not start /proc's service"
+grep -aq '^proc: written to /proc/self/fd/1$' "$WORK" || fail "what proctest wrote to /proc/self/fd/1 did not appear"
+# The shell's cat /proc/uptime: a line of two numbers, after the marker.
+sed -n '/^== proc ==$/,$p' "$WORK" | grep -aqE '^[0-9]+\.[0-9][0-9] [0-9]+\.[0-9][0-9]$' || fail "the shell's cat /proc/uptime did not print two numbers"
 grep -aq 'not reached' "$WORK" && fail "$(grep -a 'not reached' "$WORK" | head -1)"
 grep -a 'has not answered for' "$WORK" && fail "a service stopped answering during the test"
 grep -aiE 'panic|page fault in kernel|CPU EXCEPTION' "$WORK" && fail "the kernel failed"
@@ -107,3 +121,4 @@ echo "a namespace per process ($ARCH): $MOUNTS checks of mounts, .., EXDEV, a re
 echo "names from a directory ($ARCH): $ATS checks of the *at calls, a directory moved while open, and a child in a tree of its own passed"
 echo "/tmp in memory ($ARCH): $TMPS checks, the shell's /tmp, and nothing of it on the disk"
 echo "/dev ($ARCH): $DEVS checks of null, zero, full, random, urandom and the program's own, and the shell's > /dev/null"
+echo "/proc ($ARCH): $PROCS checks of uptime, meminfo, cpuinfo, stat, PID/status, self, exe and fd, and the shell's cat /proc/uptime"

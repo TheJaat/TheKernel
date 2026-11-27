@@ -36,6 +36,8 @@ pub static ECHOC: &[u8] = program!("echoc");
 pub static FS: &[u8] = program!("fs");
 /// /dev's devices (J65).
 pub static DEV: &[u8] = program!("dev");
+/// /proc (J66).
+pub static PROC: &[u8] = program!("proc");
 pub static FSCHECK: &[u8] = program!("fscheck");
 pub static MEMRO: &[u8] = program!("memro");
 pub static HEAPCHECK: &[u8] = program!("heapcheck");
@@ -129,6 +131,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("display", DISPLAY),
     ("fs", FS),
     ("dev", DEV),
+    ("proc", PROC),
     ("blk", BLK),
     ("ahci", AHCI),
     ("nvme", NVME),
@@ -154,6 +157,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("shell", SHELL),
     ("fs", FS),
     ("dev", DEV),
+    ("proc", PROC),
     ("blk", BLK),
     ("nic", NIC),
     ("net", NET),
