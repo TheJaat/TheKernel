@@ -1178,6 +1178,19 @@ pub mod display {
     /// the drivers of pointing devices (kbd for the PC's PS/2 mouse,
     /// hid for virtio ones), on a send-only copy of this channel.
     pub const POINTER: u8 = 4;
+    /// Nothing follows. The desktop benchmark (K114): the display times
+    /// one composition of the whole screen, and a window dragged a pixel
+    /// at a time, and prints what they cost. Sent by the shell
+    /// (`display bench`).
+    pub const BENCH: u8 = 5;
+    /// Followed by a count (u32 LE, at most KEYS_MAX): the desktop
+    /// benchmark's key to screen - the display times each of the next
+    /// that many keys from its arrival to the screen showing the
+    /// terminal's echo of it, and prints the median and the worst. Sent
+    /// by the shell (`display keys N`).
+    pub const KEYS: u8 = 6;
+    /// The most keys one KEYS measures.
+    pub const KEYS_MAX: u32 = 200;
 
     /// A pointer's report: moved by (x, y) pixels (`absolute` false,
     /// right and down positive), or is at (x, y), each 0..=ABSOLUTE_MAX
