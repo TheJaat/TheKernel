@@ -80,31 +80,41 @@ struct Attributes {
     priority: Priority,
     /// One bit per CPU it may run on.
     affinity: u64,
+    /// The CPU it last left to wait (K101): where its data may still be
+    /// in the cache, and where it is put back when woken, if it may.
+    last: usize,
 }
 
-/// The runnable threads that are on no CPU: a FIFO queue per priority,
-/// the most important first. Each entry carries its thread's affinity,
-/// so that choosing - the scheduler's hottest path - looks nothing up.
-pub struct Ready {
-    levels: [VecDeque<(ThreadId, u64)>; LEVELS],
+/// One CPU's runnable threads that are on no CPU: a FIFO queue per
+/// priority, the most important first. Each entry carries its thread's
+/// affinity, so that choosing - the scheduler's hottest path - looks
+/// nothing up.
+pub struct Queue {
+    /// (thread, affinity, when it joined: `Ready`'s count, for FIFO
+    /// order across the CPUs' queues).
+    levels: [VecDeque<(ThreadId, u64, u64)>; LEVELS],
     /// One bit per level that has anyone in it, so that finding the
     /// first is one instruction (trailing_zeros), not forty looks.
     occupied: u64,
+    /// How many wait here, all levels together: what `home` compares.
+    count: usize,
 }
 
-impl Ready {
-    fn new() -> Ready {
-        Ready { levels: core::array::from_fn(|_| VecDeque::new()), occupied: 0 }
+impl Queue {
+    fn new() -> Queue {
+        Queue { levels: core::array::from_fn(|_| VecDeque::new()), occupied: 0, count: 0 }
     }
 
-    fn push_back(&mut self, id: ThreadId, priority: Priority, affinity: u64) {
+    fn push_back(&mut self, id: ThreadId, priority: Priority, affinity: u64, joined: u64) {
         let level = level(priority);
-        self.levels[level].push_back((id, affinity));
+        self.levels[level].push_back((id, affinity, joined));
         self.occupied |= 1 << level;
+        self.count += 1;
     }
 
-    /// Clears `level`'s bit if it has emptied.
+    /// One fewer at `level`: clears its bit if it has emptied.
     fn update(&mut self, level: usize) {
+        self.count -= 1;
         if self.levels[level].is_empty() {
             self.occupied &= !(1 << level);
         }
@@ -113,7 +123,7 @@ impl Ready {
     /// Takes `id` out, wherever it is; false if it was not there.
     fn remove(&mut self, id: ThreadId) -> bool {
         for level in 0..LEVELS {
-            if let Some(at) = self.levels[level].iter().position(|&(other, _)| other == id) {
+            if let Some(at) = self.levels[level].iter().position(|&(other, _, _)| other == id) {
                 self.levels[level].remove(at);
                 self.update(level);
                 return true;
@@ -122,16 +132,6 @@ impl Ready {
         false
     }
 
-    /// A queued thread's new affinity; false if it is not queued.
-    fn set_affinity(&mut self, id: ThreadId, affinity: u64) -> bool {
-        for queue in &mut self.levels {
-            if let Some(entry) = queue.iter_mut().find(|(other, _)| *other == id) {
-                entry.1 = affinity;
-                return true;
-            }
-        }
-        false
-    }
 
     /// Where the thread `cpu` would take next is: its priority's level
     /// and its place there - the most important allowed on `cpu`, the
@@ -141,7 +141,7 @@ impl Ready {
         let mut left = self.occupied;
         while left != 0 {
             let level = left.trailing_zeros() as usize;
-            if let Some(at) = self.levels[level].iter().position(|&(_, affinity)| affinity & bit != 0) {
+            if let Some(at) = self.levels[level].iter().position(|&(_, affinity, _)| affinity & bit != 0) {
                 return Some((level, at));
             }
             left &= left - 1;
@@ -151,18 +151,14 @@ impl Ready {
 
     /// Takes the thread at `place` out: it, its priority and affinity.
     fn take(&mut self, (level, at): (usize, usize)) -> (ThreadId, Priority, u64) {
-        let (id, affinity) = self.levels[level].remove(at).expect("best_for's place");
+        let (id, affinity, _) = self.levels[level].remove(at).expect("best_for's place");
         self.update(level);
         (id, priority_of(level), affinity)
     }
 
-    #[cfg(test)]
-    fn get(&self, (level, at): (usize, usize)) -> ThreadId {
-        self.levels[level][at].0
-    }
 
     pub fn contains(&self, id: &ThreadId) -> bool {
-        self.levels.iter().any(|queue| queue.iter().any(|(other, _)| other == id))
+        self.levels.iter().any(|queue| queue.iter().any(|(other, _, _)| other == id))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -170,13 +166,99 @@ impl Ready {
     }
 
     pub fn len(&self) -> usize {
-        self.levels.iter().map(VecDeque::len).sum()
+        self.count
     }
 
     /// In the order they would be taken: the most important first, and
     /// within a priority the longest waiting first.
     pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
-        self.levels.iter().flatten().map(|(id, _)| id)
+        self.levels.iter().flatten().map(|(id, _, _)| id)
+    }
+}
+
+/// The runnable threads that are on no CPU: a queue per CPU (K68,
+/// journal entry NNN). A thread waits in one CPU's queue - the CPU that
+/// is to take it, or the one it last ran on (K101) - and that CPU takes
+/// from its own queue first. Priorities stay strict across the machine:
+/// a CPU takes a thread from another CPU's queue when it is more
+/// important than anything in its own, or when its own has nothing it
+/// may run - an idle CPU takes work from a busy one.
+pub struct Ready {
+    queues: Vec<Queue>,
+    /// Counts every thread that joins a queue: among equally important
+    /// threads, the one that joined first is taken first, whichever
+    /// CPU's queue it waits in.
+    joined: u64,
+}
+
+impl Ready {
+    fn new() -> Ready {
+        Ready { queues: alloc::vec![Queue::new()], joined: 0 }
+    }
+
+    fn add_cpu(&mut self) {
+        self.queues.push(Queue::new());
+    }
+
+    fn push(&mut self, on: usize, id: ThreadId, priority: Priority, affinity: u64) {
+        self.joined += 1;
+        self.queues[on].push_back(id, priority, affinity, self.joined);
+    }
+
+    /// Takes `id` out, wherever it is; the queue it was in.
+    fn remove(&mut self, id: ThreadId) -> Option<usize> {
+        self.queues.iter_mut().position(|queue| queue.remove(id))
+    }
+
+    /// Where the thread `cpu` would take next is - its queue, its level
+    /// and its place there: the most important allowed on `cpu` in any
+    /// queue; among equals, the one that joined first, whichever queue
+    /// it is in. As fair as one queue for all: a CPU taking from its own
+    /// queue first among equals let a thread keep a CPU nearly to itself
+    /// (journal entry NNN, bug 1).
+    fn best_for(&self, cpu: usize) -> Option<(usize, usize, usize)> {
+        let mut best: Option<(usize, usize, usize, u64)> = None;
+        for (q, queue) in self.queues.iter().enumerate() {
+            if let Some((level, at)) = queue.best_for(cpu) {
+                let joined = queue.levels[level][at].2;
+                if best.is_none_or(|(_, so_far, _, first)| level < so_far || (level == so_far && joined < first)) {
+                    best = Some((q, level, at, joined));
+                }
+            }
+        }
+        best.map(|(q, level, at, _)| (q, level, at))
+    }
+
+    /// Takes the thread at `place` out: it, its priority and affinity.
+    fn take(&mut self, (q, level, at): (usize, usize, usize)) -> (ThreadId, Priority, u64) {
+        self.queues[q].take((level, at))
+    }
+
+    /// How many wait in `cpu`'s queue.
+    fn waiting_on(&self, cpu: usize) -> usize {
+        self.queues[cpu].len()
+    }
+
+    #[cfg(test)]
+    fn get(&self, (q, level, at): (usize, usize, usize)) -> ThreadId {
+        self.queues[q].levels[level][at].0
+    }
+
+    pub fn contains(&self, id: &ThreadId) -> bool {
+        self.queues.iter().any(|queue| queue.contains(id))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queues.iter().all(Queue::is_empty)
+    }
+
+    pub fn len(&self) -> usize {
+        self.queues.iter().map(Queue::len).sum()
+    }
+
+    /// Every queued thread: CPU 0's queue in its order, then CPU 1's...
+    pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
+        self.queues.iter().flat_map(Queue::iter)
     }
 }
 
@@ -258,7 +340,7 @@ impl Scheduler {
         let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false, priority, affinity: ANY_CPU };
         let mut attributes = BTreeMap::new();
         if running != idle {
-            attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU });
+            attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU, last: 0 });
         }
         Scheduler { states, attributes, ready: Ready::new(), sleepers: alloc::vec![BTreeSet::new()], asleep_on: BTreeMap::new(), cpus: alloc::vec![cpu], pokes: 0 }
     }
@@ -270,6 +352,7 @@ impl Scheduler {
         // A CPU that arrives when there is already work takes some at
         // its first chance.
         let reschedule = !self.ready.is_empty();
+        self.ready.add_cpu();
         self.cpus.push(Cpu { current: idle, idle, slice_left: SLICE, reschedule, priority: IDLE_PRIORITY, affinity: ANY_CPU });
         self.sleepers.push(BTreeSet::new());
         self.cpus.len() - 1
@@ -313,7 +396,7 @@ impl Scheduler {
     pub fn add_with(&mut self, id: ThreadId, cpu: usize, priority: Priority, affinity: u64) {
         assert!(self.states.insert(id, State::Ready).is_none(), "thread {id} added twice");
         let priority = priority.clamp(HIGHEST, LOWEST);
-        self.attributes.insert(id, Attributes { priority, affinity });
+        self.attributes.insert(id, Attributes { priority, affinity, last: cpu });
         self.enqueue(id, cpu);
     }
 
@@ -335,10 +418,10 @@ impl Scheduler {
     pub fn set_priority(&mut self, id: ThreadId, priority: Priority, cpu: usize) -> bool {
         let Some(attributes) = self.attributes.get_mut(&id) else { return false };
         attributes.priority = priority.clamp(HIGHEST, LOWEST);
-        let Attributes { priority, affinity } = *attributes;
-        if self.ready.remove(id) {
-            self.ready.push_back(id, priority, affinity);
-            self.offer(priority, affinity, cpu);
+        let Attributes { priority, affinity, .. } = *attributes;
+        if let Some(was) = self.ready.remove(id) {
+            let on = self.offer(priority, affinity, cpu).unwrap_or(was);
+            self.ready.push(on, id, priority, affinity);
         } else if let Some(on) = self.cpu_of(id) {
             self.cpus[on].priority = priority;
             if self.someone_waiting_for(on) {
@@ -354,9 +437,10 @@ impl Scheduler {
     pub fn set_affinity(&mut self, id: ThreadId, affinity: u64, cpu: usize) -> bool {
         let Some(attributes) = self.attributes.get_mut(&id) else { return false };
         attributes.affinity = affinity;
-        let priority = attributes.priority;
-        if self.ready.set_affinity(id, affinity) {
-            self.offer(priority, affinity, cpu);
+        let (priority, last) = (attributes.priority, attributes.last);
+        if self.ready.remove(id).is_some() {
+            let on = self.offer(priority, affinity, cpu).unwrap_or_else(|| self.home(affinity, last));
+            self.ready.push(on, id, priority, affinity);
         } else if let Some(on) = self.cpu_of(id) {
             self.cpus[on].affinity = affinity;
             if affinity & (1u64 << on) == 0 {
@@ -386,7 +470,7 @@ impl Scheduler {
     /// - or anyone at all, if the current one may no longer run there.
     fn someone_waiting_for(&self, cpu: usize) -> bool {
         let this = &self.cpus[cpu];
-        let Some((level, _)) = self.ready.best_for(cpu) else { return false };
+        let Some((_, level, _)) = self.ready.best_for(cpu) else { return false };
         if this.current == this.idle || this.affinity & (1u64 << cpu) == 0 {
             return true;
         }
@@ -496,16 +580,32 @@ impl Scheduler {
     fn enqueue(&mut self, id: ThreadId, cpu: usize) {
         debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
         self.set_state(id, State::Ready);
-        let Attributes { priority, affinity } =
-            self.attributes.get(&id).copied().unwrap_or(Attributes { priority: DEFAULT, affinity: ANY_CPU });
-        self.enqueue_known(id, priority, affinity, cpu);
+        let Attributes { priority, affinity, last } =
+            self.attributes.get(&id).copied().unwrap_or(Attributes { priority: DEFAULT, affinity: ANY_CPU, last: 0 });
+        self.enqueue_known(id, priority, affinity, cpu, last);
     }
 
     /// `enqueue`, its attributes already known (a switch: no look-up).
-    fn enqueue_known(&mut self, id: ThreadId, priority: Priority, affinity: u64, cpu: usize) {
+    /// `last` is the CPU it last ran on. It waits in the queue of the
+    /// CPU offered it, if one is; else in its home's (`home`).
+    fn enqueue_known(&mut self, id: ThreadId, priority: Priority, affinity: u64, cpu: usize, last: usize) {
         self.set_state(id, State::Ready);
-        self.ready.push_back(id, priority, affinity);
-        self.offer(priority, affinity, cpu);
+        let on = self.offer_from(priority, affinity, cpu, last).unwrap_or_else(|| self.home(affinity, last));
+        self.ready.push(on, id, priority, affinity);
+    }
+
+    /// Where a thread waits when no CPU is offered it: the allowed CPU
+    /// with the fewest waiting - so that busy threads spread over the
+    /// CPUs, and three on two take turns on both - and among those its
+    /// last CPU first (its cache), then the lowest number.
+    fn home(&self, affinity: u64, last: usize) -> usize {
+        let count = self.cpus.len();
+        let last = if last < count { last } else { 0 };
+        (0..count)
+            .map(|n| (last + n) % count)
+            .filter(|&c| affinity & (1u64 << c) != 0)
+            .min_by_key(|&c| self.ready.waiting_on(c))
+            .unwrap_or(last)
     }
 
     /// A thread (of `priority` and `affinity`) has just joined the queue,
@@ -524,16 +624,28 @@ impl Scheduler {
     /// important one, this CPU first among equals (no interrupt). If
     /// none is less important, nothing is done: it waits for a slice to
     /// end, as it always did.
-    fn offer(&mut self, priority: Priority, affinity: u64, cpu: usize) {
+    ///
+    /// Returns the CPU asked, in whose queue the thread then waits.
+    fn offer(&mut self, priority: Priority, affinity: u64, cpu: usize) -> Option<usize> {
+        self.offer_from(priority, affinity, cpu, cpu)
+    }
+
+    /// `offer`, for a thread that last ran on `last`. This CPU first, if
+    /// it idles: it takes the thread now, with no interrupt - the quickest
+    /// a woken thread can run. Then its last CPU, if that idles (K101: the
+    /// thread's data may still be in its cache); then the others.
+    fn offer_from(&mut self, priority: Priority, affinity: u64, cpu: usize, last: usize) -> Option<usize> {
         let count = self.cpus.len();
         let allowed = |c: usize| affinity & (1u64 << c) != 0;
         let free = |s: &Scheduler, c: usize| {
             let this = &s.cpus[c];
             this.current == this.idle && !this.reschedule && allowed(c)
         };
-        if let Some(chosen) = (0..count).map(|n| (cpu + n) % count).find(|&c| free(self, c)) {
+        let here = free(self, cpu).then_some(cpu);
+        let there = (last < count && free(self, last)).then_some(last);
+        if let Some(chosen) = here.or(there).or_else(|| (0..count).map(|n| (cpu + n) % count).find(|&c| free(self, c))) {
             self.ask(chosen, cpu);
-            return;
+            return Some(chosen);
         }
         let mut victim: Option<(usize, Priority)> = None;
         for c in (0..count).map(|n| (cpu + n) % count) {
@@ -546,9 +658,9 @@ impl Scheduler {
                 victim = Some((c, theirs));
             }
         }
-        if let Some((chosen, _)) = victim {
-            self.ask(chosen, cpu);
-        }
+        let (chosen, _) = victim?;
+        self.ask(chosen, cpu);
+        Some(chosen)
     }
 
     /// Ends the sleep or block of `id`. If it has not left its CPU yet
@@ -587,6 +699,9 @@ impl Scheduler {
         assert!(this.current != this.idle, "the idle thread cannot sleep, block or exit");
         let current = this.current;
         self.set_state(current, state);
+        if let Some(attributes) = self.attributes.get_mut(&current) {
+            attributes.last = cpu;
+        }
     }
 
     /// Takes back a `suspend_current` into Sleeping or Blocked: the
@@ -620,7 +735,7 @@ impl Scheduler {
         let candidate = self
             .ready
             .best_for(cpu)
-            .filter(|&(level, _)| !(may_stay && from != idle && priority_of(level) > mine));
+            .filter(|&(_, level, _)| !(may_stay && from != idle && priority_of(level) > mine));
         let Some(place) = candidate else {
             if may_stay {
                 self.cpus[cpu].slice_left = SLICE;
@@ -630,7 +745,7 @@ impl Scheduler {
             if still_running && from != idle {
                 // No longer allowed here: back in the queue, for a CPU
                 // it may run on.
-                self.enqueue_known(from, mine, my_affinity, cpu);
+                self.enqueue_known(from, mine, my_affinity, cpu, cpu);
             }
             return switch;
         };
@@ -644,7 +759,7 @@ impl Scheduler {
             } else {
                 // It gave way on this CPU; another may be idling, or
                 // running someone less important.
-                self.enqueue_known(from, mine, my_affinity, cpu);
+                self.enqueue_known(from, mine, my_affinity, cpu, cpu);
             }
         }
         switch
@@ -914,6 +1029,158 @@ mod tests {
         let mut s = Scheduler::new(IDLE);
         assert_eq!(s.add_cpu(100), 1);
         s
+    }
+
+    // ---- A run queue per CPU (K68, K101; journal entry NNN) ----------
+
+    /// Runs `cpu`'s slice out: SLICE ticks, then it chooses if asked.
+    fn end_slice(s: &mut Scheduler, cpu: usize) {
+        for _ in 0..SLICE {
+            s.tick_slice(cpu);
+        }
+        if s.take_reschedule(cpu) {
+            s.pick_next(cpu);
+        }
+    }
+
+    #[test]
+    fn among_equals_the_longest_waiting_goes_first_and_an_idle_cpu_takes_work_from_a_busy_one() {
+        let mut s = two_cpus();
+        // Four threads, both CPUs busy: two wait, one in each queue.
+        for id in 1..=4 {
+            s.add(id, 0);
+            s.pick_next(0);
+            s.pick_next(1);
+        }
+        assert_eq!(s.ready.waiting_on(0), 1, "each waits in a queue of its own");
+        assert_eq!(s.ready.waiting_on(1), 1);
+        let first = s.ready.queues.iter().flat_map(|q| q.levels.iter().flatten()).min_by_key(|entry| entry.2).unwrap().0;
+        // CPU 1's slice ends: it takes the one that joined first, even if
+        // it waits in CPU 0's queue - as fair as one queue for all.
+        end_slice(&mut s, 1);
+        assert_eq!(s.current(1), first);
+        // CPU 0's thread blocks, then the next: CPU 0 takes from any
+        // queue rather than idle.
+        s.suspend_current(0, State::Blocked);
+        s.pick_next(0);
+        assert_ne!(s.current(0), IDLE);
+        s.suspend_current(0, State::Blocked);
+        s.pick_next(0);
+        assert_ne!(s.current(0), IDLE, "an idle CPU takes work from a busy one's queue");
+        assert!(s.ready.is_empty());
+        sleepers_match(&s);
+    }
+
+    #[test]
+    fn a_more_important_thread_in_another_queue_comes_before_this_cpus_own() {
+        let mut s = two_cpus();
+        s.add(1, 0);
+        s.add(2, 0);
+        s.pick_next(0);
+        s.pick_next(1);
+        // Thread 3, at 0, made by CPU 1: no CPU runs anyone less
+        // important, so it waits - in CPU 1's queue (its home).
+        s.add_with(3, 1, DEFAULT, ANY_CPU);
+        assert_eq!(s.ready.waiting_on(1), 1);
+        // Thread 4, at -3, made by CPU 0: it takes CPU 0 (this CPU first
+        // among equals), so it waits in CPU 0's queue, CPU 0 asked.
+        s.add_with(4, 0, -3, ANY_CPU);
+        assert_eq!(s.ready.waiting_on(0), 1);
+        // CPU 1 chooses first: thread 4, from CPU 0's queue, before its
+        // own thread 3 - priorities are strict across the queues.
+        s.suspend_current(1, State::Blocked);
+        s.pick_next(1);
+        assert_eq!(s.current(1), 4);
+        assert_eq!(s.ready.waiting_on(1), 1, "thread 3 still waits");
+    }
+
+    #[test]
+    fn a_woken_thread_goes_back_to_the_cpu_it_last_ran_on_when_that_one_idles() {
+        let mut s = Scheduler::new(IDLE);
+        s.add_cpu(100);
+        s.add_cpu(200);
+        s.add(1, 0);
+        s.add(2, 0);
+        s.pick_next(0);
+        s.pick_next(1);
+        let (a, b) = (s.current(0), s.current(1));
+        // b runs on CPU 1 and blocks there; CPU 1 idles.
+        s.suspend_current(1, State::Blocked);
+        s.pick_next(1);
+        assert_eq!(s.current(1), 100);
+        s.take_pokes();
+        // Woken by CPU 0, which is busy (with a): CPU 2 idles too, but b
+        // goes back to CPU 1, where it last ran.
+        assert!(s.wake(b, 0));
+        assert_eq!(s.take_pokes(), 1 << 1, "CPU 1 interrupted, not CPU 2");
+        assert!(s.take_reschedule(1));
+        s.pick_next(1);
+        assert_eq!(s.current(1), b);
+        assert_eq!(s.current(0), a);
+    }
+
+    #[test]
+    fn busy_threads_share_the_cpus_fairly_whatever_order_slices_end_in() {
+        for (threads, cpus) in [(4u64, 2usize), (3, 2), (5, 2), (6, 4), (5, 4)] {
+            let mut s = Scheduler::new(IDLE);
+            for n in 1..cpus {
+                s.add_cpu(100 * n as u64);
+            }
+            for id in 1..=threads {
+                s.add(id, 0);
+            }
+            for cpu in 0..cpus {
+                s.pick_next(cpu);
+            }
+            let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+            let mut ran = alloc::vec![0u32; threads as usize + 1];
+            for _ in 0..4000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let cpu = (seed % cpus as u64) as usize;
+                let current = s.current(cpu);
+                if current <= threads {
+                    ran[current as usize] += 1;
+                }
+                s.tick_slice(cpu);
+                if s.take_reschedule(cpu) {
+                    s.pick_next(cpu);
+                }
+            }
+            let total: u32 = ran.iter().sum();
+            let fair = total / threads as u32;
+            for id in 1..=threads as usize {
+                assert!(
+                    ran[id] * 10 >= fair * 7 && ran[id] * 10 <= fair * 13,
+                    "{threads} threads on {cpus} CPUs: thread {id} had {} ticks, fair is {fair}: {ran:?}",
+                    ran[id]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn three_busy_threads_on_two_cpus_share_them_fairly() {
+        let mut s = two_cpus();
+        for id in 1..=3 {
+            s.add(id, 0);
+        }
+        s.pick_next(0);
+        s.pick_next(1);
+        let mut ran = [0u32; 4];
+        for _ in 0..300 {
+            for cpu in 0..2 {
+                ran[s.current(cpu) as usize] += 1;
+                end_slice(&mut s, cpu);
+            }
+        }
+        // 600 slices among three: 200 each, if fair. Each gets most of
+        // that, not 300 for one and 150 for the others.
+        for id in 1..=3 {
+            assert!((170..=230).contains(&ran[id]), "thread {id} ran {} slices of 600: {ran:?}", ran[id]);
+        }
+        sleepers_match(&s);
     }
 
     #[test]
