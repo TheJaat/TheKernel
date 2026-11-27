@@ -191,9 +191,25 @@ impl FrameAllocator {
 mod tests {
     use super::*;
 
-    fn allocator(frames: usize) -> FrameAllocator {
-        let storage = vec![0u64; FrameAllocator::words_for(frames)].leak();
-        FrameAllocator::new(storage, frames)
+    /// The bitmap's memory, given back when the test ends. The allocator
+    /// takes `&'static mut`, as the kernel's bitmap lives for ever; a test's
+    /// was leaked for it, which Miri reports as an error (K187). Bound
+    /// before the allocator (`let (_storage, mut a) = ...`), so that it is
+    /// dropped after it: variables are dropped in reverse order.
+    struct Storage(*mut [u64]);
+
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            // SAFETY: made by Box::into_raw in `allocator`, given back once,
+            // after the allocator that borrowed it is gone.
+            drop(unsafe { Box::from_raw(self.0) });
+        }
+    }
+
+    fn allocator(frames: usize) -> (Storage, FrameAllocator) {
+        let storage = Box::into_raw(vec![0u64; FrameAllocator::words_for(frames)].into_boxed_slice());
+        // SAFETY: just allocated; it outlives the allocator (see Storage).
+        (Storage(storage), FrameAllocator::new(unsafe { &mut *storage }, frames))
     }
 
     fn frame(n: u64) -> PhysAddr {
@@ -202,14 +218,14 @@ mod tests {
 
     #[test]
     fn everything_starts_in_use() {
-        let mut a = allocator(100);
+        let (_storage, mut a) = allocator(100);
         assert_eq!(a.free_frames(), 0);
         assert_eq!(a.allocate(), None);
     }
 
     #[test]
     fn hands_out_the_lowest_free_frame_first() {
-        let mut a = allocator(100);
+        let (_storage, mut a) = allocator(100);
         a.free_range(frame(10), frame(20));
         assert_eq!(a.free_frames(), 10);
         assert_eq!(a.allocate(), Some(frame(10)));
@@ -221,7 +237,7 @@ mod tests {
 
     #[test]
     fn free_range_rounds_inward_reserve_rounds_outward() {
-        let mut a = allocator(100);
+        let (_storage, mut a) = allocator(100);
         // 0x1800..0x5800 wholly contains frames 2, 3 and 4 only.
         a.free_range(PhysAddr::new(0x1800), PhysAddr::new(0x5800));
         assert_eq!(a.free_frames(), 3);
@@ -237,7 +253,7 @@ mod tests {
     #[test]
     fn never_returns_a_frame_past_the_end() {
         // 70 frames: the second bitmap word has 58 bits past the end.
-        let mut a = allocator(70);
+        let (_storage, mut a) = allocator(70);
         a.free_range(frame(0), frame(1000));
         assert_eq!(a.free_frames(), 70);
         for n in 0..70 {
@@ -249,7 +265,7 @@ mod tests {
     #[test]
     fn the_highest_free_frame_can_be_asked_for() {
         // 100 frames: the bitmap's second word has 28 bits past the end.
-        let mut frames = allocator(100);
+        let (_storage, mut frames) = allocator(100);
         assert_eq!(frames.allocate_highest(), None);
         frames.free_range(frame(3), frame(100));
         frames.reserve_range(frame(90), frame(100));
@@ -272,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_frame_can_be_asked_about() {
-        let mut frames = allocator(100);
+        let (_storage, mut frames) = allocator(100);
         frames.free_range(frame(10), frame(20));
         assert!(!frames.is_free(frame(9)));
         assert!(frames.is_free(frame(10)));
@@ -288,7 +304,7 @@ mod tests {
 
     #[test]
     fn freeing_everything_restores_the_count() {
-        let mut a = allocator(256);
+        let (_storage, mut a) = allocator(256);
         a.free_range(frame(0), frame(256));
         let taken: Vec<_> = (0..200).map(|_| a.allocate().unwrap()).collect();
         assert_eq!(a.free_frames(), 56);
@@ -300,7 +316,7 @@ mod tests {
 
     #[test]
     fn contiguous_runs() {
-        let mut a = allocator(100);
+        let (_storage, mut a) = allocator(100);
         a.free_range(frame(0), frame(100));
         a.reserve_range(frame(3), frame(4)); // a hole at 3
         a.reserve_range(frame(10), frame(11)); // and at 10
@@ -320,7 +336,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "double free")]
     fn double_free_is_caught() {
-        let mut a = allocator(10);
+        let (_storage, mut a) = allocator(10);
         a.free_range(frame(0), frame(10));
         let f = a.allocate().unwrap();
         a.free(f);
@@ -330,7 +346,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unaligned")]
     fn unaligned_free_is_caught() {
-        let mut a = allocator(10);
+        let (_storage, mut a) = allocator(10);
         a.free(PhysAddr::new(0x1234));
     }
 }

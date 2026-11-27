@@ -1514,6 +1514,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn randomized_fairness() {
         let s = Scheduler::new(IDLE);
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -1965,6 +1966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn randomized_on_four_cpus() {
         // Far more threads than CPUs: nobody starves, and threads move.
         let (moved, _) = randomized(30);
@@ -1972,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn randomized_with_cpus_to_spare() {
         // Fewer threads than CPUs: there is nearly always a CPU idling
         // when a thread wakes, and it must be told.
@@ -2223,6 +2226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn randomized_with_priorities_and_affinity() {
         const CPUS: usize = 4;
         let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };

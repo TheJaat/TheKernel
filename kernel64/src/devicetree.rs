@@ -1417,6 +1417,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn a_damaged_tree_is_never_a_panic() {
         // Cut short at every length: the header may refuse it, or the
         // walk may end early - either is fine; panicking is not.
