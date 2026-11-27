@@ -87,6 +87,16 @@ steps="$(keys 'counter') spc shift-7 ret see:[counter],window"
 go 265 247; steps="$steps $MOVES $(click) see:clicks:,1 shift-equal a see:key,a"
 # Shift alone and Control alone (K42): no byte, but the window is told.
 steps="$steps shift see:key,code,42,up ctrl see:key,code,29,up"
+# The wheel turned up once over counter's content (K46): on the PC
+# QEMU's monitor (`mouse_move 0 0 1`: a positive dz is wheel up, which
+# QEMU's PS/2 mouse sends as -1 and the decoder reads as +1, Linux's
+# sign), on AArch64 the tablet's (`wheel-up`, a button QEMU turns into
+# REL_WHEEL).
+if [ "$ARCH" = aarch64 ]; then
+    steps="$steps @btn,wheel-up see:wheel"
+else
+    steps="$steps !mouse_move,0,0,1 see:wheel"
+fi
 go 600 500; steps="$steps $MOVES $(click) see:lost,the,focus"
 steps="$steps $(keys 'echo back') ret ~"
 go 100 90; steps="$steps $MOVES $(press)"
@@ -118,6 +128,7 @@ said '\[counter\] key code 42 down \(modifiers 1\)' "counter was not told Shift 
 said '\[counter\] key code 42 up \(modifiers 0\)' "counter was not told Shift came up (K42)"
 said '\[counter\] key code 29 down \(modifiers 2\)' "counter was not told Control alone went down (K42)"
 said '\[counter\] key code 29 up \(modifiers 0\)' "counter was not told Control came up (K42)"
+said '\[counter\] wheel 1 at \(64, 74\)' "counter was not told the wheel turned up once, under the pointer at (265, 247) (K46)"
 said '\[display\] focus: window 1 "terminal"' "the click on the terminal did not give it the focus"
 said '\[counter\] lost the focus' "counter was not told it lost the focus"
 said '\[shell\] line: "echo back"' "the shell did not get exactly the line typed after the focus came back"

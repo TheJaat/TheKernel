@@ -1215,6 +1215,8 @@ pub mod display {
         pub x: i32,
         pub y: i32,
         pub buttons: u8,
+        /// The scroll wheel's clicks, positive away from the user (K46).
+        pub wheel: i8,
     }
 
     /// The range of an absolute position on each axis.
@@ -1222,8 +1224,8 @@ pub mod display {
 
     impl Pointer {
         /// The whole message: POINTER, then whether absolute (0 or 1),
-        /// x and y (i32 LE), the buttons.
-        pub const SIZE: usize = 1 + 1 + 4 + 4 + 1;
+        /// x and y (i32 LE), the buttons, the wheel (i8, K46).
+        pub const SIZE: usize = 1 + 1 + 4 + 4 + 1 + 1;
 
         pub fn to_message(&self) -> [u8; Pointer::SIZE] {
             let mut message = [0u8; Pointer::SIZE];
@@ -1232,6 +1234,7 @@ pub mod display {
             message[2..6].copy_from_slice(&self.x.to_le_bytes());
             message[6..10].copy_from_slice(&self.y.to_le_bytes());
             message[10] = self.buttons;
+            message[11] = self.wheel as u8;
             message
         }
 
@@ -1248,7 +1251,7 @@ pub mod display {
             if absolute && !((0..=ABSOLUTE_MAX).contains(&x) && (0..=ABSOLUTE_MAX).contains(&y)) {
                 return None;
             }
-            Some(Pointer { absolute, x, y, buttons: message[10] })
+            Some(Pointer { absolute, x, y, buttons: message[10], wheel: message[11] as i8 })
         }
     }
 }
@@ -2692,18 +2695,18 @@ mod tests {
     fn a_pointer_message_goes_there_and_back() {
         use crate::display::{self, Pointer, ABSOLUTE_MAX};
         for pointer in [
-            Pointer { absolute: false, x: -256, y: 255, buttons: 1 },
-            Pointer { absolute: false, x: i32::MIN, y: i32::MAX, buttons: 7 },
-            Pointer { absolute: true, x: 0, y: ABSOLUTE_MAX, buttons: 0 },
+            Pointer { absolute: false, x: -256, y: 255, buttons: 1, wheel: 0 },
+            Pointer { absolute: false, x: i32::MIN, y: i32::MAX, buttons: 0x1F, wheel: -128 },
+            Pointer { absolute: true, x: 0, y: ABSOLUTE_MAX, buttons: 0, wheel: 0 },
         ] {
             let message = pointer.to_message();
             assert_eq!(message[0], display::POINTER);
             assert_eq!(Pointer::from_message(&message), Some(pointer));
         }
-        let good = Pointer { absolute: true, x: 5, y: 6, buttons: 2 }.to_message();
-        assert_eq!(Pointer::from_message(&good[..10]), None);
-        let mut longer = [0u8; 12];
-        longer[..11].copy_from_slice(&good);
+        let good = Pointer { absolute: true, x: 5, y: 6, buttons: 2, wheel: 0 }.to_message();
+        assert_eq!(Pointer::from_message(&good[..Pointer::SIZE - 1]), None);
+        let mut longer = [0u8; Pointer::SIZE + 1];
+        longer[..Pointer::SIZE].copy_from_slice(&good);
         assert_eq!(Pointer::from_message(&longer), None);
         let mut wrong = good;
         wrong[0] = display::TEXT;
@@ -2712,9 +2715,9 @@ mod tests {
         wrong[1] = 2;
         assert_eq!(Pointer::from_message(&wrong), None);
         // Absolute, and off the range: refused. Relative: any number.
-        let outside = Pointer { absolute: true, x: ABSOLUTE_MAX + 1, y: 0, buttons: 0 }.to_message();
+        let outside = Pointer { absolute: true, x: ABSOLUTE_MAX + 1, y: 0, buttons: 0, wheel: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
-        let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0 }.to_message();
+        let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0, wheel: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
     }
 
