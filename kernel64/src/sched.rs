@@ -44,7 +44,7 @@
 //! `pick_next` asks for, so that no other CPU can act on a decision
 //! that has been made but not yet carried out.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 pub type ThreadId = u64;
@@ -215,6 +215,11 @@ pub struct Scheduler {
     /// Each thread's priority and affinity; an idle thread has none.
     attributes: BTreeMap<ThreadId, Attributes>,
     ready: Ready,
+    /// The sleepers, sorted by when they wake (then by number): a tick
+    /// looks at the first, not at every thread (K96, journal entry NNN).
+    /// Kept by `set_state`, the only way a state changes once a thread
+    /// is added, so it always holds exactly the Sleeping threads.
+    sleepers: BTreeSet<(u64, ThreadId)>,
     cpus: Vec<Cpu>,
     /// The CPUs that must be interrupted, one bit each: idling CPUs
     /// that were offered a thread by another CPU and cannot know it.
@@ -250,7 +255,7 @@ impl Scheduler {
         if running != idle {
             attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU });
         }
-        Scheduler { states, attributes, ready: Ready::new(), cpus: alloc::vec![cpu], pokes: 0 }
+        Scheduler { states, attributes, ready: Ready::new(), sleepers: BTreeSet::new(), cpus: alloc::vec![cpu], pokes: 0 }
     }
 
     /// One more CPU, running its idle thread `idle`. Returns its number:
@@ -395,16 +400,37 @@ impl Scheduler {
     /// wakes sleepers whose time has come, and counts down the slice of
     /// the thread on `cpu`.
     pub fn tick(&mut self, now: u64, cpu: usize) {
-        let due: Vec<ThreadId> = self
-            .states
-            .iter()
-            .filter(|(_, s)| matches!(s, State::Sleeping(until) if *until <= now))
-            .map(|(&id, _)| id)
-            .collect();
-        for id in due {
-            self.make_runnable(id, cpu);
-        }
+        self.wake_sleepers(now, cpu);
         self.tick_slice(cpu);
+    }
+
+    /// Wakes every sleeper whose time is `now` or before: the first ones
+    /// of the sorted set, so this looks at no thread that is not due and
+    /// allocates nothing.
+    pub fn wake_sleepers(&mut self, now: u64, cpu: usize) {
+        while let Some(&(until, id)) = self.sleepers.first() {
+            if until > now {
+                break;
+            }
+            self.make_runnable(id, cpu); // takes it out of the set
+        }
+    }
+
+    /// When the first sleeper wakes, if anyone sleeps: what a one-shot
+    /// timer is set for.
+    pub fn first_wake(&self) -> Option<u64> {
+        self.sleepers.first().map(|&(until, _)| until)
+    }
+
+    /// Changes `id`'s state, keeping `sleepers` right. Every change of an
+    /// added thread's state goes through here.
+    fn set_state(&mut self, id: ThreadId, state: State) {
+        if let Some(State::Sleeping(until)) = self.states.insert(id, state) {
+            let _ = until;
+        }
+        if let State::Sleeping(until) = state {
+            self.sleepers.insert((until, id));
+        }
     }
 
     /// One timer tick on a CPU that does not keep the time: only the
@@ -451,7 +477,7 @@ impl Scheduler {
     /// Into the queue - for a thread that is on no CPU.
     fn enqueue(&mut self, id: ThreadId, cpu: usize) {
         debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
-        self.states.insert(id, State::Ready);
+        self.set_state(id, State::Ready);
         let Attributes { priority, affinity } =
             self.attributes.get(&id).copied().unwrap_or(Attributes { priority: DEFAULT, affinity: ANY_CPU });
         self.enqueue_known(id, priority, affinity, cpu);
@@ -459,7 +485,7 @@ impl Scheduler {
 
     /// `enqueue`, its attributes already known (a switch: no look-up).
     fn enqueue_known(&mut self, id: ThreadId, priority: Priority, affinity: u64, cpu: usize) {
-        self.states.insert(id, State::Ready);
+        self.set_state(id, State::Ready);
         self.ready.push_back(id, priority, affinity);
         self.offer(priority, affinity, cpu);
     }
@@ -511,7 +537,7 @@ impl Scheduler {
     /// it stays there, running; otherwise it joins the queue.
     fn make_runnable(&mut self, id: ThreadId, cpu: usize) {
         if self.cpu_of(id).is_some() {
-            self.states.insert(id, State::Running);
+            self.set_state(id, State::Running);
         } else {
             self.enqueue(id, cpu);
         }
@@ -541,7 +567,8 @@ impl Scheduler {
         // The idle thread is what runs when nothing else can, so it can
         // never wait for anything: pick_next would simply choose it again.
         assert!(this.current != this.idle, "the idle thread cannot sleep, block or exit");
-        self.states.insert(this.current, state);
+        let current = this.current;
+        self.set_state(current, state);
     }
 
     /// Takes back a `suspend_current` into Sleeping or Blocked: the
@@ -550,7 +577,7 @@ impl Scheduler {
     pub fn resume_current(&mut self, cpu: usize) {
         let id = self.cpus[cpu].current;
         if let Some(State::Blocked | State::Sleeping(_)) = self.states.get(&id) {
-            self.states.insert(id, State::Running);
+            self.set_state(id, State::Running);
         }
     }
 
@@ -595,7 +622,7 @@ impl Scheduler {
         let switch = self.switch_to(cpu, from, to, priority, affinity);
         if still_running {
             if from == idle {
-                self.states.insert(from, State::Ready); // ready, never queued
+                self.set_state(from, State::Ready); // ready, never queued
             } else {
                 // It gave way on this CPU; another may be idling, or
                 // running someone less important.
@@ -606,7 +633,7 @@ impl Scheduler {
     }
 
     fn switch_to(&mut self, cpu: usize, from: ThreadId, to: ThreadId, priority: Priority, affinity: u64) -> Option<Switch> {
-        self.states.insert(to, State::Running);
+        self.set_state(to, State::Running);
         let this = &mut self.cpus[cpu];
         this.current = to;
         this.priority = priority;
@@ -760,6 +787,60 @@ mod tests {
     /// Many threads, random operations: every thread that is ready is
     /// eventually run, nobody runs twice in a row while others wait, and
     /// the idle thread is never queued.
+    /// The sorted set holds exactly the Sleeping threads, at their times.
+    fn sleepers_match(s: &Scheduler) {
+        let sleeping: BTreeSet<(u64, ThreadId)> = s
+            .states
+            .iter()
+            .filter_map(|(&id, state)| match state {
+                State::Sleeping(until) => Some((*until, id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(s.sleepers, sleeping, "the sleeper set and the states disagree");
+    }
+
+    #[test]
+    fn sleepers_wake_in_their_order_and_leave_the_set_when_woken_early() {
+        let mut s = Scheduler::new(IDLE);
+        for id in 1..=4 {
+            s.add(id, 0);
+        }
+        // Threads 1-4 go to sleep, in turn, until 30, 10, 10 and 20.
+        for (id, until) in [(1, 30), (2, 10), (3, 10), (4, 20)] {
+            assert_eq!(next(&mut s), id);
+            s.suspend_current(0, State::Sleeping(until));
+        }
+        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(s.first_wake(), Some(10));
+        sleepers_match(&s);
+        // Thread 4 is woken early, as a futex or a message would.
+        assert!(s.wake(4, 0));
+        assert_eq!(s.sleepers.len(), 3);
+        sleepers_match(&s);
+        // At 9 nobody is due; at 10 both of that time are, not thread 1.
+        s.tick(9, 0);
+        assert_eq!(s.sleepers.len(), 3);
+        s.tick(10, 0);
+        assert_eq!(s.state(2), Some(State::Ready));
+        assert_eq!(s.state(3), Some(State::Ready));
+        assert_eq!(s.state(1), Some(State::Sleeping(30)));
+        assert_eq!(s.first_wake(), Some(30));
+        sleepers_match(&s);
+        // A sleep taken back (the thread had nothing to wait for).
+        let current = next(&mut s);
+        assert_ne!(current, IDLE);
+        s.suspend_current(0, State::Sleeping(5));
+        assert_eq!(s.first_wake(), Some(5));
+        s.resume_current(0);
+        assert_eq!(s.state(current), Some(State::Running));
+        assert_eq!(s.first_wake(), Some(30));
+        sleepers_match(&s);
+        s.tick(1_000, 0);
+        assert_eq!(s.first_wake(), None);
+        sleepers_match(&s);
+    }
+
     #[test]
     fn randomized_fairness() {
         let mut s = Scheduler::new(IDLE);
@@ -1176,6 +1257,7 @@ mod tests {
                 assert!(!s.ready.iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
                 assert_eq!(s.state(*id), Some(State::Ready));
             }
+            sleepers_match(&s);
         }
         for id in 1..=threads {
             assert!(ran.get(&id).copied().unwrap_or(0) > 50, "thread {id} starved");
@@ -1383,6 +1465,7 @@ mod tests {
                 assert!(!s.ready.iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
                 assert_eq!(s.state(*id), Some(State::Ready));
             }
+            sleepers_match(&s);
         }
     }
 }
