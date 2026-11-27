@@ -747,25 +747,35 @@ fn reap() {
         return; // nobody to reap: no lock taken at all
     }
     let policy = policy();
-    let dead: Vec<Box<Thread>> = {
+    // Out of the table under its lock - so that of two CPUs reaping at
+    // once, one takes each - but forgotten by the policy only after its
+    // stack is freed: `join` waits for the policy to forget it, and must
+    // then find the stack back. The other order let a joiner count the
+    // free frames one stack short (journal entry NNN, bug 9). Off its CPU
+    // (`leaving` clear) is asked first: removable before that, it could
+    // still be saving onto that stack.
+    let dead: Vec<(ThreadId, Box<Thread>)> = {
         let mut guard = THREADS.lock();
         let t = guard.as_mut().expect("threads not initialised");
-        // Off its CPU (`leaving` clear) first, then forgotten by the
-        // policy: the other order could forget one whose record must
-        // still wait, and never find it again.
         let exited: Vec<ThreadId> = t
             .table
             .iter()
-            .filter(|(&id, thread)| !thread.leaving.load(Ordering::Acquire) && policy.remove(id))
+            .filter(|(&id, thread)| !thread.leaving.load(Ordering::Acquire) && policy.removable(id))
             .map(|(&id, _)| id)
             .collect();
-        exited.iter().filter_map(|id| t.table.remove(id)).collect()
+        exited.into_iter().filter_map(|id| t.table.remove(&id).map(|thread| (id, thread))).collect()
     };
-    if !dead.is_empty() {
-        EXITS.fetch_sub(dead.len(), Ordering::SeqCst);
-        drop(dead); // outside the lock: freeing stacks takes other locks
-        EXITED.wake_all();
+    if dead.is_empty() {
+        return;
     }
+    let count = dead.len();
+    for (id, thread) in dead {
+        drop(thread); // outside the lock: freeing stacks takes other locks
+        let forgotten = policy.remove(id);
+        debug_assert!(forgotten, "thread {id} reaped twice");
+    }
+    EXITS.fetch_sub(count, Ordering::SeqCst);
+    EXITED.wake_all();
 }
 
 /// Ticks in which a CPU was found running something other than its

@@ -67,7 +67,8 @@
 //! let go (threads.rs, `schedule`): kept for a whole new slice instead,
 //! a woken thread waited for the one CPU whose queue it was in.
 //!
-//! **Peeking** (the user's choice for K193, 2026-11-27). Choosing
+//! **Peeking** (chosen for K193 over taking from a CPU's own queue
+//! first, which entry 129 found unfair, and over one lock). Choosing
 //! FIFO across every queue used to read every queue under the one lock.
 //! Now each queue *publishes* the key of its first thread - its priority
 //! level and when it joined - in an atomic, after every change, under its
@@ -1161,6 +1162,15 @@ impl Scheduler {
         l.slice_left = SLICE;
         self.publish_current(cpu, l);
         (from != to_id).then_some(Switch { from, to: to_id })
+    }
+
+    /// Whether `remove` would forget `id` now: exited, and on no CPU and
+    /// in no queue. Nothing is changed - the mechanism frees the thread's
+    /// stack first and only then forgets it, so that whoever waits for
+    /// it to be gone (`join`) finds the stack already back (journal
+    /// entry NNN, bug 9).
+    pub fn removable(&self, id: ThreadId) -> bool {
+        self.rec(id).is_some_and(|rec| rec.kind.load(SeqCst) == EXITED && rec.rq.load(SeqCst) == NOWHERE)
     }
 
     /// Forgets an exited thread, once it is off every CPU. Returns
@@ -2556,6 +2566,21 @@ mod tests {
             "CPU 1 idles, not asked, while thread 3 waits in busy CPU 0's queue: {:?}",
             s.queued()
         );
+    }
+
+    #[test]
+    fn an_exited_thread_is_removable_only_once_off_its_cpu() {
+        let s = Scheduler::new(IDLE);
+        s.add(1, 0);
+        s.pick_next(0);
+        assert!(!s.removable(1), "running");
+        s.suspend_current(0, State::Exited);
+        assert!(!s.removable(1), "exited, but still on its CPU");
+        s.pick_next(0);
+        assert!(s.removable(1));
+        assert!(s.removable(1), "asking changes nothing");
+        assert!(s.remove(1));
+        assert!(!s.removable(1) && s.state(1).is_none());
     }
 
     #[test]
