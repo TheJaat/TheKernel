@@ -213,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn output_bits_are_balanced() {
         // Not a proof of anything; a check that nothing is stuck.
         let mut g = Generator::new();

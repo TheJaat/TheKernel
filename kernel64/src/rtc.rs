@@ -188,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn every_day_follows_the_one_before() {
         let mut expected = 0;
         for year in 1970..2101 {
@@ -201,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn seconds_turn_back_into_dates() {
         assert_eq!(Date::from_unix_seconds(0), date(1970, 1, 1, 0, 0, 0));
         assert_eq!(Date::from_unix_seconds(1_795_614_330), date(2026, 11, 25, 13, 45, 30));
