@@ -192,8 +192,8 @@ first
 second" ] || fail "\"both\" is not the two files, one after the other"
         get procs | grep -q "init  *running" || fail "the output of ps did not go into \"procs\""
         get long3 | cmp -s - "$DISK.long" || fail "\"long3\" is not \"long\": cat < long > long3 changed it"
-        { get ls; get ls; } > "$LOG.twice"
-        get big | cmp -s - "$LOG.twice"  || fail "\"big\" is not the program ls twice over: cat ls ls > big lost or changed bytes"
+        { get bin/ls; get bin/ls; } > "$LOG.twice"
+        get big | cmp -s - "$LOG.twice"  || fail "\"big\" is not the program /bin/ls twice over: cat bin/ls bin/ls > big lost or changed bytes"
         get big2 | cmp -s - "$LOG.twice" || fail "\"big2\" is not \"big\": 50 messages did not come through an input and an output whole"
         # A complaint is not output: it went to standard error, the
         # screen, and the file the output went to holds nothing.
@@ -206,7 +206,7 @@ second" ] || fail "\"both\" is not the two files, one after the other"
         # programs.
         [ "$(get piped)" = "300 lines, 1200 words, 4692 bytes
 300 lines, 1200 words, 4692 bytes" ] || fail "\"piped\" does not hold what wc counted of cat's output, twice"
-        get big3 | cmp -s - "$LOG.twice" || fail "\"big3\" is not \"big\": cat ls ls | cat | cat > big3 lost or changed bytes"
+        get big3 | cmp -s - "$LOG.twice" || fail "\"big3\" is not \"big\": cat bin/ls bin/ls | cat | cat > big3 lost or changed bytes"
         # And background jobs: 50 KB written by a pipeline nobody
         # waited for, while other lines ran; the one line a program
         # printed into a file before it was killed; and a count made
