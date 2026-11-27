@@ -394,7 +394,7 @@ fn spawn_from(
     })?;
 
     // A child takes the priority of the one who asked for it - its
-    // `nice` (K190, journal entry NNN) - the way it takes its memory
+    // `nice` (K190, journal entry 130) - the way it takes its memory
     // limit: from whoever made the program file's object, not from init,
     // which loads every program. Never above the child's own ceiling (0):
     // a program at nice 10 starts its children at 10, but the shell, whom

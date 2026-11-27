@@ -35,7 +35,7 @@ pub struct MemoryObject {
     /// (MEMORY_CREATE). They are given back when it goes.
     account: Option<Arc<Account>>,
     /// Its maker's priority (MEMORY_CREATE), for a program started from
-    /// it: a child takes its parent's `nice` (K190, journal entry NNN).
+    /// it: a child takes its parent's `nice` (K190, journal entry 130).
     maker_priority: Option<i64>,
 }
 

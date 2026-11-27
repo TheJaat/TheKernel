@@ -386,7 +386,7 @@ static long long spin_pair(int pinned)
     return (cpu_ns() - cpu0) / 1000000;
 }
 
-/* A child takes its parent's nice (K190, journal entry NNN): at nice 7,
+/* A child takes its parent's nice (K190, journal entry 130): at nice 7,
  * this program starts one that says its priority in its exit code. */
 static void bench_inherit(void)
 {
