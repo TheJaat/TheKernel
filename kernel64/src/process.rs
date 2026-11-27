@@ -87,6 +87,12 @@ pub struct Process {
     /// threads.rs when one of them leaves a CPU and at every tick
     /// (clock::PROCESS_CPU, journal entry 114).
     cpu_ns: AtomicU64,
+    /// Scheduling (journal entry 123): the priority its new threads get,
+    /// the CPUs they may run on, and its ceiling - the most important
+    /// priority it may give itself, its threads or a process it started.
+    sched_priority: AtomicI64,
+    sched_affinity: AtomicU64,
+    sched_ceiling: AtomicI64,
     /// Set by `kill`: the process ends when it next heads for user mode.
     kill_requested: AtomicBool,
     /// The exit code that end will have: STOPPED, or a signal's.
@@ -146,6 +152,38 @@ impl Process {
     /// part running now).
     pub fn cpu_ns(&self) -> u64 {
         self.cpu_ns.load(Ordering::Relaxed)
+    }
+
+    /// The priority its new threads get.
+    pub fn sched_priority(&self) -> i64 {
+        self.sched_priority.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sched_priority(&self, priority: i64) {
+        self.sched_priority.store(priority, Ordering::Relaxed);
+    }
+
+    /// The CPUs its new threads may run on.
+    pub fn sched_affinity(&self) -> u64 {
+        self.sched_affinity.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sched_affinity(&self, affinity: u64) {
+        self.sched_affinity.store(affinity, Ordering::Relaxed);
+    }
+
+    /// The most important priority it may give (abi::sched::CEILING).
+    pub fn sched_ceiling(&self) -> i64 {
+        self.sched_ceiling.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sched_ceiling(&self, ceiling: i64) {
+        self.sched_ceiling.store(ceiling, Ordering::Relaxed);
+    }
+
+    /// Its threads that have not ended.
+    pub fn thread_ids(&self) -> Vec<ThreadId> {
+        self.threads.lock().clone()
     }
 
     /// Counts `nanoseconds` more of CPU time (threads.rs, under its lock).
@@ -635,6 +673,12 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         exit_code: AtomicI64::new(RUNNING),
         ending: AtomicBool::new(false),
         cpu_ns: AtomicU64::new(0),
+        sched_priority: AtomicI64::new(abi::sched::DEFAULT),
+        sched_affinity: AtomicU64::new(u64::MAX),
+        // The first program, the one the kernel loads itself, is init:
+        // it may give any priority. Every other starts at the default,
+        // and only whoever started it can change that (SCHED_SET).
+        sched_ceiling: AtomicI64::new(if current().is_none() { abi::sched::HIGHEST } else { abi::sched::DEFAULT }),
         kill_requested: AtomicBool::new(false),
         kill_code: AtomicI64::new(abi::STOPPED),
         signals_pending: AtomicU64::new(0),
