@@ -295,9 +295,13 @@ fi
 if [ -n "${EXPECT:-}" ] && echo "$EXPECT" | grep -q "registry"; then
     # The registry was made to crash once. The one init started in its
     # place must have been told everything again: both namespaces are
-    # announced a second time.
-    [ "$(grep -c "^\[registry\] shell may ask for:" "$LOG")" -ge 2 ] || fail "the new registry was not told the shell's namespace"
-    [ "$(grep -c "^\[registry\] fs may ask for:" "$LOG")" -ge 2 ]    || fail "the new registry was not told fs's namespace"
+    # announced a second time. Counted anywhere in a line, not only at
+    # its start: another program's line can be cut in two on the serial
+    # line, its end landing first ("er[registry] fs may ask for: disk",
+    # aarch64-keys-test, journal entry NNN, bug 7) - as entry 104 found
+    # for cprimes' answers.
+    [ "$(grep -c "\[registry\] shell may ask for:" "$LOG")" -ge 2 ] || fail "the new registry was not told the shell's namespace"
+    [ "$(grep -c "\[registry\] fs may ask for:" "$LOG")" -ge 2 ]    || fail "the new registry was not told fs's namespace"
 fi
 if [ -n "${EXPECT:-}" ]; then
     # The output of the commands typed: each pattern must appear.
