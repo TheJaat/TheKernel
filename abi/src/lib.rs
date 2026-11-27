@@ -2718,6 +2718,27 @@ mod tests {
         assert_eq!(Pointer::from_message(&outside), None);
     }
 
+    // K42's KEY message, byte for byte as display.rs reads it (KEY, the
+    // code u16 LE, 1 down / 0 up). The night run's coverage floor found
+    // it untested (kernel/abi 86.6% < 87%, 2026-11-28).
+    #[test]
+    fn a_key_message_is_its_code_and_whether_down() {
+        use crate::display::{key_message, KEY, KEY_SIZE};
+        assert_eq!(key_message(42, true), [KEY, 42, 0, 1]);
+        assert_eq!(key_message(29, false), [KEY, 29, 0, 0]);
+        // Codes past 255 (KEY_OK is 352): the high byte second.
+        assert_eq!(key_message(0x0160, true), [KEY, 0x60, 0x01, 1]);
+        assert_eq!(key_message(u16::MAX, false), [KEY, 0xFF, 0xFF, 0]);
+        for (code, down) in [(0u16, false), (30, true), (0x1234, true), (u16::MAX, true)] {
+            let message = key_message(code, down);
+            assert_eq!(message.len(), KEY_SIZE);
+            assert_eq!(message[0], KEY);
+            assert!(message[3] <= 1);
+            assert_eq!(u16::from_le_bytes([message[1], message[2]]), code);
+            assert_eq!(message[3] == 1, down);
+        }
+    }
+
     #[test]
     fn power_info_survives_the_trip_through_bytes() {
         use crate::{power, PowerInfo};
