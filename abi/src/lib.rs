@@ -281,14 +281,14 @@ pub mod call {
     /// own, else a process handle with KILL: whoever started it). A
     /// priority or ceiling more important than the caller's own ceiling
     /// is AccessDenied; an affinity with no CPU there is, InvalidArgument
-    /// (journal entry NNN).
+    /// (journal entry 123).
     pub const SCHED_SET: u64 = 45;
     /// sched_get(target, id, what) - what SCHED_SET sets, read back; and
     /// sched::THREAD_ID, the calling thread's own number.
     pub const SCHED_GET: u64 = 46;
 }
 
-/// SCHED_SET's and SCHED_GET's words (journal entry NNN). Priorities run
+/// SCHED_SET's and SCHED_GET's words (journal entry 123). Priorities run
 /// from HIGHEST (-20, the most important) to LOWEST (19), DEFAULT 0, as
 /// `nice` counts; in the calls they travel as levels, 0 to 39 (`level`,
 /// `priority`), so that no value looks like an error.

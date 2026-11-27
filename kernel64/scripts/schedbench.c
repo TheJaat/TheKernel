@@ -33,7 +33,7 @@
  *             one after another, and a window from each one's own start
  *             would give the first more time alone
  *
- * And since K20 (priorities and affinity, journal entry NNN):
+ * And since K20 (priorities and affinity, journal entry 123):
  *
  *   nice      as fair, two of the four at nice 10: on one or two CPUs the
  *             two at nice 0 get the CPUs and the two at 10 next to nothing

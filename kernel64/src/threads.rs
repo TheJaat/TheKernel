@@ -235,7 +235,7 @@ pub fn process_cpu_ns() -> Option<u64> {
 /// that CPU to choose again: what the end of a system call reads before
 /// it takes the lock (`preempt_if_asked`). Without it, every call took
 /// the lock once more on its way out, about 130 ns a switch on MaK-WSL;
-/// with it, only calls that need to (journal entry NNN).
+/// with it, only calls that need to (journal entry 123).
 static ASKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
@@ -385,7 +385,7 @@ pub fn cpus() -> usize {
     with(|t| t.policy.cpu_count())
 }
 
-/// Gives thread `id` a new priority (journal entry NNN). A thread more
+/// Gives thread `id` a new priority (journal entry 123). A thread more
 /// important than one running somewhere it may use takes that CPU: this
 /// one when the call returns (syscall.rs), another by an interrupt.
 pub fn set_priority(id: ThreadId, priority: i64) -> bool {

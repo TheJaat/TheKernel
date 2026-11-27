@@ -437,7 +437,7 @@ fn sched_affinity(value: u64) -> Result<u64, Error> {
     if value & there == 0 { Err(Error::InvalidArgument) } else { Ok(value & there) }
 }
 
-/// SCHED_SET (journal entry NNN): a thread's or a process's priority or
+/// SCHED_SET (journal entry 123): a thread's or a process's priority or
 /// CPUs, or a process's ceiling. Nothing more important than the
 /// caller's own ceiling can be given, to anyone: a program cannot start
 /// a child and make it more important than itself is allowed to be.
