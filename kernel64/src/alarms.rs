@@ -54,7 +54,10 @@ pub fn set(nanoseconds: u64, interval: u64, keep: u64) -> Result<u64, Error> {
     let left = {
         let mut alarms = ALARMS.lock();
         let mine = alarms.iter().position(|alarm| core::ptr::eq(alarm.process.as_ptr(), Arc::as_ptr(&me)));
-        let left = mine.map_or(0, |n| alarms[n].at.saturating_sub(now));
+        // At least 1 while it is still to ring: due, but not yet rung by
+        // the thread, is not "no alarm" - setitimer's old value would say
+        // no interval (found by clib compiled by tcc, journal entry NNN).
+        let left = mine.map_or(0, |n| alarms[n].at.saturating_sub(now).max(1));
         if keep == 1 {
             return Ok(left);
         }
