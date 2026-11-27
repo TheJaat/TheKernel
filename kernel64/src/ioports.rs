@@ -64,6 +64,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn everything_is_refused_until_allowed() {
         let mut map = PortBitmap::NONE;
         assert!((0..=u16::MAX).all(|p| !map.allows(p)));

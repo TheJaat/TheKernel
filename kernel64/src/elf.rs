@@ -371,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn no_damaged_file_panics() {
         // Every truncation of a good file, and every single byte of its
         // headers flipped: an error or a (still valid) image, never a
