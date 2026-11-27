@@ -235,7 +235,7 @@ pub mod call {
     /// `keep` 1 nothing changes - the other two are ignored - and the call
     /// only reads (getitimer). Returns the nanoseconds the earlier one had
     /// left, or 0. Each at most ALARM_MAX. Exact to the nanosecond the
-    /// timer can give since K24 (journal entry NNN), to the tick before.
+    /// timer can give since K24 (journal entry 128), to the tick before.
     pub const ALARM: u64 = 38;
     /// random(buffer, length) - fills `length` bytes at `buffer` (at
     /// most RANDOM_MAX) with random bytes from the kernel's generator
@@ -292,7 +292,7 @@ pub mod call {
     pub const SCHED_GET: u64 = 46;
     /// sleep_until(nanoseconds) - sleeps until the monotonic clock
     /// (clock::MONOTONIC) reads at least that: to the nanosecond the
-    /// timer gives, not to the tick (K24, journal entry NNN). Interrupted
+    /// timer gives, not to the tick (K24, journal entry 128). Interrupted
     /// if a caught signal or a kill cuts it short; 0 at once if the time
     /// has passed.
     pub const SLEEP_UNTIL: u64 = 47;

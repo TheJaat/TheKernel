@@ -32,7 +32,7 @@ static INTERVAL: AtomicU64 = AtomicU64::new(0);
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// Per CPU: when its next tick is due, and what its compare value is
 /// now - that tick, or a sleeper's time before it (K24, journal entry
-/// NNN). Only that CPU writes them, with interrupts masked.
+/// 128). Only that CPU writes them, with interrupts masked.
 static NEXT_TICK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static ARMED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// The timer's interrupt number; 0 until `init`.

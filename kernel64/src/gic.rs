@@ -253,7 +253,7 @@ pub fn next_deadline(deadline: u64, now: u64, interval: u64) -> (u64, u64) {
 }
 
 /// A one-shot timer's interrupt, when the counter reads `now` and the
-/// next tick was due at `next_tick` (K24, journal entry NNN): how many
+/// next tick was due at `next_tick` (K24, journal entry 128): how many
 /// ticks have come (0 if this is an early interrupt, for a sleeper),
 /// and when the next tick is due. The timer is set again each time, for
 /// the next tick or a sleeper before it, whichever is first.

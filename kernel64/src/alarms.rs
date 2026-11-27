@@ -9,7 +9,7 @@
 //! Why a thread, and not the timer interrupt: sending a signal can wake
 //! threads and end a process, and wants locks the interrupt may already
 //! be inside (the scheduler's); and an alarm only needs to be as exact
-//! as the timer: since K24 (journal entry NNN) the thread sleeps to the
+//! as the timer: since K24 (journal entry 128) the thread sleeps to the
 //! nanosecond, as alarms are kept, so an alarm rings as soon as a timer
 //! interrupt can say so - not at the next tick. The thread starts at
 //! boot (`start`), and waits blocked until an alarm is set.
@@ -56,7 +56,7 @@ pub fn set(nanoseconds: u64, interval: u64, keep: u64) -> Result<u64, Error> {
         let mine = alarms.iter().position(|alarm| core::ptr::eq(alarm.process.as_ptr(), Arc::as_ptr(&me)));
         // At least 1 while it is still to ring: due, but not yet rung by
         // the thread, is not "no alarm" - setitimer's old value would say
-        // no interval (found by clib compiled by tcc, journal entry NNN).
+        // no interval (found by clib compiled by tcc, journal entry 128).
         let left = mine.map_or(0, |n| alarms[n].at.saturating_sub(now).max(1));
         if keep == 1 {
             return Ok(left);
@@ -79,7 +79,7 @@ pub fn set(nanoseconds: u64, interval: u64, keep: u64) -> Result<u64, Error> {
 }
 
 /// Starts the "alarms" thread, if it has not started. At boot, before
-/// init (journal entry NNN): it used to start with the first alarm, so
+/// init (journal entry 128): it used to start with the first alarm, so
 /// that a system none set never had it; but then the first program that
 /// set one left a thread behind that was not there before - which the
 /// boot test's "ps before and after" counts as a leak. Waiting, it costs

@@ -434,7 +434,7 @@ fn announce(state: State) {
 const TICK_NS: u64 = 1_000_000_000 / interrupts::HZ;
 
 /// Now, as sleepers' deadlines are kept: nanoseconds since the clock
-/// started (K24, journal entry NNN) - before it starts, the ticks so far
+/// started (K24, journal entry 128) - before it starts, the ticks so far
 /// in nanoseconds, which is the same scale.
 pub fn now_ns() -> u64 {
     if crate::clock::started() {
@@ -480,7 +480,7 @@ pub fn sleep(ticks: u64) -> bool {
 
 /// Sleeps until the clock reads `until` nanoseconds (`now_ns`), as
 /// `sleep` does: cut short by a kill or a caught signal. Returns whether
-/// the time came (K24, journal entry NNN).
+/// the time came (K24, journal entry 128).
 pub fn sleep_until_ns(until: u64) -> bool {
     let were_enabled = arch::disable_interrupts();
     announce(State::Sleeping(until));
@@ -869,7 +869,7 @@ pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, condition: i
 }
 
 /// `wait_any_until`, the deadline in nanoseconds of the clock (`now_ns`)
-/// rather than a tick (K24, journal entry NNN).
+/// rather than a tick (K24, journal entry 128).
 pub fn wait_any_until_ns(queues: &[&WaitQueue], deadline: Option<u64>, mut condition: impl FnMut() -> bool) -> Waited {
     loop {
         // Interrupts off from here to the switch: this thread must not

@@ -370,7 +370,7 @@ pub fn selftest_interrupts() {
     // 2. Masked for 35 ms: three ticks' worth. No interrupt may arrive;
     // and once unmasked, the one that was waiting must come at once, and
     // the tick count must have all three. (Since K24 the count is read
-    // from the counter - journal entry NNN - so it has them even before
+    // from the counter - journal entry 128 - so it has them even before
     // that interrupt; what the interrupt still does is wake sleepers.)
     let taken = timer::interrupts_taken();
     disable_interrupts();

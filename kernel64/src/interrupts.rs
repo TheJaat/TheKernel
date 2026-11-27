@@ -69,7 +69,7 @@ pub fn interrupt_done() {
 /// The tick count, now. Read from the counter, not left at what the boot
 /// CPU's last interrupt wrote: a sleeper woken by its own CPU's timer, a
 /// hair before the boot CPU's tick, must not find the count a tick short
-/// (K24, journal entry NNN). It never goes back, whichever CPU reads it.
+/// (K24, journal entry 128). It never goes back, whichever CPU reads it.
 pub fn ticks() -> u64 {
     if crate::clock::started() {
         let counted = crate::clock::ticks();

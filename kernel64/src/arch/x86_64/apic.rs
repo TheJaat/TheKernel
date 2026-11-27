@@ -161,7 +161,7 @@ pub fn stated_frequencies() -> Option<(u64, u64)> {
 }
 
 /// Makes the timer one-shot, raising `vector` when a count set by
-/// `set_timer` runs out. It was periodic until K24 (journal entry NNN):
+/// `set_timer` runs out. It was periodic until K24 (journal entry 128):
 /// one-shot, it is set each time for the next tick or for a sleeper due
 /// before it, whichever is first (platform.rs).
 pub fn start_timer(vector: u8) {

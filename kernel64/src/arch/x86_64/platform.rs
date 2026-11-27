@@ -138,7 +138,7 @@ pub unsafe fn init(madt: &Madt, hz: u64) -> Report {
     report
 }
 
-// ---- The timer, one-shot (K24, journal entry NNN) -----------------------
+// ---- The timer, one-shot (K24, journal entry 128) -----------------------
 //
 // Each CPU's local APIC timer interrupts once, and is set again at every
 // interrupt: for its next tick (every TICK_TSC of the time-stamp

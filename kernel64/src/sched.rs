@@ -217,7 +217,7 @@ pub struct Scheduler {
     ready: Ready,
     /// The sleepers, one set per CPU - the CPU each went to sleep on -
     /// sorted by when they wake (then by number): a tick looks at the
-    /// first, not at every thread (K96, journal entry NNN), and each CPU
+    /// first, not at every thread (K96, journal entry 128), and each CPU
     /// can set its timer for its own first sleeper, so that a sleep costs
     /// one interrupt, not one on every CPU (K24). Kept by `set_state`,
     /// the only way a state changes once a thread is added, so together

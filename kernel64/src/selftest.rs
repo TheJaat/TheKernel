@@ -205,7 +205,7 @@ pub fn timer() {
         monotonic / 1_000_000
     );
 
-    // Late interrupts (J53, journal entry NNN). A virtual machine whose
+    // Late interrupts (J53, journal entry 128). A virtual machine whose
     // host is busy delivers timer interrupts late, two or three at once
     // as one; the tick count must keep the time all the same - it is
     // read from the counter (clock.rs), not counted from interrupts. Here
