@@ -10,11 +10,11 @@
 //! number of CPUs:
 //!   - each thread has a priority, from HIGHEST (-20) to LOWEST (19),
 //!     DEFAULT 0, and an affinity: the CPUs it may run on (journal entry
-//!     124). Runnable threads wait in ONE set of FIFO queues, one per
-//!     priority, shared by all CPUs: a CPU that needs a thread takes the
-//!     most important one allowed on it, and of those the one that has
-//!     waited longest. Work spreads over the CPUs by itself, and a
-//!     thread runs on whichever allowed CPU is free.
+//!     124). Runnable threads wait in a queue per CPU (K68, journal entry
+//!     129), a FIFO per priority in each. A CPU that needs a thread takes
+//!     the most important one allowed on it, from any CPU's queue, and of
+//!     those the one that joined a queue first: as fair as one queue for
+//!     all, and an idle CPU takes work from a busy one.
 //!   - each CPU has a running thread, which gets SLICE timer ticks;
 //!     when they run out and someone at least as important is waiting,
 //!     it goes to the back of its queue. A less important thread never
@@ -27,25 +27,82 @@
 //!     another), rather than the thread waiting out a slice
 //!   - a thread can also give up the CPU early (yield), sleep until a
 //!     tick, block until woken, or exit
-//!   - each CPU has an idle thread, which runs only when the queue is
-//!     empty. It never sits in the queue, and never runs on another CPU.
+//!   - each CPU has an idle thread, which runs only when nothing else
+//!     may. It never sits in a queue, and never runs on another CPU.
 //!
 //! One rule exists only because there is more than one CPU. A thread
 //! that has said it will block is, for a moment, still running: it has
 //! changed its state but not yet left its CPU. If it is woken in that
-//! moment it must NOT go into the queue - another CPU would take it
-//! from there and run it while the first CPU is still on its stack. It
-//! simply becomes Running again, and when it gets to the switch it
-//! finds it has no reason to leave. So: only a thread that is on no
-//! CPU is ever in the queue.
+//! moment it must NOT go into a queue - another CPU would take it from
+//! there and run it while the first CPU is still on its stack. It simply
+//! becomes runnable again, and when it gets to the switch it finds it
+//! has no reason to leave.
 //!
-//! Nothing here locks anything. The caller holds one lock around every
-//! call, and - this matters - keeps holding it across the switch that
-//! `pick_next` asks for, so that no other CPU can act on a decision
-//! that has been made but not yet carried out.
+//! ## Locks (K193, journal entry NNN)
+//!
+//! Until K193 the caller held one lock around every call here, on every
+//! CPU, and across every switch. Now the policy locks for itself, and
+//! finely, so that two CPUs share a lock only when they touch the same
+//! thing:
+//!
+//! - **each CPU's lock** covers its queue, the thread on it, its slice,
+//!   and `rq` of every thread it runs or queues (below). A switch takes
+//!   only its own CPU's lock - unless it takes a thread from another
+//!   CPU's queue, and then that one's too, for a moment;
+//! - **each CPU's sleepers** have a small lock of their own;
+//! - **each thread's settings lock** is taken by whoever changes the
+//!   thread from outside - a wake-up, a new priority. Two CPUs waking the
+//!   same thread take turns, so it is queued once;
+//! - **the directory** (thread number to its record) is locked only for
+//!   a look-up, an addition or a removal - never while deciding.
+//!
+//! The order, so that no two CPUs ever wait for each other: a thread's
+//! settings, then one CPU's lock, then (sleepers aside) nothing. A
+//! second CPU's lock is waited for only if its number is higher than the
+//! one held; a lower one is only *tried*, a few times, and passed over if
+//! busy. Somebody holding a higher-numbered lock never waits for a lower
+//! one, so whoever waits for a higher one is waiting for somebody who
+//! will finish. A CPU that passes a queue over asks itself to choose
+//! again (`reschedule`), and the mechanism does so at once, its own lock
+//! let go (threads.rs, `schedule`): kept for a whole new slice instead,
+//! a woken thread waited for the one CPU whose queue it was in.
+//!
+//! **Peeking** (the user's choice for K193, 2026-11-27). Choosing
+//! FIFO across every queue used to read every queue under the one lock.
+//! Now each queue *publishes* the key of its first thread - its priority
+//! level and when it joined - in an atomic, after every change, under its
+//! lock. A choosing CPU reads the published keys of the others without
+//! their locks, compares them with its own queue's best, and locks only
+//! the queue it then takes from, where it checks again. The choice is
+//! exact unless two CPUs change queues at the same instant; then it can
+//! be one thread off, never one that must not run.
+//!
+//! **Nobody sleeps with work waiting** - the same race as rule 2 of
+//! threads.rs, between CPUs. A CPU about to idle says so (`idling`)
+//! *before* it looks at the queues one last time; a thread queued says
+//! so (its queue's published key) *before* it looks for an idling CPU to
+//! tell. Both are sequentially consistent, so at least one of them sees
+//! the other: the idler finds the thread, or the queuer interrupts the
+//! idler.
+//!
+//! **A thread leaves its CPU after it is queued.** A thread that gives
+//! way is queued at once, before its CPU has saved its registers; the
+//! one lock held across the switch (rule 1) used to stop another CPU
+//! from taking it in that moment. Now the mechanism keeps a "leaving"
+//! flag per thread, set when it is switched from and cleared once its
+//! registers are saved; a CPU that took it waits for the flag before it
+//! loads them (threads.rs, `schedule`). The policy needs nothing for it.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::sync::Arc;
+#[cfg(test)]
 use alloc::vec::Vec;
+use core::hint;
+use core::sync::atomic::{fence, AtomicBool, AtomicI8, AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
+
+use crate::smp::MAX_CPUS;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 pub type ThreadId = u64;
 
@@ -74,25 +131,111 @@ const LEVELS: usize = (LOWEST - HIGHEST + 1) as usize;
 /// Every CPU, as an affinity.
 pub const ANY_CPU: u64 = u64::MAX;
 
-/// What a thread asks of the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Attributes {
+/// What an idle thread counts as, against a priority: less important
+/// than any, so that anyone ready may take its CPU.
+const IDLE_PRIORITY: Priority = LOWEST + 1;
+
+/// `rq` of a thread that is on no CPU and in no queue.
+const NOWHERE: usize = usize::MAX;
+
+/// A thread's `kind`: what it is doing as far as choosing is concerned.
+/// Ready and Running are one kind, as in Linux: which of the two a thread
+/// is depends on where it is (`rq`, the CPU's current thread), which the
+/// CPU's lock covers - not on something a waker would have to change
+/// under that lock.
+const RUNNABLE: u8 = 0;
+const BLOCKED: u8 = 1;
+const SLEEPING: u8 = 2;
+const EXITED: u8 = 3;
+
+/// What only the thread itself, and whoever holds its settings lock,
+/// changes.
+struct Settings {
     priority: Priority,
     /// One bit per CPU it may run on.
     affinity: u64,
     /// The CPU it last left to wait (K101): where its data may still be
     /// in the cache, and where it is put back when woken, if it may.
     last: usize,
+    /// While Sleeping: until when, and the CPU whose set it is in.
+    until: u64,
+    asleep_on: usize,
 }
 
+/// What the scheduler keeps for each thread.
+struct Rec {
+    id: ThreadId,
+    /// An idle thread: never queued, on one CPU only, no settings.
+    idle: bool,
+    /// What the mechanism gave to find its own record of the thread
+    /// without a look-up (threads.rs: the address of its `Thread`). Set
+    /// before the thread is first queued, never changed.
+    handle: usize,
+    /// RUNNABLE, BLOCKED, SLEEPING or EXITED. Changed by the thread
+    /// itself (to wait, or to take a wait back), and by a waker holding
+    /// `settings` (back to RUNNABLE). The CPU it runs on reads it when
+    /// choosing, under that CPU's lock only.
+    kind: AtomicU8,
+    /// The CPU whose lock covers where the thread is: the one it runs on
+    /// or whose queue it waits in; NOWHERE if it is in neither. Changed
+    /// only by someone holding that CPU's lock (and, when the thread
+    /// moves, the other CPU's too): so a reader that locks the CPU it
+    /// read here, and finds the same number again, has it fixed.
+    rq: AtomicUsize,
+    settings: SpinLock<Settings>,
+}
+
+impl Rec {
+    fn new(id: ThreadId, priority: Priority, affinity: u64, last: usize, handle: usize) -> Arc<Rec> {
+        let settings = Settings { priority, affinity, last, until: 0, asleep_on: 0 };
+        Arc::new(Rec {
+            id,
+            idle: false,
+            handle,
+            kind: AtomicU8::new(RUNNABLE),
+            rq: AtomicUsize::new(NOWHERE),
+            settings: SpinLock::new(settings),
+        })
+    }
+
+    fn idle(id: ThreadId, cpu: usize, handle: usize) -> Arc<Rec> {
+        let settings = Settings { priority: IDLE_PRIORITY, affinity: 1 << cpu, last: cpu, until: 0, asleep_on: 0 };
+        Arc::new(Rec {
+            id,
+            idle: true,
+            handle,
+            kind: AtomicU8::new(RUNNABLE),
+            rq: AtomicUsize::new(cpu),
+            settings: SpinLock::new(settings),
+        })
+    }
+}
+
+/// One queued thread: its record, the affinity it was queued with (so
+/// that choosing looks nothing up) and when it joined.
+struct Entry {
+    rec: Arc<Rec>,
+    affinity: u64,
+    joined: u64,
+}
+
+/// A key to compare queued threads by, the smaller first: the priority
+/// level in the top byte, when it joined below. What a queue publishes.
+fn key(level: usize, joined: u64) -> u64 {
+    ((level as u64) << 56) | (joined & ((1 << 56) - 1))
+}
+
+fn level_of_key(key: u64) -> usize {
+    (key >> 56) as usize
+}
+
+/// The key of an empty queue: after every other.
+const EMPTY: u64 = u64::MAX;
+
 /// One CPU's runnable threads that are on no CPU: a FIFO queue per
-/// priority, the most important first. Each entry carries its thread's
-/// affinity, so that choosing - the scheduler's hottest path - looks
-/// nothing up.
+/// priority, the most important first.
 pub struct Queue {
-    /// (thread, affinity, when it joined: `Ready`'s count, for FIFO
-    /// order across the CPUs' queues).
-    levels: [VecDeque<(ThreadId, u64, u64)>; LEVELS],
+    levels: [VecDeque<Entry>; LEVELS],
     /// One bit per level that has anyone in it, so that finding the
     /// first is one instruction (trailing_zeros), not forty looks.
     occupied: u64,
@@ -105,9 +248,9 @@ impl Queue {
         Queue { levels: core::array::from_fn(|_| VecDeque::new()), occupied: 0, count: 0 }
     }
 
-    fn push_back(&mut self, id: ThreadId, priority: Priority, affinity: u64, joined: u64) {
+    fn push_back(&mut self, entry: Entry, priority: Priority) {
         let level = level(priority);
-        self.levels[level].push_back((id, affinity, joined));
+        self.levels[level].push_back(entry);
         self.occupied |= 1 << level;
         self.count += 1;
     }
@@ -120,28 +263,27 @@ impl Queue {
         }
     }
 
-    /// Takes `id` out, wherever it is; false if it was not there.
-    fn remove(&mut self, id: ThreadId) -> bool {
+    /// Takes `id` out, wherever it is.
+    fn remove(&mut self, id: ThreadId) -> Option<Entry> {
         for level in 0..LEVELS {
-            if let Some(at) = self.levels[level].iter().position(|&(other, _, _)| other == id) {
-                self.levels[level].remove(at);
+            if let Some(at) = self.levels[level].iter().position(|entry| entry.rec.id == id) {
+                let entry = self.levels[level].remove(at);
                 self.update(level);
-                return true;
+                return entry;
             }
         }
-        false
+        None
     }
 
-
     /// Where the thread `cpu` would take next is: its priority's level
-    /// and its place there - the most important allowed on `cpu`, the
-    /// longest waiting of those.
-    fn best_for(&self, cpu: usize) -> Option<(usize, usize)> {
+    /// and its place there - the most important allowed on `cpu`, no
+    /// less important than `max` (a level), the longest waiting of those.
+    fn best_for(&self, cpu: usize, max: usize) -> Option<(usize, usize)> {
         let bit = 1u64 << cpu;
-        let mut left = self.occupied;
+        let mut left = self.occupied & (u64::MAX >> (63 - max));
         while left != 0 {
             let level = left.trailing_zeros() as usize;
-            if let Some(at) = self.levels[level].iter().position(|&(_, affinity, _)| affinity & bit != 0) {
+            if let Some(at) = self.levels[level].iter().position(|entry| entry.affinity & bit != 0) {
                 return Some((level, at));
             }
             left &= left - 1;
@@ -149,116 +291,31 @@ impl Queue {
         None
     }
 
-    /// Takes the thread at `place` out: it, its priority and affinity.
-    fn take(&mut self, (level, at): (usize, usize)) -> (ThreadId, Priority, u64) {
-        let (id, affinity, _) = self.levels[level].remove(at).expect("best_for's place");
+    fn key_at(&self, (level, at): (usize, usize)) -> u64 {
+        key(level, self.levels[level][at].joined)
+    }
+
+    /// The key of the first thread, whoever may run it: what is published.
+    fn head(&self) -> u64 {
+        if self.occupied == 0 {
+            return EMPTY;
+        }
+        let level = self.occupied.trailing_zeros() as usize;
+        key(level, self.levels[level][0].joined)
+    }
+
+    /// Takes the thread at `place` out: it, and its priority.
+    fn take(&mut self, (level, at): (usize, usize)) -> (Entry, Priority) {
+        let entry = self.levels[level].remove(at).expect("best_for's place");
         self.update(level);
-        (id, priority_of(level), affinity)
-    }
-
-
-    pub fn contains(&self, id: &ThreadId) -> bool {
-        self.levels.iter().any(|queue| queue.iter().any(|(other, _, _)| other == id))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.occupied == 0
-    }
-
-    pub fn len(&self) -> usize {
-        self.count
+        (entry, priority_of(level))
     }
 
     /// In the order they would be taken: the most important first, and
     /// within a priority the longest waiting first.
-    pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
-        self.levels.iter().flatten().map(|(id, _, _)| id)
-    }
-}
-
-/// The runnable threads that are on no CPU: a queue per CPU (K68,
-/// journal entry 129). A thread waits in one CPU's queue - the CPU that
-/// is to take it, or the one it last ran on (K101) - and that CPU takes
-/// from its own queue first. Priorities stay strict across the machine:
-/// a CPU takes a thread from another CPU's queue when it is more
-/// important than anything in its own, or when its own has nothing it
-/// may run - an idle CPU takes work from a busy one.
-pub struct Ready {
-    queues: Vec<Queue>,
-    /// Counts every thread that joins a queue: among equally important
-    /// threads, the one that joined first is taken first, whichever
-    /// CPU's queue it waits in.
-    joined: u64,
-}
-
-impl Ready {
-    fn new() -> Ready {
-        Ready { queues: alloc::vec![Queue::new()], joined: 0 }
-    }
-
-    fn add_cpu(&mut self) {
-        self.queues.push(Queue::new());
-    }
-
-    fn push(&mut self, on: usize, id: ThreadId, priority: Priority, affinity: u64) {
-        self.joined += 1;
-        self.queues[on].push_back(id, priority, affinity, self.joined);
-    }
-
-    /// Takes `id` out, wherever it is; the queue it was in.
-    fn remove(&mut self, id: ThreadId) -> Option<usize> {
-        self.queues.iter_mut().position(|queue| queue.remove(id))
-    }
-
-    /// Where the thread `cpu` would take next is - its queue, its level
-    /// and its place there: the most important allowed on `cpu` in any
-    /// queue; among equals, the one that joined first, whichever queue
-    /// it is in. As fair as one queue for all: a CPU taking from its own
-    /// queue first among equals let a thread keep a CPU nearly to itself
-    /// (journal entry 129, bug 1).
-    fn best_for(&self, cpu: usize) -> Option<(usize, usize, usize)> {
-        let mut best: Option<(usize, usize, usize, u64)> = None;
-        for (q, queue) in self.queues.iter().enumerate() {
-            if let Some((level, at)) = queue.best_for(cpu) {
-                let joined = queue.levels[level][at].2;
-                if best.is_none_or(|(_, so_far, _, first)| level < so_far || (level == so_far && joined < first)) {
-                    best = Some((q, level, at, joined));
-                }
-            }
-        }
-        best.map(|(q, level, at, _)| (q, level, at))
-    }
-
-    /// Takes the thread at `place` out: it, its priority and affinity.
-    fn take(&mut self, (q, level, at): (usize, usize, usize)) -> (ThreadId, Priority, u64) {
-        self.queues[q].take((level, at))
-    }
-
-    /// How many wait in `cpu`'s queue.
-    fn waiting_on(&self, cpu: usize) -> usize {
-        self.queues[cpu].len()
-    }
-
     #[cfg(test)]
-    fn get(&self, (q, level, at): (usize, usize, usize)) -> ThreadId {
-        self.queues[q].levels[level][at].0
-    }
-
-    pub fn contains(&self, id: &ThreadId) -> bool {
-        self.queues.iter().any(|queue| queue.contains(id))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queues.iter().all(Queue::is_empty)
-    }
-
-    pub fn len(&self) -> usize {
-        self.queues.iter().map(Queue::len).sum()
-    }
-
-    /// Every queued thread: CPU 0's queue in its order, then CPU 1's...
-    pub fn iter(&self) -> impl Iterator<Item = &ThreadId> {
-        self.queues.iter().flat_map(Queue::iter)
+    fn ids(&self) -> impl Iterator<Item = ThreadId> + '_ {
+        self.levels.iter().flatten().map(|entry| entry.rec.id)
     }
 }
 
@@ -270,49 +327,129 @@ fn priority_of(level: usize) -> Priority {
     level as Priority + HIGHEST
 }
 
-/// What an idle thread counts as, against a priority: less important
-/// than any, so that anyone ready may take its CPU.
-const IDLE_PRIORITY: Priority = LOWEST + 1;
+fn bit(cpu: usize) -> u64 {
+    1u64 << cpu
+}
 
-/// What the scheduler keeps for each CPU.
-struct Cpu {
+/// What one CPU's lock covers.
+struct Local {
+    queue: Queue,
     /// The thread on this CPU now - until the next `pick_next`, even if
     /// it has already said it will sleep, block or exit.
-    current: ThreadId,
-    idle: ThreadId,
+    current: Arc<Rec>,
+    idle: Arc<Rec>,
     slice_left: u64,
-    /// Set when this CPU should choose again as soon as possible - a
-    /// wakeup while it idles, or the end of a slice. On an idling CPU
-    /// it is also a promise: a thread in the queue has been offered to
-    /// this CPU, so the next one is offered to somebody else.
-    reschedule: bool,
     /// The current thread's priority (IDLE_PRIORITY for the idle
     /// thread) and affinity, kept here so that a switch looks nothing up.
     priority: Priority,
     affinity: u64,
 }
 
+/// What the scheduler keeps for each CPU: what its lock covers, and what
+/// it publishes for the other CPUs to read without it.
+struct Cpu {
+    local: SpinLock<Option<Local>>,
+    /// The sleepers that went to sleep on this CPU, sorted by when they
+    /// wake (then by number): a tick looks at the first, not at every
+    /// thread (K96, journal entry 128), and each CPU can set its timer
+    /// for its own first sleeper, so that a sleep costs one interrupt,
+    /// not one on every CPU (K24).
+    sleepers: SpinLock<BTreeSet<(u64, ThreadId)>>,
+    /// Published under `local`'s lock, after every change: its queue's
+    /// first key (EMPTY if none), and how many wait there.
+    head: AtomicU64,
+    waiting: AtomicUsize,
+    /// Published under the lock at every switch: the thread on it, its
+    /// priority, and whether it idles.
+    current: AtomicU64,
+    priority: AtomicI8,
+    idling: AtomicBool,
+    /// Its idle thread's number (fixed once the CPU is added).
+    idle: AtomicU64,
+    /// Set when this CPU should choose again as soon as possible - a
+    /// wakeup while it idles, or the end of a slice. On an idling CPU
+    /// it is also a promise: a queued thread has been offered to this
+    /// CPU, so the next one is offered to somebody else. Anyone may set
+    /// it; only the CPU clears it.
+    reschedule: AtomicBool,
+}
+
+impl Cpu {
+    fn new() -> Cpu {
+        Cpu {
+            local: SpinLock::new(None),
+            sleepers: SpinLock::new(BTreeSet::new()),
+            head: AtomicU64::new(EMPTY),
+            waiting: AtomicUsize::new(0),
+            current: AtomicU64::new(u64::MAX),
+            priority: AtomicI8::new(IDLE_PRIORITY),
+            idling: AtomicBool::new(false),
+            idle: AtomicU64::new(u64::MAX),
+            reschedule: AtomicBool::new(false),
+        }
+    }
+}
+
+type Guard<'a> = SpinLockGuard<'a, Option<Local>>;
+
+fn local<'a>(guard: &'a mut Guard<'_>) -> &'a mut Local {
+    guard.as_mut().expect("a CPU that was never added")
+}
+
+/// Nothing in the kernel. In the host tests, where two CPUs race -
+/// between looking and saying so - a moment's pause, so that the
+/// CPUs-at-once tests meet the bad order often rather than once in
+/// millions; or, if a test has set one for this `site`, what another CPU
+/// does at exactly that moment (`at_race`), once.
+#[inline(always)]
+fn race_window(site: &'static str) {
+    #[cfg(test)]
+    {
+        let hook = RACE.with(|race| {
+            let mut race = race.borrow_mut();
+            if race.as_ref().is_some_and(|(at, _)| *at == site) { race.take() } else { None }
+        });
+        match hook {
+            Some((_, act)) => act(),
+            None => std::thread::yield_now(),
+        }
+    }
+    #[cfg(not(test))]
+    let _ = site;
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RACE: core::cell::RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { core::cell::RefCell::new(None) };
+}
+
+/// For the host tests: `act` is done the next time this host thread
+/// reaches `race_window(site)`.
+#[cfg(test)]
+fn at_race(site: &'static str, act: impl FnOnce() + 'static) {
+    RACE.with(|race| *race.borrow_mut() = Some((site, Box::new(act))));
+}
+
+/// How often a busy lower-numbered CPU's lock is tried before it is
+/// passed over (see "Locks" above).
+const TRIES: usize = 64;
+
 pub struct Scheduler {
-    states: BTreeMap<ThreadId, State>,
-    /// Each thread's priority and affinity; an idle thread has none.
-    attributes: BTreeMap<ThreadId, Attributes>,
-    ready: Ready,
-    /// The sleepers, one set per CPU - the CPU each went to sleep on -
-    /// sorted by when they wake (then by number): a tick looks at the
-    /// first, not at every thread (K96, journal entry 128), and each CPU
-    /// can set its timer for its own first sleeper, so that a sleep costs
-    /// one interrupt, not one on every CPU (K24). Kept by `set_state`,
-    /// the only way a state changes once a thread is added, so together
-    /// they hold exactly the Sleeping threads; `asleep_on` says which
-    /// set each is in.
-    sleepers: Vec<BTreeSet<(u64, ThreadId)>>,
-    asleep_on: BTreeMap<ThreadId, usize>,
-    cpus: Vec<Cpu>,
+    /// MAX_CPUS of them from the start, so that adding a CPU moves
+    /// nothing another CPU may be reading; `count` of them in use.
+    cpus: Box<[Cpu]>,
+    count: AtomicUsize,
+    /// Every thread's record, by number.
+    threads: SpinLock<BTreeMap<ThreadId, Arc<Rec>>>,
+    /// Counts every thread that joins a queue: among equally important
+    /// threads, the one that joined first is taken first, whichever
+    /// CPU's queue it waits in.
+    joined: AtomicU64,
     /// The CPUs that must be interrupted, one bit each: idling CPUs
     /// that were offered a thread by another CPU and cannot know it.
     /// The policy cannot interrupt anyone; the caller collects this
     /// with `take_pokes` and does.
-    pokes: u64,
+    pokes: AtomicU64,
 }
 
 /// A switch the caller must carry out.
@@ -333,178 +470,251 @@ impl Scheduler {
     /// thread) and `idle` waiting in the wings for when nothing else
     /// can run.
     pub fn with_running(idle: ThreadId, running: ThreadId) -> Scheduler {
-        let mut states = BTreeMap::new();
-        states.insert(idle, State::Ready); // ready, but never queued
-        states.insert(running, State::Running);
-        let priority = if running == idle { IDLE_PRIORITY } else { DEFAULT };
-        let cpu = Cpu { current: running, idle, slice_left: SLICE, reschedule: false, priority, affinity: ANY_CPU };
-        let mut attributes = BTreeMap::new();
-        if running != idle {
-            attributes.insert(running, Attributes { priority: DEFAULT, affinity: ANY_CPU, last: 0 });
-        }
-        Scheduler { states, attributes, ready: Ready::new(), sleepers: alloc::vec![BTreeSet::new()], asleep_on: BTreeMap::new(), cpus: alloc::vec![cpu], pokes: 0 }
+        Scheduler::with_running_handles(idle, 0, running, 0)
+    }
+
+    /// `with_running`, with the mechanism's handles of the two threads.
+    pub fn with_running_handles(idle: ThreadId, idle_handle: usize, running: ThreadId, running_handle: usize) -> Scheduler {
+        let s = Scheduler {
+            cpus: (0..MAX_CPUS).map(|_| Cpu::new()).collect(),
+            count: AtomicUsize::new(0),
+            threads: SpinLock::new(BTreeMap::new()),
+            joined: AtomicU64::new(0),
+            pokes: AtomicU64::new(0),
+        };
+        let idle_rec = Rec::idle(idle, 0, idle_handle);
+        s.threads.lock().insert(idle, idle_rec.clone());
+        let (current, priority) = if running == idle {
+            (idle_rec.clone(), IDLE_PRIORITY)
+        } else {
+            let rec = Rec::new(running, DEFAULT, ANY_CPU, 0, running_handle);
+            rec.rq.store(0, SeqCst);
+            s.threads.lock().insert(running, rec.clone());
+            (rec, DEFAULT)
+        };
+        let l = Local { queue: Queue::new(), current, idle: idle_rec, slice_left: SLICE, priority, affinity: ANY_CPU };
+        s.cpus[0].idle.store(idle, SeqCst);
+        s.publish_current(0, &l);
+        *s.cpus[0].local.lock() = Some(l);
+        s.count.store(1, SeqCst);
+        s
     }
 
     /// One more CPU, running its idle thread `idle`. Returns its number:
     /// CPUs are numbered in the order they are added, the first being 0.
-    pub fn add_cpu(&mut self, idle: ThreadId) -> usize {
-        assert!(self.states.insert(idle, State::Running).is_none(), "thread {idle} added twice");
+    /// Called before the new CPU runs anything; others may be running.
+    pub fn add_cpu(&self, idle: ThreadId) -> usize {
+        self.add_cpu_handle(idle, 0)
+    }
+
+    /// `add_cpu`, with the mechanism's handle of its idle thread.
+    pub fn add_cpu_handle(&self, idle: ThreadId, handle: usize) -> usize {
+        let cpu = self.count.load(SeqCst);
+        assert!(cpu < MAX_CPUS, "more than {MAX_CPUS} CPUs");
+        let rec = Rec::idle(idle, cpu, handle);
+        assert!(self.threads.lock().insert(idle, rec.clone()).is_none(), "thread {idle} added twice");
+        let l = Local { queue: Queue::new(), current: rec.clone(), idle: rec, slice_left: SLICE, priority: IDLE_PRIORITY, affinity: ANY_CPU };
+        let this = &self.cpus[cpu];
+        this.idle.store(idle, SeqCst);
+        self.publish_current(cpu, &l);
+        *this.local.lock() = Some(l);
         // A CPU that arrives when there is already work takes some at
         // its first chance.
-        let reschedule = !self.ready.is_empty();
-        self.ready.add_cpu();
-        self.cpus.push(Cpu { current: idle, idle, slice_left: SLICE, reschedule, priority: IDLE_PRIORITY, affinity: ANY_CPU });
-        self.sleepers.push(BTreeSet::new());
-        self.cpus.len() - 1
+        let work = (0..cpu).any(|c| self.cpus[c].head.load(SeqCst) != EMPTY);
+        this.reschedule.store(work, SeqCst);
+        self.count.store(cpu + 1, SeqCst);
+        cpu
     }
 
     pub fn cpu_count(&self) -> usize {
-        self.cpus.len()
+        self.count.load(SeqCst)
     }
 
-    /// The thread on `cpu`.
+    /// The thread on `cpu`. Exact on `cpu` itself, with interrupts off:
+    /// only `cpu` changes it.
     pub fn current(&self, cpu: usize) -> ThreadId {
-        self.cpus[cpu].current
+        self.cpus[cpu].current.load(SeqCst)
+    }
+
+    /// The mechanism's handle of the thread on `cpu` (as exact as
+    /// `current`).
+    pub fn current_handle(&self, cpu: usize) -> usize {
+        local(&mut self.cpus[cpu].local.lock()).current.handle
     }
 
     /// The CPU `id` is on, if it is on one.
     pub fn cpu_of(&self, id: ThreadId) -> Option<usize> {
-        self.cpus.iter().position(|cpu| cpu.current == id)
+        (0..self.cpu_count()).find(|&c| self.cpus[c].current.load(SeqCst) == id)
     }
 
     /// Whether `id` is some CPU's idle thread.
     pub fn is_idle(&self, id: ThreadId) -> bool {
-        self.cpus.iter().any(|cpu| cpu.idle == id)
+        (0..self.cpu_count()).any(|c| self.cpus[c].idle.load(SeqCst) == id)
+    }
+
+    fn rec(&self, id: ThreadId) -> Option<Arc<Rec>> {
+        self.threads.lock().get(&id).cloned()
     }
 
     pub fn state(&self, id: ThreadId) -> Option<State> {
-        self.states.get(&id).copied()
+        let rec = self.rec(id)?;
+        Some(match rec.kind.load(SeqCst) {
+            RUNNABLE if self.cpu_of(id).is_some() => State::Running,
+            RUNNABLE => State::Ready,
+            BLOCKED => State::Blocked,
+            SLEEPING => State::Sleeping(rec.settings.lock().until),
+            _ => State::Exited,
+        })
     }
 
     pub fn thread_count(&self) -> usize {
-        self.states.len()
+        self.threads.lock().len()
     }
 
     /// A new thread, ready to run, at the default priority on any CPU.
     /// `cpu` is the CPU this is called on: if it is idling, it should
     /// take the thread at once.
-    pub fn add(&mut self, id: ThreadId, cpu: usize) {
+    pub fn add(&self, id: ThreadId, cpu: usize) {
         self.add_with(id, cpu, DEFAULT, ANY_CPU);
     }
 
     /// A new thread, ready to run, with its priority and affinity.
-    pub fn add_with(&mut self, id: ThreadId, cpu: usize, priority: Priority, affinity: u64) {
-        assert!(self.states.insert(id, State::Ready).is_none(), "thread {id} added twice");
+    pub fn add_with(&self, id: ThreadId, cpu: usize, priority: Priority, affinity: u64) {
+        self.add_with_handle(id, cpu, priority, affinity, 0);
+    }
+
+    /// `add_with`, with the mechanism's handle of the thread: set before
+    /// it is queued, since another CPU may take it at once.
+    pub fn add_with_handle(&self, id: ThreadId, cpu: usize, priority: Priority, affinity: u64, handle: usize) {
         let priority = priority.clamp(HIGHEST, LOWEST);
-        self.attributes.insert(id, Attributes { priority, affinity, last: cpu });
-        self.enqueue(id, cpu);
+        let rec = Rec::new(id, priority, affinity, cpu, handle);
+        assert!(self.threads.lock().insert(id, rec.clone()).is_none(), "thread {id} added twice");
+        let settings = rec.settings.lock();
+        self.enqueue(&rec, &settings, cpu);
     }
 
     /// `id`'s priority; None for an idle thread or one not known.
     pub fn priority(&self, id: ThreadId) -> Option<Priority> {
-        self.attributes.get(&id).map(|a| a.priority)
+        self.rec(id).filter(|rec| !rec.idle).map(|rec| rec.settings.lock().priority)
     }
 
     /// The CPUs `id` may run on.
     pub fn affinity(&self, id: ThreadId) -> Option<u64> {
-        self.attributes.get(&id).map(|a| a.affinity)
+        self.rec(id).filter(|rec| !rec.idle).map(|rec| rec.settings.lock().affinity)
     }
 
-    /// Gives `id` a new priority. A queued thread moves to its new
-    /// queue (and may take a CPU from a less important one); a running
+    /// Gives `id` a new priority. A queued thread is queued again, as
+    /// woken (and may take a CPU from a less important one); a running
     /// one that is now less important than someone waiting for its CPU
     /// gives way at once. `cpu` is the CPU this is called on. False if
     /// `id` is not a thread here (or is an idle thread).
-    pub fn set_priority(&mut self, id: ThreadId, priority: Priority, cpu: usize) -> bool {
-        let Some(attributes) = self.attributes.get_mut(&id) else { return false };
-        attributes.priority = priority.clamp(HIGHEST, LOWEST);
-        let Attributes { priority, affinity, .. } = *attributes;
-        if let Some(was) = self.ready.remove(id) {
-            let on = self.offer(priority, affinity, cpu).unwrap_or(was);
-            self.ready.push(on, id, priority, affinity);
-        } else if let Some(on) = self.cpu_of(id) {
-            self.cpus[on].priority = priority;
-            if self.someone_waiting_for(on) {
-                self.ask(on, cpu);
-            }
-        }
-        true
+    pub fn set_priority(&self, id: ThreadId, priority: Priority, cpu: usize) -> bool {
+        self.change(id, cpu, |settings| settings.priority = priority.clamp(HIGHEST, LOWEST))
     }
 
     /// Gives `id` the CPUs it may run on, one bit each. A running thread
     /// on a CPU no longer allowed leaves it at once. The caller checks
     /// that `affinity` names a CPU there is. False as for set_priority.
-    pub fn set_affinity(&mut self, id: ThreadId, affinity: u64, cpu: usize) -> bool {
-        let Some(attributes) = self.attributes.get_mut(&id) else { return false };
-        attributes.affinity = affinity;
-        let (priority, last) = (attributes.priority, attributes.last);
-        if self.ready.remove(id).is_some() {
-            let on = self.offer(priority, affinity, cpu).unwrap_or_else(|| self.home(affinity, last));
-            self.ready.push(on, id, priority, affinity);
-        } else if let Some(on) = self.cpu_of(id) {
-            self.cpus[on].affinity = affinity;
-            if affinity & (1u64 << on) == 0 {
-                self.ask(on, cpu);
+    pub fn set_affinity(&self, id: ThreadId, affinity: u64, cpu: usize) -> bool {
+        self.change(id, cpu, |settings| settings.affinity = affinity)
+    }
+
+    /// Changes `id`'s settings, then puts right where it is: a queued
+    /// thread is taken out and queued again; the CPU running it is told
+    /// its new priority and affinity, and asked to choose again if it
+    /// should.
+    fn change(&self, id: ThreadId, cpu: usize, f: impl FnOnce(&mut Settings)) -> bool {
+        let Some(rec) = self.rec(id).filter(|rec| !rec.idle) else { return false };
+        let mut settings = rec.settings.lock();
+        f(&mut settings);
+        loop {
+            let on = rec.rq.load(SeqCst);
+            if on == NOWHERE {
+                return true; // waiting for something: it is queued with these when woken
             }
-        }
-        true
-    }
-
-    /// Whether `id` may run on `cpu`. An idle thread runs only on its
-    /// own CPU, and is never asked. (The scheduler itself reads the
-    /// affinities kept with each queued thread and each CPU.)
-    #[cfg(test)]
-    fn allowed(&self, id: ThreadId, cpu: usize) -> bool {
-        self.attributes.get(&id).is_none_or(|a| a.affinity & (1u64 << cpu) != 0)
-    }
-
-    /// The thread `cpu` would take next: the most important allowed on
-    /// it, the longest waiting of those.
-    #[cfg(test)]
-    fn best_for(&self, cpu: usize) -> Option<ThreadId> {
-        self.ready.best_for(cpu).map(|place| self.ready.get(place))
-    }
-
-    /// Whether a thread waiting may take `cpu` from its current one at
-    /// the end of a slice: one at least as important that may run there
-    /// - or anyone at all, if the current one may no longer run there.
-    fn someone_waiting_for(&self, cpu: usize) -> bool {
-        let this = &self.cpus[cpu];
-        let Some((_, level, _)) = self.ready.best_for(cpu) else { return false };
-        if this.current == this.idle || this.affinity & (1u64 << cpu) == 0 {
+            let mut guard = self.cpus[on].local.lock();
+            if rec.rq.load(SeqCst) != on {
+                continue; // it moved before the lock was had
+            }
+            let l = local(&mut guard);
+            if Arc::ptr_eq(&l.current, &rec) {
+                l.priority = settings.priority;
+                l.affinity = settings.affinity;
+                self.publish_current(on, l);
+                if settings.affinity & bit(on) == 0 || self.someone_waiting_for(on, l) {
+                    self.ask(on, cpu);
+                }
+            } else if l.queue.remove(id).is_some() {
+                self.publish(on, &l.queue);
+                rec.rq.store(NOWHERE, SeqCst);
+                drop(guard);
+                self.enqueue(&rec, &settings, cpu);
+            }
             return true;
         }
-        priority_of(level) <= this.priority
+    }
+
+    /// Whether a waiting thread may take `cpu` from its current one at
+    /// the end of a slice: one at least as important that may run there
+    /// - or anyone at all, if the current one may no longer run there.
+    /// Other CPUs' queues are read by their published keys, which do not
+    /// say whom they hold may run here: a yes from one of them is a
+    /// reason to choose again, which may then keep the current thread.
+    fn someone_waiting_for(&self, cpu: usize, l: &Local) -> bool {
+        let anyone = Arc::ptr_eq(&l.current, &l.idle) || l.affinity & bit(cpu) == 0;
+        let max = if anyone { LEVELS - 1 } else { level(l.priority) };
+        if l.queue.best_for(cpu, max).is_some() {
+            return true;
+        }
+        (0..self.cpu_count()).any(|c| {
+            let head = self.cpus[c].head.load(SeqCst);
+            c != cpu && head != EMPTY && level_of_key(head) <= max
+        })
     }
 
     /// Asks `cpu` to choose again; interrupted if it is not `from`, the
     /// CPU this is decided on.
-    fn ask(&mut self, cpu: usize, from: usize) {
-        self.cpus[cpu].reschedule = true;
+    fn ask(&self, cpu: usize, from: usize) {
+        self.cpus[cpu].reschedule.store(true, SeqCst);
         if cpu != from {
-            self.pokes |= 1 << cpu;
+            self.pokes.fetch_or(bit(cpu), SeqCst);
         }
     }
 
     /// One timer tick at time `now`, on the CPU that keeps the time:
     /// wakes sleepers whose time has come, and counts down the slice of
     /// the thread on `cpu`.
-    pub fn tick(&mut self, now: u64, cpu: usize) {
+    pub fn tick(&self, now: u64, cpu: usize) {
         self.wake_sleepers(now, cpu);
         self.tick_slice(cpu);
     }
 
     /// Wakes every sleeper whose time is `now` or before, whichever CPU
     /// it slept on: the first ones of each sorted set, so this looks at
-    /// no thread that is not due and allocates nothing. Any CPU's timer
-    /// interrupt may do it; `cpu` is the one deciding.
-    pub fn wake_sleepers(&mut self, now: u64, cpu: usize) {
-        for on in 0..self.sleepers.len() {
-            while let Some(&(until, id)) = self.sleepers[on].first() {
-                if until > now {
-                    break;
+    /// no thread that is not due. Any CPU's timer interrupt may do it;
+    /// `cpu` is the one deciding.
+    pub fn wake_sleepers(&self, now: u64, cpu: usize) {
+        for on in 0..self.cpu_count() {
+            loop {
+                // Taken out of the set under its lock, woken after: the
+                // waking takes the thread's settings lock, which comes
+                // before the sleepers' (see "Locks").
+                let due = {
+                    let mut set = self.cpus[on].sleepers.lock();
+                    match set.first() {
+                        Some(&(until, _)) if until <= now => set.pop_first(),
+                        _ => None,
+                    }
+                };
+                let Some((until, id)) = due else { break };
+                if let Some(rec) = self.rec(id) {
+                    let settings = rec.settings.lock();
+                    // Woken early and asleep again since, it is in the set
+                    // again under its new time: this entry is not it.
+                    if rec.kind.load(SeqCst) == SLEEPING && settings.until == until {
+                        self.make_runnable(&rec, &settings, cpu);
+                    }
                 }
-                self.make_runnable(id, cpu); // takes it out of the set
             }
         }
     }
@@ -512,49 +722,38 @@ impl Scheduler {
     /// When the first sleeper that went to sleep on `cpu` wakes: what
     /// that CPU's one-shot timer is set for, if it is before its tick.
     pub fn first_wake_on(&self, cpu: usize) -> Option<u64> {
-        self.sleepers[cpu].first().map(|&(until, _)| until)
+        self.cpus[cpu].sleepers.lock().first().map(|&(until, _)| until)
     }
 
     /// When the first sleeper of all wakes.
     pub fn first_wake(&self) -> Option<u64> {
-        self.sleepers.iter().filter_map(|set| set.first().map(|&(until, _)| until)).min()
-    }
-
-    /// Changes `id`'s state, keeping `sleepers` right. Every change of an
-    /// added thread's state goes through here. A thread goes to sleep
-    /// only from a CPU (suspend_current), which is the set it joins.
-    fn set_state(&mut self, id: ThreadId, state: State) {
-        if let Some(State::Sleeping(until)) = self.states.insert(id, state) {
-            let on = self.asleep_on.remove(&id).expect("a sleeper's CPU");
-            self.sleepers[on].remove(&(until, id));
-        }
-        if let State::Sleeping(until) = state {
-            let on = self.cpu_of(id).expect("a thread goes to sleep from its CPU");
-            self.sleepers[on].insert((until, id));
-            self.asleep_on.insert(id, on);
-        }
+        (0..self.cpu_count()).filter_map(|c| self.first_wake_on(c)).min()
     }
 
     /// One timer tick on a CPU that does not keep the time: only the
     /// slice of the thread on `cpu`.
-    pub fn tick_slice(&mut self, cpu: usize) {
-        let waiting = self.someone_waiting_for(cpu);
-        let this = &mut self.cpus[cpu];
-        if this.current == this.idle {
+    pub fn tick_slice(&self, cpu: usize) {
+        let mut guard = self.cpus[cpu].local.lock();
+        let l = local(&mut guard);
+        let waiting = self.someone_waiting_for(cpu, l);
+        let reschedule = &self.cpus[cpu].reschedule;
+        if Arc::ptr_eq(&l.current, &l.idle) {
             // An idling CPU has no slice to finish: work that arrived
             // from another CPU since its last tick is taken now.
-            this.reschedule |= waiting;
+            if waiting {
+                reschedule.store(true, SeqCst);
+            }
             return;
         }
-        this.slice_left = this.slice_left.saturating_sub(1);
-        if this.slice_left == 0 {
+        l.slice_left = l.slice_left.saturating_sub(1);
+        if l.slice_left == 0 {
             if waiting {
-                this.reschedule = true;
+                reschedule.store(true, SeqCst);
             } else {
                 // Nobody waiting: a fresh slice, so a thread that turns
                 // up later still finds a full slice ahead of it to wait
                 // out - not an exhausted one that hands over at once.
-                this.slice_left = SLICE;
+                l.slice_left = SLICE;
             }
         }
     }
@@ -562,36 +761,60 @@ impl Scheduler {
     /// Whether `cpu` has been asked to choose again, the request left as
     /// it is.
     pub fn reschedule_pending(&self, cpu: usize) -> bool {
-        self.cpus[cpu].reschedule
+        self.cpus[cpu].reschedule.load(SeqCst)
     }
 
     /// Whether `cpu` should choose again; clears the request.
-    pub fn take_reschedule(&mut self, cpu: usize) -> bool {
-        core::mem::take(&mut self.cpus[cpu].reschedule)
+    pub fn take_reschedule(&self, cpu: usize) -> bool {
+        self.cpus[cpu].reschedule.swap(false, SeqCst)
     }
 
     /// The CPUs to interrupt because of what was done since the last
-    /// call, one bit each; clears the set. Never the CPU that did it.
-    pub fn take_pokes(&mut self) -> u64 {
-        core::mem::take(&mut self.pokes)
+    /// call, one bit each; clears the set. Never the CPU that did it -
+    /// though with several CPUs calling, a CPU may collect a bit another
+    /// set, even its own: the caller skips its own.
+    pub fn take_pokes(&self) -> u64 {
+        self.pokes.swap(0, SeqCst)
     }
 
-    /// Into the queue - for a thread that is on no CPU.
-    fn enqueue(&mut self, id: ThreadId, cpu: usize) {
-        debug_assert!(self.cpu_of(id).is_none(), "thread {id} queued while on a CPU");
-        self.set_state(id, State::Ready);
-        let Attributes { priority, affinity, last } =
-            self.attributes.get(&id).copied().unwrap_or(Attributes { priority: DEFAULT, affinity: ANY_CPU, last: 0 });
-        self.enqueue_known(id, priority, affinity, cpu, last);
+    /// Publishes what `cpu`'s queue holds: under its lock, after every
+    /// change. Sequentially consistent: see "Nobody sleeps with work
+    /// waiting".
+    fn publish(&self, cpu: usize, queue: &Queue) {
+        self.cpus[cpu].head.store(queue.head(), SeqCst);
+        self.cpus[cpu].waiting.store(queue.count, SeqCst);
     }
 
-    /// `enqueue`, its attributes already known (a switch: no look-up).
-    /// `last` is the CPU it last ran on. It waits in the queue of the
-    /// CPU offered it, if one is; else in its home's (`home`).
-    fn enqueue_known(&mut self, id: ThreadId, priority: Priority, affinity: u64, cpu: usize, last: usize) {
-        self.set_state(id, State::Ready);
-        let on = self.offer_from(priority, affinity, cpu, last).unwrap_or_else(|| self.home(affinity, last));
-        self.ready.push(on, id, priority, affinity);
+    /// Publishes what `cpu` runs: under its lock, at every switch.
+    fn publish_current(&self, cpu: usize, l: &Local) {
+        let this = &self.cpus[cpu];
+        this.current.store(l.current.id, SeqCst);
+        this.priority.store(l.priority, SeqCst);
+        this.idling.store(Arc::ptr_eq(&l.current, &l.idle), SeqCst);
+    }
+
+    /// Puts `entry` at the back of `cpu`'s queue, its lock held.
+    fn push(&self, cpu: usize, l: &mut Local, rec: Arc<Rec>, priority: Priority, affinity: u64) {
+        let joined = self.joined.fetch_add(1, SeqCst) + 1;
+        rec.rq.store(cpu, SeqCst);
+        l.queue.push_back(Entry { rec, affinity, joined }, priority);
+        self.publish(cpu, &l.queue);
+    }
+
+    /// Into a queue - for a runnable thread that is in none and on no
+    /// CPU, its settings held. It waits in the queue of the CPU that is
+    /// to take it, if one is; else in its home's (`home`). Queued first,
+    /// and only then is the CPU asked: asked first, it could look before
+    /// the thread is there, find nothing and go back to idling.
+    fn enqueue(&self, rec: &Arc<Rec>, settings: &Settings, cpu: usize) {
+        let (priority, affinity, last) = (settings.priority, settings.affinity, settings.last);
+        let on = self.offer_from(priority, affinity, cpu, last, false).unwrap_or_else(|| self.home(affinity, last));
+        {
+            let mut guard = self.cpus[on].local.lock();
+            self.push(on, local(&mut guard), rec.clone(), priority, affinity);
+        }
+        race_window("queued");
+        self.offer_from(priority, affinity, cpu, last, true);
     }
 
     /// Where a thread waits when no CPU is offered it: the allowed CPU
@@ -599,25 +822,26 @@ impl Scheduler {
     /// CPUs, and three on two take turns on both - and among those its
     /// last CPU first (its cache), then the lowest number.
     fn home(&self, affinity: u64, last: usize) -> usize {
-        let count = self.cpus.len();
+        let count = self.cpu_count();
         let last = if last < count { last } else { 0 };
         (0..count)
             .map(|n| (last + n) % count)
-            .filter(|&c| affinity & (1u64 << c) != 0)
-            .min_by_key(|&c| self.ready.waiting_on(c))
+            .filter(|&c| affinity & bit(c) != 0)
+            .min_by_key(|&c| self.cpus[c].waiting.load(SeqCst))
             .unwrap_or(last)
     }
 
-    /// A thread (of `priority` and `affinity`) has just joined the queue,
-    /// put there by `cpu`: finds
-    /// a CPU to take it. An idling CPU it may run on: this one if it
-    /// idles - it needs no telling - or another, which does: it sits
-    /// halted, and without an interrupt would look at the queue only at
-    /// its next timer tick.
+    /// Finds a CPU to take a thread (of `priority` and `affinity`) put in
+    /// a queue by `cpu`, and - if `ask` - asks it. An idling CPU it may
+    /// run on first: this one if it idles - it needs no telling - then
+    /// its last one (K101: its data may still be in that cache), then
+    /// another, which needs an interrupt: it sits halted, and would look
+    /// at the queues only at its next timer tick.
     ///
     /// A CPU already offered a thread is passed over, so that two
     /// threads made ready one after the other get two CPUs, not the
-    /// same one twice.
+    /// same one twice. Claiming one is a compare-and-swap of its
+    /// `reschedule`, so two CPUs offering at once claim two.
     ///
     /// If no allowed CPU idles, the thread may still take one from a
     /// less important thread: the allowed CPU running the least
@@ -625,92 +849,135 @@ impl Scheduler {
     /// none is less important, nothing is done: it waits for a slice to
     /// end, as it always did.
     ///
-    /// Returns the CPU asked, in whose queue the thread then waits.
-    fn offer(&mut self, priority: Priority, affinity: u64, cpu: usize) -> Option<usize> {
-        self.offer_from(priority, affinity, cpu, cpu)
-    }
-
-    /// `offer`, for a thread that last ran on `last`. This CPU first, if
-    /// it idles: it takes the thread now, with no interrupt - the quickest
-    /// a woken thread can run. Then its last CPU, if that idles (K101: the
-    /// thread's data may still be in its cache); then the others.
-    fn offer_from(&mut self, priority: Priority, affinity: u64, cpu: usize, last: usize) -> Option<usize> {
-        let count = self.cpus.len();
-        let allowed = |c: usize| affinity & (1u64 << c) != 0;
-        let free = |s: &Scheduler, c: usize| {
-            let this = &s.cpus[c];
-            this.current == this.idle && !this.reschedule && allowed(c)
+    /// Without `ask` nothing is changed: it says where to queue the
+    /// thread. With it, after the thread is queued, the answer may
+    /// differ - another CPU may have claimed that one meanwhile - and
+    /// the CPU asked takes the thread from whichever queue it is in.
+    fn offer_from(&self, priority: Priority, affinity: u64, cpu: usize, last: usize, ask: bool) -> Option<usize> {
+        let count = self.cpu_count();
+        let allowed = |c: usize| c < count && affinity & bit(c) != 0;
+        let claim = |c: usize| {
+            let this = &self.cpus[c];
+            allowed(c)
+                && this.idling.load(SeqCst)
+                && if ask {
+                    this.reschedule.compare_exchange(false, true, SeqCst, SeqCst).is_ok()
+                } else {
+                    !this.reschedule.load(SeqCst)
+                }
         };
-        let here = free(self, cpu).then_some(cpu);
-        let there = (last < count && free(self, last)).then_some(last);
-        if let Some(chosen) = here.or(there).or_else(|| (0..count).map(|n| (cpu + n) % count).find(|&c| free(self, c))) {
-            self.ask(chosen, cpu);
-            return Some(chosen);
+        let order = [cpu, last].into_iter().chain((0..count).map(|n| (cpu + n) % count));
+        for c in order {
+            if claim(c) {
+                if ask && c != cpu {
+                    self.pokes.fetch_or(bit(c), SeqCst);
+                }
+                return Some(c);
+            }
         }
         let mut victim: Option<(usize, Priority)> = None;
         for c in (0..count).map(|n| (cpu + n) % count) {
             let this = &self.cpus[c];
-            if this.current == this.idle || this.reschedule || !allowed(c) {
+            if !allowed(c) || this.idling.load(SeqCst) || this.reschedule.load(SeqCst) {
                 continue;
             }
-            let theirs = this.priority;
+            let theirs = this.priority.load(SeqCst);
             if theirs > priority && victim.is_none_or(|(_, worst)| theirs > worst) {
                 victim = Some((c, theirs));
             }
         }
         let (chosen, _) = victim?;
-        self.ask(chosen, cpu);
+        if ask {
+            self.ask(chosen, cpu);
+        }
         Some(chosen)
     }
 
-    /// Ends the sleep or block of `id`. If it has not left its CPU yet
-    /// it stays there, running; otherwise it joins the queue.
-    fn make_runnable(&mut self, id: ThreadId, cpu: usize) {
-        if self.cpu_of(id).is_some() {
-            self.set_state(id, State::Running);
-        } else {
-            self.enqueue(id, cpu);
+    /// Ends the sleep or block of `rec`, its settings held. If it has not
+    /// left its CPU yet it stays there, running; otherwise it is queued.
+    fn make_runnable(&self, rec: &Arc<Rec>, settings: &Settings, cpu: usize) {
+        if rec.kind.load(SeqCst) == SLEEPING {
+            self.cpus[settings.asleep_on].sleepers.lock().remove(&(settings.until, rec.id));
+        }
+        loop {
+            let on = rec.rq.load(SeqCst);
+            if on == NOWHERE {
+                rec.kind.store(RUNNABLE, SeqCst);
+                self.enqueue(rec, settings, cpu);
+                return;
+            }
+            // Still on CPU `on` (a waiting thread is never queued): if it
+            // still is under that CPU's lock, it stays. Its `pick_next`
+            // then finds it runnable, with no reason to leave.
+            let _guard = self.cpus[on].local.lock();
+            if rec.rq.load(SeqCst) == on {
+                rec.kind.store(RUNNABLE, SeqCst);
+                return;
+            }
         }
     }
 
     /// Wakes a blocked or sleeping thread. False if it was neither.
     /// `cpu` is the CPU this is called on.
-    pub fn wake(&mut self, id: ThreadId, cpu: usize) -> bool {
-        match self.states.get(&id) {
-            Some(State::Blocked | State::Sleeping(_)) => {
-                self.make_runnable(id, cpu);
+    pub fn wake(&self, id: ThreadId, cpu: usize) -> bool {
+        let Some(rec) = self.rec(id) else { return false };
+        let settings = rec.settings.lock();
+        match rec.kind.load(SeqCst) {
+            BLOCKED | SLEEPING => {
+                self.make_runnable(&rec, &settings, cpu);
                 true
             }
             _ => false,
         }
     }
 
+    fn current_rec(&self, cpu: usize) -> Arc<Rec> {
+        local(&mut self.cpus[cpu].local.lock()).current.clone()
+    }
+
     /// Says that the thread on `cpu` will leave it at the next
     /// `pick_next`, into `state` (Sleeping, Blocked or Exited). Until
-    /// then it is still there, and can still be woken.
-    pub fn suspend_current(&mut self, cpu: usize, state: State) {
-        assert!(
-            matches!(state, State::Sleeping(_) | State::Blocked | State::Exited),
-            "suspend into {state:?}"
-        );
-        let this = &self.cpus[cpu];
+    /// then it is still there, and can still be woken. Called by that
+    /// thread itself.
+    pub fn suspend_current(&self, cpu: usize, state: State) {
+        let rec = self.current_rec(cpu);
         // The idle thread is what runs when nothing else can, so it can
         // never wait for anything: pick_next would simply choose it again.
-        assert!(this.current != this.idle, "the idle thread cannot sleep, block or exit");
-        let current = this.current;
-        self.set_state(current, state);
-        if let Some(attributes) = self.attributes.get_mut(&current) {
-            attributes.last = cpu;
+        assert!(!rec.idle, "the idle thread cannot sleep, block or exit");
+        let mut settings = rec.settings.lock();
+        settings.last = cpu;
+        // Said "sleep" already and not yet left (then, say, killed: now
+        // Exited): the old sleep's entry goes, or a tick would find it.
+        if rec.kind.load(SeqCst) == SLEEPING {
+            self.cpus[settings.asleep_on].sleepers.lock().remove(&(settings.until, rec.id));
         }
+        let kind = match state {
+            State::Sleeping(until) => {
+                settings.until = until;
+                settings.asleep_on = cpu;
+                self.cpus[cpu].sleepers.lock().insert((until, rec.id));
+                SLEEPING
+            }
+            State::Blocked => BLOCKED,
+            State::Exited => EXITED,
+            _ => panic!("suspend into {state:?}"),
+        };
+        rec.kind.store(kind, SeqCst);
     }
 
     /// Takes back a `suspend_current` into Sleeping or Blocked: the
     /// thread looked again and found it has nothing to wait for. (Not
     /// Exited: that cannot be taken back.)
-    pub fn resume_current(&mut self, cpu: usize) {
-        let id = self.cpus[cpu].current;
-        if let Some(State::Blocked | State::Sleeping(_)) = self.states.get(&id) {
-            self.set_state(id, State::Running);
+    pub fn resume_current(&self, cpu: usize) {
+        let rec = self.current_rec(cpu);
+        let settings = rec.settings.lock();
+        match rec.kind.load(SeqCst) {
+            SLEEPING => {
+                self.cpus[settings.asleep_on].sleepers.lock().remove(&(settings.until, rec.id));
+                rec.kind.store(RUNNABLE, SeqCst);
+            }
+            BLOCKED => rec.kind.store(RUNNABLE, SeqCst),
+            _ => {}
         }
     }
 
@@ -718,110 +985,369 @@ impl Scheduler {
     /// running, goes to the back of the queue (unless it is the idle
     /// thread). Returns the switch to make, or None to keep running the
     /// current thread.
-    pub fn pick_next(&mut self, cpu: usize) -> Option<Switch> {
-        let from = self.cpus[cpu].current;
-        let idle = self.cpus[cpu].idle;
+    pub fn pick_next(&self, cpu: usize) -> Option<Switch> {
+        self.pick_next_with_handles(cpu).map(|(switch, _, _)| switch)
+    }
+
+    /// `pick_next`, with the mechanism's handles of the two threads.
+    pub fn pick_next_with_handles(&self, cpu: usize) -> Option<(Switch, usize, usize)> {
+        let this = &self.cpus[cpu];
+        let mut guard = this.local.lock();
+        let l = local(&mut guard);
         // Choosing is what a request to choose asks for. Left set, it
         // would follow the CPU into idling and read there as an offer
         // nobody made.
-        self.cpus[cpu].reschedule = false;
-        let still_running = self.states.get(&from) == Some(&State::Running);
+        this.reschedule.store(false, SeqCst);
+        let from = l.current.clone();
+        let still_running = from.kind.load(SeqCst) == RUNNABLE;
         // A running thread may stay only on a CPU it is allowed.
-        let (mine, my_affinity) = (self.cpus[cpu].priority, self.cpus[cpu].affinity);
-        let may_stay = still_running && my_affinity & (1u64 << cpu) != 0;
+        let (mine, my_affinity) = (l.priority, l.affinity);
+        let may_stay = still_running && my_affinity & bit(cpu) != 0;
 
         // The best waiting thread - unless it is less important than the
         // one running, which keeps the CPU (priorities are strict).
-        let candidate = self
-            .ready
-            .best_for(cpu)
-            .filter(|&(_, level, _)| !(may_stay && from != idle && priority_of(level) > mine));
-        let Some(place) = candidate else {
+        let max = if may_stay && !from.idle { level(mine) } else { LEVELS - 1 };
+        let (mut chosen, mut missed) = self.choose(cpu, l, max);
+        if chosen.is_none() && !may_stay && !from.idle {
+            // The host tests widen the race this closes (see `race_window`).
+            race_window("before idling");
+            // About to idle: say so, then look once more ("Nobody sleeps
+            // with work waiting").
+            this.idling.store(true, SeqCst);
+            this.priority.store(IDLE_PRIORITY, SeqCst);
+            fence(SeqCst);
+            (chosen, missed) = self.choose(cpu, l, LEVELS - 1);
+        }
+        if chosen.is_none() && missed {
+            // Work in a queue whose lock was busy: look again soon.
+            this.reschedule.store(true, SeqCst);
+        }
+        let Some((to, priority, affinity)) = chosen else {
             if may_stay {
-                self.cpus[cpu].slice_left = SLICE;
+                l.slice_left = SLICE;
+                self.publish_current(cpu, l);
                 return None; // nobody else may have the CPU
             }
-            let switch = self.switch_to(cpu, from, idle, IDLE_PRIORITY, ANY_CPU);
-            if still_running && from != idle {
-                // No longer allowed here: back in the queue, for a CPU
-                // it may run on.
-                self.enqueue_known(from, mine, my_affinity, cpu, cpu);
+            let idle = l.idle.clone();
+            let switch = self.switch_to(cpu, l, idle, IDLE_PRIORITY, ANY_CPU);
+            if still_running && !from.idle {
+                // No longer allowed here: back in a queue, for a CPU it
+                // may run on.
+                self.requeue(cpu, l, from.clone(), mine, my_affinity);
+            } else if !from.idle {
+                from.rq.store(NOWHERE, SeqCst);
             }
-            return switch;
+            return switch.map(|s| (s, from.handle, l.current.handle));
         };
-        let (to, priority, affinity) = self.ready.take(place);
+        let to_handle = to.handle;
         // The switch comes first: `from` is on no CPU from here on, and
         // only then may it be queued.
-        let switch = self.switch_to(cpu, from, to, priority, affinity);
+        let switch = self.switch_to(cpu, l, to, priority, affinity);
         if still_running {
-            if from == idle {
-                self.set_state(from, State::Ready); // ready, never queued
-            } else {
+            if !from.idle {
                 // It gave way on this CPU; another may be idling, or
                 // running someone less important.
-                self.enqueue_known(from, mine, my_affinity, cpu, cpu);
+                self.requeue(cpu, l, from.clone(), mine, my_affinity);
             }
+        } else {
+            from.rq.store(NOWHERE, SeqCst);
         }
-        switch
+        switch.map(|s| (s, from.handle, to_handle))
     }
 
-    fn switch_to(&mut self, cpu: usize, from: ThreadId, to: ThreadId, priority: Priority, affinity: u64) -> Option<Switch> {
-        self.set_state(to, State::Running);
-        let this = &mut self.cpus[cpu];
-        this.current = to;
-        this.priority = priority;
-        this.affinity = affinity;
-        this.slice_left = SLICE;
-        (from != to).then_some(Switch { from, to })
+    /// The thread `cpu` should take: the most important it may run, no
+    /// less important than `max`, of those the one that joined first,
+    /// from its own queue or any other. Taken out of its queue, and
+    /// `rq` set to `cpu`. Also whether a queue was passed over because
+    /// its lock was busy.
+    ///
+    /// Another queue is judged by its published key until it has been
+    /// looked into, and by what was found there after: its first thread
+    /// may be one this CPU may not run, and then what it has for this CPU
+    /// is further back - possibly behind another queue's first (the bug
+    /// this way of looking fixes: journal entry NNN, bug 2). A queue is
+    /// taken from only when what it has for this CPU beats every other
+    /// queue's, as far as is known; otherwise the next is looked into,
+    /// and a queue seen and let go is locked again only if it is then
+    /// the best. Each queue is looked into once, so this ends - in a few
+    /// rounds more if other CPUs change the queues meanwhile; after
+    /// 2 rounds per CPU it takes its own best rather than go on, and
+    /// says so (`missed`), so that it chooses again soon.
+    fn choose(&self, cpu: usize, l: &mut Local, max: usize) -> (Option<(Arc<Rec>, Priority, u64)>, bool) {
+        let count = self.cpu_count();
+        // What each other queue has for this CPU, once looked into.
+        let mut seen: [Option<u64>; MAX_CPUS] = [None; MAX_CPUS];
+        let mut missed = false;
+        let judged = |seen: &[Option<u64>; MAX_CPUS], c: usize| {
+            seen[c].unwrap_or_else(|| {
+                let head = self.cpus[c].head.load(SeqCst);
+                if level_of_key(head) <= max { head } else { EMPTY }
+            })
+        };
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            if rounds > 2 * count + 2 {
+                missed = true; // queues changing under it: look again soon
+                break;
+            }
+            let own = l.queue.best_for(cpu, max);
+            let own_key = own.map_or(EMPTY, |place| l.queue.key_at(place));
+            let mut other: Option<(usize, u64)> = None;
+            for c in (0..count).filter(|&c| c != cpu) {
+                let key = judged(&seen, c);
+                if key < own_key && other.is_none_or(|(_, best)| key < best) {
+                    other = Some((c, key));
+                }
+            }
+            let Some((c, _)) = other else { break };
+            let Some(mut guard) = self.lock_second(cpu, c) else {
+                missed = true;
+                seen[c] = Some(EMPTY); // busy: passed over this time
+                continue;
+            };
+            let theirs = local(&mut guard);
+            let found = theirs.queue.best_for(cpu, max);
+            let key = found.map_or(EMPTY, |place| theirs.queue.key_at(place));
+            seen[c] = Some(key);
+            let beaten = key >= own_key || (0..count).any(|o| o != cpu && o != c && judged(&seen, o) < key);
+            if let (Some(place), false) = (found, beaten) {
+                let (entry, priority) = theirs.queue.take(place);
+                self.publish(c, &theirs.queue);
+                entry.rec.rq.store(cpu, SeqCst); // both locks held
+                return (Some((entry.rec, priority, entry.affinity)), missed);
+            }
+        }
+        let taken = l.queue.best_for(cpu, max).map(|place| {
+            let (entry, priority) = l.queue.take(place);
+            self.publish(cpu, &l.queue);
+            (entry.rec, priority, entry.affinity)
+        });
+        (taken, missed)
+    }
+
+    /// CPU `other`'s lock, taken while `held`'s is held: waited for if
+    /// `other` is the higher number, else only tried (see "Locks").
+    fn lock_second(&self, held: usize, other: usize) -> Option<Guard<'_>> {
+        let lock = &self.cpus[other].local;
+        if other > held {
+            return Some(lock.lock());
+        }
+        for _ in 0..TRIES {
+            if let Some(guard) = lock.try_lock() {
+                return Some(guard);
+            }
+            hint::spin_loop();
+        }
+        None
+    }
+
+    /// The thread `from`, which just left `cpu` still runnable, at the
+    /// back of `cpu`'s own queue - the one lock held - and offered to an
+    /// idling CPU or one running somebody less important, which takes it
+    /// from there.
+    fn requeue(&self, cpu: usize, l: &mut Local, from: Arc<Rec>, priority: Priority, affinity: u64) {
+        self.push(cpu, l, from, priority, affinity);
+        self.offer_from(priority, affinity, cpu, cpu, true);
+    }
+
+    fn switch_to(&self, cpu: usize, l: &mut Local, to: Arc<Rec>, priority: Priority, affinity: u64) -> Option<Switch> {
+        let from = l.current.id;
+        let to_id = to.id;
+        to.rq.store(cpu, SeqCst);
+        l.current = to;
+        l.priority = priority;
+        l.affinity = affinity;
+        l.slice_left = SLICE;
+        self.publish_current(cpu, l);
+        (from != to_id).then_some(Switch { from, to: to_id })
     }
 
     /// Forgets an exited thread, once it is off every CPU. Returns
     /// whether it was there to forget.
-    pub fn remove(&mut self, id: ThreadId) -> bool {
-        if self.cpu_of(id).is_some() || self.states.get(&id) != Some(&State::Exited) {
+    pub fn remove(&self, id: ThreadId) -> bool {
+        let mut threads = self.threads.lock();
+        let Some(rec) = threads.get(&id) else { return false };
+        if rec.kind.load(SeqCst) != EXITED || rec.rq.load(SeqCst) != NOWHERE {
             return false;
         }
-        self.states.remove(&id);
-        self.attributes.remove(&id);
+        threads.remove(&id);
         true
+    }
+
+    // ---- for the tests: what is queued, and where --------------------
+
+    /// Every queued thread: CPU 0's queue in its order, then CPU 1's...
+    #[cfg(test)]
+    fn queued(&self) -> Vec<ThreadId> {
+        (0..self.cpu_count()).flat_map(|c| self.queued_on(c)).collect()
+    }
+
+    #[cfg(test)]
+    fn queued_on(&self, cpu: usize) -> Vec<ThreadId> {
+        local(&mut self.cpus[cpu].local.lock()).queue.ids().collect()
+    }
+
+    /// Each CPU's sleepers, in order.
+    #[cfg(test)]
+    fn sleepers_on(&self, cpu: usize) -> Vec<(u64, ThreadId)> {
+        self.cpus[cpu].sleepers.lock().iter().copied().collect()
+    }
+
+    /// Whether `id` may run on `cpu`. An idle thread runs only on its
+    /// own CPU.
+    #[cfg(test)]
+    fn allowed(&self, id: ThreadId, cpu: usize) -> bool {
+        self.rec(id).is_none_or(|rec| rec.idle || rec.settings.lock().affinity & bit(cpu) != 0)
+    }
+
+    /// The thread `cpu` would take next: the most important allowed on
+    /// it, the longest waiting of those, from any queue.
+    #[cfg(test)]
+    fn best_for(&self, cpu: usize) -> Option<ThreadId> {
+        let mut best: Option<(u64, ThreadId)> = None;
+        for c in 0..self.cpu_count() {
+            let guard = self.cpus[c].local.lock();
+            let queue = &guard.as_ref().unwrap().queue;
+            if let Some(place) = queue.best_for(cpu, LEVELS - 1) {
+                let candidate = (queue.key_at(place), queue.levels[place.0][place.1].rec.id);
+                if best.is_none_or(|b| candidate.0 < b.0) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Every CPU's lock at once (in order), and everything checked
+    /// against everything: each runnable thread that is not an idle one
+    /// is on exactly one CPU or queued exactly once, and its `rq` says
+    /// where; a thread that waits is nowhere; the sleeper sets hold
+    /// exactly the sleepers. For the tests that run CPUs at once: a lost
+    /// thread - runnable, yet in no queue and on no CPU - fails here.
+    #[cfg(test)]
+    fn check_consistent(&self) {
+        let count = self.cpu_count();
+        let guards: Vec<_> = (0..count).map(|c| self.cpus[c].local.lock()).collect();
+        let mut place: BTreeMap<ThreadId, usize> = BTreeMap::new();
+        for (c, guard) in guards.iter().enumerate() {
+            let l = guard.as_ref().unwrap();
+            assert_eq!(self.cpus[c].current.load(SeqCst), l.current.id, "CPU {c} publishes another current");
+            assert_eq!(l.current.rq.load(SeqCst), c, "thread {} runs on CPU {c} but its rq says otherwise", l.current.id);
+            if !l.current.idle {
+                assert!(place.insert(l.current.id, c).is_none(), "thread {} on two CPUs", l.current.id);
+                // A thread whose affinity was changed while it ran stays
+                // until its CPU chooses again - which it has been asked to.
+                let allowed = l.current.settings.lock().affinity & bit(c) != 0;
+                assert!(allowed || self.cpus[c].reschedule.load(SeqCst), "CPU {c} runs thread {}, not allowed there, and was not asked to choose", l.current.id);
+            }
+            assert_eq!(self.cpus[c].head.load(SeqCst), l.queue.head(), "CPU {c} publishes an old key");
+            for id in l.queue.ids() {
+                assert!(place.insert(id, c).is_none(), "thread {id} in two places");
+            }
+            for entry in l.queue.levels.iter().flatten() {
+                assert_eq!(entry.rec.rq.load(SeqCst), c, "thread {} queued on CPU {c} but its rq says otherwise", entry.rec.id);
+                assert_eq!(entry.rec.kind.load(SeqCst), RUNNABLE, "thread {} queued while waiting", entry.rec.id);
+            }
+        }
+        // Nobody sleeps with work waiting: each queued thread has a CPU
+        // it may run on that is busy (its slice will end) or has been
+        // asked to choose. Not "every idling CPU is asked": an idling CPU
+        // offered one thread is passed over for the next (`offer_from`),
+        // so a second may wait for that CPU, or for an idle one's tick.
+        // A thread whose allowed CPUs all idle, unasked, is the lost
+        // wake-up "Nobody sleeps with work waiting" exists to prevent.
+        for guard in &guards {
+            for entry in guard.as_ref().unwrap().queue.levels.iter().flatten() {
+                let served = (0..count).any(|c| {
+                    let l = guards[c].as_ref().unwrap();
+                    entry.affinity & bit(c) != 0 && (!Arc::ptr_eq(&l.current, &l.idle) || self.cpus[c].reschedule.load(SeqCst))
+                });
+                assert!(served, "thread {} waits, and every CPU it may run on idles unasked", entry.rec.id);
+            }
+        }
+        for (&id, rec) in self.threads.lock().iter() {
+            if rec.idle {
+                continue;
+            }
+            match rec.kind.load(SeqCst) {
+                RUNNABLE => assert!(place.contains_key(&id), "thread {id} is runnable but in no queue and on no CPU: lost"),
+                _ if place.contains_key(&id) => {
+                    // Waiting, but not yet left its CPU: allowed only there.
+                    let c = place[&id];
+                    assert_eq!(guards[c].as_ref().unwrap().current.id, id, "thread {id} waits but is queued");
+                }
+                _ => assert_eq!(rec.rq.load(SeqCst), NOWHERE, "thread {id} waits but its rq names a CPU"),
+            }
+            let asleep = (0..count).filter(|&c| self.cpus[c].sleepers.lock().iter().any(|&(_, other)| other == id)).count();
+            let sleeping = rec.kind.load(SeqCst) == SLEEPING;
+            assert_eq!(asleep, usize::from(sleeping), "thread {id}: sleeping {sleeping}, in {asleep} sleeper sets");
+        }
+    }
+
+    /// Every thread's number.
+    #[cfg(test)]
+    fn ids(&self) -> Vec<ThreadId> {
+        self.threads.lock().keys().copied().collect()
+    }
+
+    /// The queued thread that joined first, in any queue.
+    #[cfg(test)]
+    fn first_joined(&self) -> Option<ThreadId> {
+        let mut first: Option<(u64, ThreadId)> = None;
+        for c in 0..self.cpu_count() {
+            let guard = self.cpus[c].local.lock();
+            for entry in guard.as_ref().unwrap().queue.levels.iter().flatten() {
+                if first.is_none_or(|(joined, _)| entry.joined < joined) {
+                    first = Some((entry.joined, entry.rec.id));
+                }
+            }
+        }
+        first.map(|(_, id)| id)
+    }
+
+    #[cfg(test)]
+    fn reschedule_of(&self, cpu: usize) -> bool {
+        self.cpus[cpu].reschedule.load(SeqCst)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
 
     const IDLE: ThreadId = 0;
 
     /// Runs `pick_next` and returns who is running afterwards.
-    fn next(s: &mut Scheduler) -> ThreadId {
+    fn next(s: &Scheduler) -> ThreadId {
         s.pick_next(0);
         s.current(0)
     }
 
     #[test]
     fn idle_runs_when_nothing_else_can() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         assert_eq!(s.pick_next(0), None);
         assert_eq!(s.current(0), IDLE);
     }
 
     #[test]
     fn round_robin_in_order_and_idle_never_queued() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         for id in 1..=3 {
             s.add(id, 0);
         }
         assert!(s.take_reschedule(0), "new work while idle asks for a switch");
-        let order: Vec<_> = (0..7).map(|_| next(&mut s)).collect();
+        let order: Vec<_> = (0..7).map(|_| next(&s)).collect();
         assert_eq!(order, vec![1, 2, 3, 1, 2, 3, 1]);
     }
 
     #[test]
     fn a_slice_runs_out_only_when_someone_is_waiting() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
-        next(&mut s);
+        next(&s);
         s.take_reschedule(0);
         for t in 1..=10 {
             s.tick(t, 0);
@@ -833,16 +1359,16 @@ mod tests {
         assert!(!s.take_reschedule(0), "slice not over yet");
         s.tick(12, 0);
         assert!(s.take_reschedule(0), "slice over, 2 is waiting");
-        assert_eq!(next(&mut s), 2);
+        assert_eq!(next(&s), 2);
     }
 
     #[test]
     fn sleepers_wake_on_their_tick() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
-        next(&mut s);
+        next(&s);
         s.suspend_current(0, State::Sleeping(5));
-        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(next(&s), IDLE);
         s.take_reschedule(0);
 
         s.tick(4, 0);
@@ -851,42 +1377,42 @@ mod tests {
         s.tick(5, 0);
         assert_eq!(s.state(1), Some(State::Ready));
         assert!(s.take_reschedule(0), "the idle CPU should switch at once");
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
     }
 
     #[test]
     fn blocked_threads_are_skipped_until_woken() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
         s.add(2, 0);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         s.suspend_current(0, State::Blocked);
-        assert_eq!(next(&mut s), 2);
-        assert_eq!(next(&mut s), 2, "1 is blocked; 2 keeps going");
+        assert_eq!(next(&s), 2);
+        assert_eq!(next(&s), 2, "1 is blocked; 2 keeps going");
 
         assert!(s.wake(1, 0));
         assert!(!s.wake(1, 0), "already awake");
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
     }
 
     #[test]
     fn a_thread_that_blocks_and_is_woken_before_switching_keeps_running() {
         // The race a wait queue must survive: block, then the wakeup
         // arrives before the switch happens.
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
-        next(&mut s);
+        next(&s);
         s.suspend_current(0, State::Blocked);
         s.wake(1, 0);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         assert_eq!(s.state(1), Some(State::Running));
     }
 
     #[test]
     fn exited_threads_leave_and_are_removed_once_off_the_cpu() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
-        next(&mut s);
+        next(&s);
         s.suspend_current(0, State::Exited);
         assert!(!s.remove(1), "still on the CPU");
         assert_eq!(s.pick_next(0), Some(Switch { from: 1, to: IDLE }));
@@ -898,21 +1424,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "idle thread cannot sleep")]
     fn the_idle_thread_cannot_sleep() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.suspend_current(0, State::Sleeping(10));
     }
 
     #[test]
     fn a_boot_thread_can_sleep_and_exit_leaving_idle() {
         const BOOT: ThreadId = 1;
-        let mut s = Scheduler::with_running(IDLE, BOOT);
+        let s = Scheduler::with_running(IDLE, BOOT);
         s.suspend_current(0, State::Sleeping(3));
         assert_eq!(s.pick_next(0), Some(Switch { from: BOOT, to: IDLE }));
         s.tick(3, 0);
         assert!(s.take_reschedule(0));
-        assert_eq!(next(&mut s), BOOT);
+        assert_eq!(next(&s), BOOT);
         s.suspend_current(0, State::Exited);
-        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(next(&s), IDLE);
         assert!(s.remove(BOOT));
         assert_eq!(s.thread_count(), 1);
     }
@@ -923,44 +1449,40 @@ mod tests {
     /// The sorted set holds exactly the Sleeping threads, at their times.
     fn sleepers_match(s: &Scheduler) {
         let sleeping: BTreeSet<(u64, ThreadId)> = s
-            .states
-            .iter()
-            .filter_map(|(&id, state)| match state {
-                State::Sleeping(until) => Some((*until, id)),
+            .ids()
+            .into_iter()
+            .filter_map(|id| match s.state(id) {
+                Some(State::Sleeping(until)) => Some((until, id)),
                 _ => None,
             })
             .collect();
-        let sets: BTreeSet<(u64, ThreadId)> = s.sleepers.iter().flatten().copied().collect();
+        let sets: BTreeSet<(u64, ThreadId)> = (0..s.cpu_count()).flat_map(|c| s.sleepers_on(c)).collect();
         assert_eq!(sets, sleeping, "the sleeper sets and the states disagree");
-        assert_eq!(s.sleepers.iter().map(BTreeSet::len).sum::<usize>(), sleeping.len(), "a sleeper in two sets");
-        for (on, set) in s.sleepers.iter().enumerate() {
-            for (_, id) in set {
-                assert_eq!(s.asleep_on.get(id), Some(&on));
-            }
-        }
+        let total: usize = (0..s.cpu_count()).map(|c| s.sleepers_on(c).len()).sum();
+        assert_eq!(total, sleeping.len(), "a sleeper in two sets");
     }
 
     #[test]
     fn sleepers_wake_in_their_order_and_leave_the_set_when_woken_early() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         for id in 1..=4 {
             s.add(id, 0);
         }
         // Threads 1-4 go to sleep, in turn, until 30, 10, 10 and 20.
         for (id, until) in [(1, 30), (2, 10), (3, 10), (4, 20)] {
-            assert_eq!(next(&mut s), id);
+            assert_eq!(next(&s), id);
             s.suspend_current(0, State::Sleeping(until));
         }
-        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(next(&s), IDLE);
         assert_eq!(s.first_wake(), Some(10));
         sleepers_match(&s);
         // Thread 4 is woken early, as a futex or a message would.
         assert!(s.wake(4, 0));
-        assert_eq!(s.sleepers[0].len(), 3);
+        assert_eq!(s.sleepers_on(0).len(), 3);
         sleepers_match(&s);
         // At 9 nobody is due; at 10 both of that time are, not thread 1.
         s.tick(9, 0);
-        assert_eq!(s.sleepers[0].len(), 3);
+        assert_eq!(s.sleepers_on(0).len(), 3);
         s.tick(10, 0);
         assert_eq!(s.state(2), Some(State::Ready));
         assert_eq!(s.state(3), Some(State::Ready));
@@ -968,7 +1490,7 @@ mod tests {
         assert_eq!(s.first_wake(), Some(30));
         sleepers_match(&s);
         // A sleep taken back (the thread had nothing to wait for).
-        let current = next(&mut s);
+        let current = next(&s);
         assert_ne!(current, IDLE);
         s.suspend_current(0, State::Sleeping(5));
         assert_eq!(s.first_wake(), Some(5));
@@ -983,7 +1505,7 @@ mod tests {
 
     #[test]
     fn randomized_fairness() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut random = move || {
             seed ^= seed << 13;
@@ -1012,9 +1534,9 @@ mod tests {
             s.pick_next(0);
             let after = s.current(0);
             *ran.entry(after).or_insert(0u32) += 1;
-            assert!(!s.ready.contains(&IDLE));
+            assert!(!s.queued().contains(&IDLE));
             if before == after && after != IDLE {
-                assert!(s.ready.is_empty(), "kept the CPU while others waited");
+                assert!(s.queued().is_empty(), "kept the CPU while others waited");
             }
         }
         for id in 1..=20 {
@@ -1026,7 +1548,7 @@ mod tests {
 
     /// Two CPUs: idle threads 0 and 100.
     fn two_cpus() -> Scheduler {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         assert_eq!(s.add_cpu(100), 1);
         s
     }
@@ -1034,7 +1556,7 @@ mod tests {
     // ---- A run queue per CPU (K68, K101; journal entry 129) ----------
 
     /// Runs `cpu`'s slice out: SLICE ticks, then it chooses if asked.
-    fn end_slice(s: &mut Scheduler, cpu: usize) {
+    fn end_slice(s: &Scheduler, cpu: usize) {
         for _ in 0..SLICE {
             s.tick_slice(cpu);
         }
@@ -1045,19 +1567,19 @@ mod tests {
 
     #[test]
     fn among_equals_the_longest_waiting_goes_first_and_an_idle_cpu_takes_work_from_a_busy_one() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         // Four threads, both CPUs busy: two wait, one in each queue.
         for id in 1..=4 {
             s.add(id, 0);
             s.pick_next(0);
             s.pick_next(1);
         }
-        assert_eq!(s.ready.waiting_on(0), 1, "each waits in a queue of its own");
-        assert_eq!(s.ready.waiting_on(1), 1);
-        let first = s.ready.queues.iter().flat_map(|q| q.levels.iter().flatten()).min_by_key(|entry| entry.2).unwrap().0;
+        assert_eq!(s.queued_on(0).len(), 1, "each waits in a queue of its own");
+        assert_eq!(s.queued_on(1).len(), 1);
+        let first = s.first_joined().unwrap();
         // CPU 1's slice ends: it takes the one that joined first, even if
         // it waits in CPU 0's queue - as fair as one queue for all.
-        end_slice(&mut s, 1);
+        end_slice(&s, 1);
         assert_eq!(s.current(1), first);
         // CPU 0's thread blocks, then the next: CPU 0 takes from any
         // queue rather than idle.
@@ -1067,13 +1589,13 @@ mod tests {
         s.suspend_current(0, State::Blocked);
         s.pick_next(0);
         assert_ne!(s.current(0), IDLE, "an idle CPU takes work from a busy one's queue");
-        assert!(s.ready.is_empty());
+        assert!(s.queued().is_empty());
         sleepers_match(&s);
     }
 
     #[test]
     fn a_more_important_thread_in_another_queue_comes_before_this_cpus_own() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.add(2, 0);
         s.pick_next(0);
@@ -1081,22 +1603,22 @@ mod tests {
         // Thread 3, at 0, made by CPU 1: no CPU runs anyone less
         // important, so it waits - in CPU 1's queue (its home).
         s.add_with(3, 1, DEFAULT, ANY_CPU);
-        assert_eq!(s.ready.waiting_on(1), 1);
+        assert_eq!(s.queued_on(1).len(), 1);
         // Thread 4, at -3, made by CPU 0: it takes CPU 0 (this CPU first
         // among equals), so it waits in CPU 0's queue, CPU 0 asked.
         s.add_with(4, 0, -3, ANY_CPU);
-        assert_eq!(s.ready.waiting_on(0), 1);
+        assert_eq!(s.queued_on(0).len(), 1);
         // CPU 1 chooses first: thread 4, from CPU 0's queue, before its
         // own thread 3 - priorities are strict across the queues.
         s.suspend_current(1, State::Blocked);
         s.pick_next(1);
         assert_eq!(s.current(1), 4);
-        assert_eq!(s.ready.waiting_on(1), 1, "thread 3 still waits");
+        assert_eq!(s.queued_on(1).len(), 1, "thread 3 still waits");
     }
 
     #[test]
     fn a_woken_thread_goes_back_to_the_cpu_it_last_ran_on_when_that_one_idles() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add_cpu(100);
         s.add_cpu(200);
         s.add(1, 0);
@@ -1122,7 +1644,7 @@ mod tests {
     #[test]
     fn busy_threads_share_the_cpus_fairly_whatever_order_slices_end_in() {
         for (threads, cpus) in [(4u64, 2usize), (3, 2), (5, 2), (6, 4), (5, 4)] {
-            let mut s = Scheduler::new(IDLE);
+            let s = Scheduler::new(IDLE);
             for n in 1..cpus {
                 s.add_cpu(100 * n as u64);
             }
@@ -1162,7 +1684,7 @@ mod tests {
 
     #[test]
     fn three_busy_threads_on_two_cpus_share_them_fairly() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         for id in 1..=3 {
             s.add(id, 0);
         }
@@ -1172,7 +1694,7 @@ mod tests {
         for _ in 0..300 {
             for cpu in 0..2 {
                 ran[s.current(cpu) as usize] += 1;
-                end_slice(&mut s, cpu);
+                end_slice(&s, cpu);
             }
         }
         // 600 slices among three: 200 each, if fair. Each gets most of
@@ -1185,7 +1707,7 @@ mod tests {
 
     #[test]
     fn two_cpus_take_different_threads_from_the_one_queue() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.add(2, 0);
         assert_eq!(s.pick_next(0), Some(Switch { from: IDLE, to: 1 }));
@@ -1199,7 +1721,7 @@ mod tests {
 
     #[test]
     fn a_thread_runs_on_whichever_cpu_is_free() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.pick_next(0);
         assert_eq!(s.cpu_of(1), Some(0));
@@ -1216,7 +1738,7 @@ mod tests {
 
     #[test]
     fn each_cpu_falls_back_to_its_own_idle_thread() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.add(2, 0);
         s.pick_next(0);
@@ -1225,7 +1747,7 @@ mod tests {
         s.suspend_current(1, State::Blocked);
         assert_eq!(s.pick_next(1), Some(Switch { from: 2, to: 100 }));
         assert_eq!(s.pick_next(0), Some(Switch { from: 1, to: IDLE }));
-        assert!(!s.ready.contains(&IDLE) && !s.ready.contains(&100));
+        assert!(!s.queued().contains(&IDLE) && !s.queued().contains(&100));
         assert!(s.is_idle(100) && s.is_idle(IDLE) && !s.is_idle(1));
     }
 
@@ -1235,12 +1757,12 @@ mod tests {
         // says it will block. Before it has switched away, CPU 1 wakes
         // it. In the queue, CPU 1 could take it and run it - on a stack
         // CPU 0 is still using.
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.pick_next(0);
         s.suspend_current(0, State::Blocked);
         assert!(s.wake(1, 1));
-        assert!(s.ready.is_empty(), "a thread still on a CPU was queued");
+        assert!(s.queued().is_empty(), "a thread still on a CPU was queued");
         assert!(!s.take_reschedule(1), "there is nothing for CPU 1 to take");
         assert_eq!(s.pick_next(1), None);
         assert_eq!(s.state(1), Some(State::Running));
@@ -1251,19 +1773,19 @@ mod tests {
 
     #[test]
     fn a_sleeper_whose_time_comes_before_it_left_its_cpu_stays_too() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 1);
         s.pick_next(1);
         s.suspend_current(1, State::Sleeping(5));
         s.tick(5, 0); // the time is kept on CPU 0
-        assert!(s.ready.is_empty());
+        assert!(s.queued().is_empty());
         assert_eq!(s.state(1), Some(State::Running));
         assert_eq!(s.pick_next(1), None);
     }
 
     #[test]
     fn a_wait_can_be_taken_back() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
         s.pick_next(0);
         s.suspend_current(0, State::Blocked);
@@ -1281,7 +1803,7 @@ mod tests {
 
     #[test]
     fn an_exited_thread_is_not_forgotten_while_any_cpu_is_on_it() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.pick_next(1); // CPU 1 takes it
         s.suspend_current(1, State::Exited);
@@ -1292,7 +1814,7 @@ mod tests {
 
     #[test]
     fn an_idle_cpu_takes_work_at_its_tick_and_a_busy_one_at_the_end_of_its_slice() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add(1, 0);
         s.pick_next(0);
         s.take_reschedule(0);
@@ -1321,7 +1843,7 @@ mod tests {
 
     #[test]
     fn a_cpu_that_joins_late_takes_waiting_work() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         for id in 1..=3 {
             s.add(id, 0);
         }
@@ -1340,7 +1862,7 @@ mod tests {
     /// about to leave. And nobody starves.
     /// Two CPUs, CPU 0 running thread 1 and CPU 1 idling.
     fn one_busy_one_idle() -> Scheduler {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
         s.pick_next(0);
         s.add_cpu(100);
@@ -1350,7 +1872,7 @@ mod tests {
 
     #[test]
     fn a_thread_made_ready_on_a_busy_cpu_is_offered_to_an_idling_one() {
-        let mut s = one_busy_one_idle();
+        let s = one_busy_one_idle();
         s.add(2, 0);
         assert_eq!(s.take_pokes(), 0b10, "CPU 1 idles and was not told");
         assert_eq!(s.take_pokes(), 0, "told twice");
@@ -1366,7 +1888,7 @@ mod tests {
 
     #[test]
     fn an_idling_cpu_that_makes_a_thread_ready_takes_it_itself_and_tells_nobody() {
-        let mut s = one_busy_one_idle();
+        let s = one_busy_one_idle();
         s.add(2, 1);
         assert_eq!(s.take_pokes(), 0);
         assert!(s.take_reschedule(1));
@@ -1374,7 +1896,7 @@ mod tests {
 
     #[test]
     fn nobody_is_told_when_every_cpu_is_busy() {
-        let mut s = one_busy_one_idle();
+        let s = one_busy_one_idle();
         s.add(2, 0);
         s.take_pokes();
         s.take_reschedule(1);
@@ -1386,7 +1908,7 @@ mod tests {
 
     #[test]
     fn two_threads_made_ready_at_once_go_to_two_cpus() {
-        let mut s = one_busy_one_idle();
+        let s = one_busy_one_idle();
         s.add_cpu(200);
         s.add_cpu(300);
         s.add(2, 0);
@@ -1402,7 +1924,7 @@ mod tests {
     #[test]
     fn a_thread_that_gives_way_is_offered_to_an_idling_cpu() {
         // CPU 0 runs 1 with 2 waiting; CPU 1 arrives idling only now.
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add(1, 0);
         s.pick_next(0);
         s.add(2, 0);
@@ -1417,7 +1939,7 @@ mod tests {
 
     #[test]
     fn a_cpu_told_for_nothing_just_goes_on_idling() {
-        let mut s = one_busy_one_idle();
+        let s = one_busy_one_idle();
         s.add(2, 0);
         assert_eq!(s.take_pokes(), 0b10);
         // CPU 0 gets there first: its thread blocks and it takes 2.
@@ -1454,18 +1976,18 @@ mod tests {
     fn randomized(threads: u64) -> (u32, u32) {
         const CPUS: usize = 4;
         let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         for cpu in 1..CPUS {
             assert_eq!(s.add_cpu(idle_of(cpu)), cpu);
         }
         // After each thing CPU `by` does: whoever is to be interrupted
         // for it idles, was offered a thread, and is not `by` itself.
-        let interrupted = |s: &mut Scheduler, by: usize| {
+        let interrupted = |s: &Scheduler, by: usize| {
             let pokes = s.take_pokes();
             for other in 0..CPUS {
                 if pokes & (1 << other) != 0 {
                     assert_eq!(s.current(other), idle_of(other), "busy CPU {other} was interrupted");
-                    assert!(s.cpus[other].reschedule, "CPU {other} interrupted without an offer");
+                    assert!(s.reschedule_of(other), "CPU {other} interrupted without an offer");
                     assert_ne!(other, by, "CPU {other} told itself");
                 }
             }
@@ -1495,7 +2017,7 @@ mod tests {
             } else {
                 s.tick_slice(cpu);
             }
-            poked += interrupted(&mut s, 0);
+            poked += interrupted(&s, 0);
             let on_idle = s.current(cpu) == idle_of(cpu);
             match random() % 12 {
                 0 if !on_idle => s.suspend_current(cpu, State::Sleeping(now + random() % 5)),
@@ -1512,21 +2034,21 @@ mod tests {
             }
             // Sometimes the switch does not follow at once: another CPU
             // gets in first, which is the whole difficulty.
-            poked += interrupted(&mut s, cpu);
+            poked += interrupted(&s, cpu);
             if random() % 3 != 0 {
                 s.pick_next(cpu);
             }
-            poked += interrupted(&mut s, cpu);
+            poked += interrupted(&s, cpu);
 
             // No thread waits while a CPU idles unasked: if the queue
             // has threads, every idling CPU has been offered one - or
             // there are at least as many offers as threads.
-            let offered = (0..CPUS).filter(|&c| s.current(c) == idle_of(c) && s.cpus[c].reschedule).count();
+            let offered = (0..CPUS).filter(|&c| s.current(c) == idle_of(c) && s.reschedule_of(c)).count();
             let idling = (0..CPUS).filter(|&c| s.current(c) == idle_of(c)).count();
             assert!(
-                offered >= s.ready.len().min(idling),
+                offered >= s.queued().len().min(idling),
                 "step {step}: {} threads wait, {idling} CPUs idle, only {offered} were offered one",
-                s.ready.len()
+                s.queued().len()
             );
 
             for a in 0..CPUS {
@@ -1534,8 +2056,8 @@ mod tests {
                 for b in a + 1..CPUS {
                     assert_ne!(current, s.current(b), "one thread on CPUs {a} and {b}");
                 }
-                assert!(!s.ready.contains(&current), "thread {current} is on CPU {a} and in the queue");
-                assert!(!s.ready.contains(&idle_of(a)), "an idle thread is queued");
+                assert!(!s.queued().contains(&current), "thread {current} is on CPU {a} and in the queue");
+                assert!(!s.queued().contains(&idle_of(a)), "an idle thread is queued");
                 if s.is_idle(current) {
                     assert_eq!(current, idle_of(a), "CPU {a} runs another CPU's idle thread");
                 }
@@ -1545,8 +2067,8 @@ mod tests {
                     moved += 1;
                 }
             }
-            for (n, id) in s.ready.iter().enumerate() {
-                assert!(!s.ready.iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
+            for (n, id) in s.queued().iter().enumerate() {
+                assert!(!s.queued().iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
                 assert_eq!(s.state(*id), Some(State::Ready));
             }
             sleepers_match(&s);
@@ -1560,50 +2082,50 @@ mod tests {
 
     #[test]
     fn the_most_important_ready_thread_runs_first() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.add_with(2, 0, 5, ANY_CPU);
         s.add_with(3, 0, -5, ANY_CPU);
-        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [3, 1, 2], "the queue's order");
-        assert_eq!(next(&mut s), 3);
+        assert_eq!(s.queued(), [3, 1, 2], "the queue's order");
+        assert_eq!(next(&s), 3);
     }
 
     #[test]
     fn a_less_important_thread_never_takes_the_cpu_from_a_more_important_one() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add_with(1, 0, -5, ANY_CPU);
         s.add_with(2, 0, DEFAULT, ANY_CPU);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         for _ in 0..10 * SLICE {
             s.tick_slice(0);
             assert!(!s.take_reschedule(0), "a slice ended for a less important thread");
         }
-        assert_eq!(next(&mut s), 1, "a yield gave the CPU to a less important thread");
+        assert_eq!(next(&s), 1, "a yield gave the CPU to a less important thread");
         // Equals still take turns: round-robin within a priority.
         s.add_with(3, 0, -5, ANY_CPU);
-        assert_eq!(next(&mut s), 3);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 3);
+        assert_eq!(next(&s), 1);
     }
 
     #[test]
     fn a_woken_important_thread_takes_this_cpu_at_once() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.add_with(2, 0, -5, ANY_CPU);
-        assert_eq!(next(&mut s), 2);
+        assert_eq!(next(&s), 2);
         s.suspend_current(0, State::Blocked);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         assert!(!s.take_reschedule(0));
         s.wake(2, 0);
         assert!(s.take_reschedule(0), "the woken thread waits out a slice behind a less important one");
         assert_eq!(s.take_pokes(), 0, "nobody else needs telling");
-        assert_eq!(next(&mut s), 2);
-        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(next(&s), 2);
+        assert_eq!(s.queued(), [1]);
     }
 
     #[test]
     fn a_sleeper_joins_the_set_of_its_cpu_and_any_cpu_may_wake_it() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.add_with(2, 0, DEFAULT, ANY_CPU);
         s.pick_next(0);
@@ -1626,16 +2148,16 @@ mod tests {
 
     #[test]
     fn a_woken_important_thread_takes_another_cpu_with_an_interrupt() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.add_with(2, 0, 3, ANY_CPU);
         s.add_with(9, 0, -5, ANY_CPU);
         s.take_pokes();
-        assert_eq!(next(&mut s), 9);
+        assert_eq!(next(&s), 9);
         s.pick_next(1);
         assert_eq!(s.current(1), 1);
         s.suspend_current(0, State::Blocked);
-        assert_eq!(next(&mut s), 2);
+        assert_eq!(next(&s), 2);
         s.take_pokes();
         // Woken from CPU 1: CPU 0 runs the least important thread (3),
         // so CPU 0 is the one interrupted.
@@ -1647,11 +2169,11 @@ mod tests {
 
     #[test]
     fn a_thread_runs_only_on_the_cpus_it_may() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add_with(1, 0, DEFAULT, 1 << 1);
         assert_eq!(s.take_pokes(), 1 << 1, "the idling CPU it may run on was not told");
         assert!(!s.take_reschedule(0), "a CPU it may not run on was offered it");
-        assert_eq!(next(&mut s), IDLE, "CPU 0 took a thread pinned to CPU 1");
+        assert_eq!(next(&s), IDLE, "CPU 0 took a thread pinned to CPU 1");
         s.pick_next(1);
         assert_eq!(s.current(1), 1);
         assert_eq!(s.affinity(1), Some(1 << 1));
@@ -1659,13 +2181,13 @@ mod tests {
 
     #[test]
     fn a_running_thread_leaves_a_cpu_it_may_no_longer_use() {
-        let mut s = two_cpus();
+        let s = two_cpus();
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.take_pokes();
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         assert!(s.set_affinity(1, 1 << 1, 0));
         assert!(s.take_reschedule(0), "the thread stayed on a CPU it may not use");
-        assert_eq!(next(&mut s), IDLE);
+        assert_eq!(next(&s), IDLE);
         assert_eq!(s.take_pokes(), 1 << 1, "CPU 1 was not told of it");
         s.pick_next(1);
         assert_eq!(s.current(1), 1);
@@ -1673,19 +2195,19 @@ mod tests {
 
     #[test]
     fn a_new_priority_moves_a_queued_thread_and_can_end_a_running_ones_turn() {
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         s.add_with(1, 0, DEFAULT, ANY_CPU);
         s.add_with(2, 0, DEFAULT, ANY_CPU);
         s.add_with(3, 0, DEFAULT, ANY_CPU);
-        assert_eq!(next(&mut s), 1);
+        assert_eq!(next(&s), 1);
         assert!(s.set_priority(3, -1, 0));
-        assert_eq!(s.ready.iter().copied().collect::<Vec<_>>(), [3, 2], "the queued thread did not move up");
+        assert_eq!(s.queued(), [3, 2], "the queued thread did not move up");
         assert!(s.take_reschedule(0), "a more important thread waits behind a running one");
-        assert_eq!(next(&mut s), 3);
+        assert_eq!(next(&s), 3);
         // 3 now lowers itself below the others: it gives way.
         assert!(s.set_priority(3, 1, 0));
         assert!(s.take_reschedule(0));
-        assert_eq!(next(&mut s), 2);
+        assert_eq!(next(&s), 2);
         assert!(!s.set_priority(IDLE, -5, 0), "an idle thread has no priority to set");
         assert!(!s.set_priority(77, -5, 0), "a thread that is not there has no priority to set");
     }
@@ -1694,7 +2216,7 @@ mod tests {
     fn randomized_with_priorities_and_affinity() {
         const CPUS: usize = 4;
         let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };
-        let mut s = Scheduler::new(IDLE);
+        let s = Scheduler::new(IDLE);
         for cpu in 1..CPUS {
             s.add_cpu(idle_of(cpu));
         }
@@ -1713,26 +2235,26 @@ mod tests {
         }
         // After each thing CPU `by` does: whoever is to be interrupted for
         // it has been asked to choose again, and is not `by` itself.
-        let check_pokes = |s: &mut Scheduler, by: usize, step: u32| {
+        let check_pokes = |s: &Scheduler, by: usize, step: u32| {
             let pokes = s.take_pokes();
             for other in 0..CPUS {
                 if pokes & (1 << other) != 0 {
-                    assert!(s.cpus[other].reschedule, "step {step}: CPU {other} interrupted for nothing");
+                    assert!(s.reschedule_of(other), "step {step}: CPU {other} interrupted for nothing");
                     assert_ne!(other, by, "step {step}: CPU {other} told itself");
                 }
             }
         };
-        check_pokes(&mut s, 0, 0);
+        check_pokes(&s, 0, 0);
         let mut now = 0;
         for step in 0..40_000u32 {
             let cpu = (random() % CPUS as u64) as usize;
             if step as usize % CPUS == 0 {
                 now += 1;
                 s.tick(now, 0);
-                check_pokes(&mut s, 0, step);
+                check_pokes(&s, 0, step);
             } else {
                 s.tick_slice(cpu);
-                check_pokes(&mut s, cpu, step);
+                check_pokes(&s, cpu, step);
             }
             let on_idle = s.current(cpu) == idle_of(cpu);
             match random() % 16 {
@@ -1750,10 +2272,10 @@ mod tests {
                 }
                 _ => {}
             }
-            check_pokes(&mut s, cpu, step);
+            check_pokes(&s, cpu, step);
             if random() % 3 != 0 {
                 s.pick_next(cpu);
-                check_pokes(&mut s, cpu, step);
+                check_pokes(&s, cpu, step);
                 let current = s.current(cpu);
                 assert!(s.allowed(current, cpu), "step {step}: CPU {cpu} runs thread {current}, which may not run there");
                 // Strict: nobody allowed here and waiting is more
@@ -1774,13 +2296,271 @@ mod tests {
                 for b in a + 1..CPUS {
                     assert_ne!(current, s.current(b), "one thread on CPUs {a} and {b}");
                 }
-                assert!(!s.ready.contains(&current), "thread {current} is on CPU {a} and in the queue");
+                assert!(!s.queued().contains(&current), "thread {current} is on CPU {a} and in the queue");
             }
-            for (n, id) in s.ready.iter().enumerate() {
-                assert!(!s.ready.iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
+            for (n, id) in s.queued().iter().enumerate() {
+                assert!(!s.queued().iter().skip(n + 1).any(|other| other == id), "thread {id} queued twice");
                 assert_eq!(s.state(*id), Some(State::Ready));
             }
             sleepers_match(&s);
         }
+    }
+
+    /// A barrier for the CPUs-at-once tests that gives up when any of
+    /// them has failed - std's would leave the rest waiting for ever.
+    struct Gate {
+        cpus: usize,
+        arrived: AtomicUsize,
+        round: AtomicUsize,
+        failed: AtomicBool,
+    }
+
+    impl Gate {
+        fn new(cpus: usize) -> Gate {
+            Gate { cpus, arrived: AtomicUsize::new(0), round: AtomicUsize::new(0), failed: AtomicBool::new(false) }
+        }
+
+        /// Waits for all; true for exactly one of them (the last to come).
+        fn wait(&self) -> bool {
+            let round = self.round.load(SeqCst);
+            if self.arrived.fetch_add(1, SeqCst) + 1 == self.cpus {
+                self.arrived.store(0, SeqCst);
+                self.round.fetch_add(1, SeqCst);
+                return true;
+            }
+            while self.round.load(SeqCst) == round {
+                assert!(!self.failed.load(SeqCst), "another CPU failed");
+                std::thread::yield_now();
+            }
+            false
+        }
+    }
+
+    /// Dropped when a CPU's host thread ends: if it ends by panicking,
+    /// the gate is told, so the others stop waiting.
+    struct Failed {
+        gate: std::sync::Arc<Gate>,
+        done: std::sync::Arc<AtomicBool>,
+    }
+
+    impl Drop for Failed {
+        fn drop(&mut self) {
+            if !self.done.load(SeqCst) {
+                self.gate.failed.store(true, SeqCst);
+            }
+        }
+    }
+
+    // ---- CPUs at once (K193, journal entry NNN) -------------------------
+
+    /// The policy as the kernel uses it, on host threads: one host thread
+    /// per CPU, each doing what that CPU does - ticks, waits, wake-ups of
+    /// any thread, new priorities and affinities, switches - all at once,
+    /// against one scheduler. Each switch is carried out as the kernel's
+    /// mechanism does (threads.rs, `schedule`): the CPU lets go of the
+    /// thread it leaves, then waits until no other CPU is on the thread it
+    /// takes, and claims it; a thread two CPUs took fails the claim.
+    /// Every so often all CPUs stop at a barrier and everything is
+    /// checked against everything (`check_consistent`). At the end every
+    /// thread is woken, and each must then run.
+    ///
+    /// With `idle_ticks` false an idling CPU's timer does not run - a CPU
+    /// that misses a thread queued as it went idle then stays idle until
+    /// asked, where in the kernel its next tick, 10 ms later, would find
+    /// the thread. So only that way do these tests show whether "Nobody
+    /// sleeps with work waiting" holds by itself.
+    fn cpus_at_once(cpus: usize, threads: u64, steps: u32, seed: u64, idle_ticks: bool) {
+        use std::sync::Arc as Shared;
+        use std::vec;
+
+        const FREE: usize = usize::MAX;
+        let idle_of = |cpu: usize| if cpu == 0 { IDLE } else { 1000 + cpu as u64 };
+        let s = Shared::new(Scheduler::new(IDLE));
+        for cpu in 1..cpus {
+            s.add_cpu(idle_of(cpu));
+        }
+        let mut setup = seed;
+        let mut random = move || {
+            setup ^= setup << 13;
+            setup ^= setup >> 7;
+            setup ^= setup << 17;
+            setup
+        };
+        for id in 1..=threads {
+            let priority = (random() % 5) as Priority - 2;
+            let affinity = if random() % 4 == 0 { 1 << (random() % cpus as u64) } else { ANY_CPU };
+            s.add_with(id, 0, priority, affinity);
+        }
+        // Which CPU is on each thread (FREE: none), as the mechanism would
+        // know it; idle threads are their CPU's for ever.
+        let owner: Shared<Vec<AtomicUsize>> = Shared::new((0..=threads).map(|_| AtomicUsize::new(FREE)).collect());
+        let now = Shared::new(AtomicU64::new(0));
+        let barrier = Shared::new(Gate::new(cpus));
+        const CHECK_EVERY: u32 = 2000;
+
+        let workers: Vec<_> = (0..cpus)
+            .map(|cpu| {
+                let (s, owner, now, barrier) = (s.clone(), owner.clone(), now.clone(), barrier.clone());
+                let done = Shared::new(AtomicBool::new(false));
+                let failed = Failed { gate: barrier.clone(), done: done.clone() };
+                let mut state = seed ^ (0x1234_5678_9ABC_DEF1u64.wrapping_mul(cpu as u64 + 1));
+                std::thread::spawn(move || {
+                    let _failed = failed;
+                    let mut random = move || {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    };
+                    let mine = |id: ThreadId| id >= 1 && id <= threads;
+                    for step in 0..steps {
+                        if step % CHECK_EVERY == 0 {
+                            // Everyone stops between two actions, as if
+                            // each CPU sat with interrupts on; one checks.
+                            if barrier.wait() {
+                                s.check_consistent();
+                            }
+                            barrier.wait();
+                        }
+                        let time = if cpu == 0 { now.fetch_add(1, SeqCst) + 1 } else { now.load(SeqCst) };
+                        s.wake_sleepers(time, cpu);
+                        if idle_ticks || s.current(cpu) != idle_of(cpu) {
+                            s.tick_slice(cpu);
+                        }
+                        let on_idle = s.current(cpu) == idle_of(cpu);
+                        match random() % 16 {
+                            0 if !on_idle => s.suspend_current(cpu, State::Sleeping(time + random() % 5)),
+                            1 if !on_idle => s.suspend_current(cpu, State::Blocked),
+                            2..=5 => {
+                                s.wake(1 + random() % threads, cpu);
+                            }
+                            6 => {
+                                s.set_priority(1 + random() % threads, (random() % 5) as Priority - 2, cpu);
+                            }
+                            7 => {
+                                let affinity = if random() % 2 == 0 { 1 << (random() % cpus as u64) } else { ANY_CPU };
+                                s.set_affinity(1 + random() % threads, affinity, cpu);
+                            }
+                            _ => {}
+                        }
+                        s.take_pokes();
+                        // A busy CPU chooses when asked or when its thread
+                        // yields, waits or ends; an idling one only when
+                        // asked - halted, it does nothing else.
+                        let idling = s.current(cpu) == idle_of(cpu);
+                        if s.take_reschedule(cpu) || (!idling && random() % 3 == 0) {
+                            if let Some(Switch { from, to }) = s.pick_next(cpu) {
+                                if mine(from) {
+                                    owner[from as usize].store(FREE, SeqCst); // its registers saved
+                                }
+                                if mine(to) {
+                                    while owner[to as usize].load(SeqCst) != FREE {
+                                        core::hint::spin_loop(); // its last CPU still saving them
+                                    }
+                                    let claimed = owner[to as usize].compare_exchange(FREE, cpu, SeqCst, SeqCst);
+                                    assert!(claimed.is_ok(), "step {step}: CPU {cpu} took thread {to}, which CPU {:?} has", claimed);
+                                }
+                            }
+                        }
+                    }
+                    done.store(true, SeqCst);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("a CPU failed");
+        }
+        s.check_consistent();
+        sleepers_match(&s);
+
+        // Nobody lost: wake everyone, let them be allowed anywhere at one
+        // priority (priorities are strict: a busy more important thread
+        // would rightly keep a less important one from running), and run
+        // the CPUs one after another until each thread has run.
+        for id in 1..=threads {
+            s.set_affinity(id, ANY_CPU, 0);
+            s.set_priority(id, DEFAULT, 0);
+            s.wake(id, 0);
+        }
+        let mut ran = vec![false; threads as usize + 1];
+        for round in 0..threads * 4 {
+            for cpu in 0..cpus {
+                for _ in 0..SLICE {
+                    s.tick_slice(cpu);
+                }
+                s.pick_next(cpu);
+                let current = s.current(cpu);
+                if mine(current) {
+                    ran[current as usize] = true;
+                }
+            }
+            if round % 8 == 0 {
+                s.check_consistent();
+            }
+        }
+        for id in 1..=threads {
+            assert!(ran[id as usize], "thread {id} never ran once woken");
+        }
+
+        fn mine(id: ThreadId) -> bool {
+            id >= 1 && id < 1000
+        }
+    }
+
+    #[test]
+    fn two_cpus_at_once() {
+        cpus_at_once(2, 8, 60_000, 0x2545_F491_4F6C_DD1D, true);
+    }
+
+    #[test]
+    fn four_cpus_at_once() {
+        cpus_at_once(4, 24, 60_000, 0x9E37_79B9_7F4A_7C15, true);
+    }
+
+    #[test]
+    fn eight_cpus_at_once_few_threads() {
+        // Fewer threads than CPUs, often: idling and stealing at once.
+        cpus_at_once(8, 6, 40_000, 0xD1B5_4A32_D192_ED03, true);
+    }
+
+    /// "Nobody sleeps with work waiting", the order the CPUs-at-once
+    /// tests cannot catch (journal entry NNN, bug 3): CPU 1 looks, finds
+    /// nothing, and - before it says it idles - CPU 0 wakes a thread.
+    /// CPU 1 is not idle yet, so the thread waits in busy CPU 0's queue
+    /// and nobody is asked. Without its second look CPU 1 idled past it,
+    /// and the thread waited for CPU 0's slice to end.
+    #[test]
+    fn a_cpu_about_to_idle_takes_a_thread_woken_as_it_looked() {
+        let s = std::sync::Arc::new(two_cpus());
+        // Thread 3 runs on CPU 0, then blocks: it last ran there.
+        s.add(3, 0);
+        assert_eq!(s.pick_next(0), Some(Switch { from: IDLE, to: 3 }));
+        s.suspend_current(0, State::Blocked);
+        s.pick_next(0);
+        // Thread 1 on CPU 0, thread 2 on CPU 1; nothing queued.
+        s.add(1, 0);
+        assert_eq!(s.pick_next(0), Some(Switch { from: IDLE, to: 1 }));
+        s.add(2, 1);
+        assert_eq!(s.pick_next(1), Some(Switch { from: 100, to: 2 }));
+        assert!(s.queued().is_empty());
+        s.take_pokes();
+        let other = s.clone();
+        at_race("before idling", move || {
+            assert!(other.wake(3, 0)); // on CPU 0, at that moment
+            assert_eq!(other.queued_on(0), [3], "queued at busy CPU 0, its last");
+        });
+        s.suspend_current(1, State::Blocked);
+        s.pick_next(1);
+        assert!(
+            s.current(1) == 3 || s.reschedule_of(1),
+            "CPU 1 idles, not asked, while thread 3 waits in busy CPU 0's queue: {:?}",
+            s.queued()
+        );
+    }
+
+    #[test]
+    fn cpus_at_once_without_idle_ticks() {
+        cpus_at_once(4, 6, 60_000, 0x6A09_E667_F3BC_C908, false);
+        cpus_at_once(8, 4, 40_000, 0xBB67_AE85_84CA_A73B, false);
     }
 }
