@@ -228,10 +228,14 @@ pub mod call {
     /// register as the `signal::Context` at `context` says, the flags
     /// only as far as a program may set them. Does not return.
     pub const SIGNAL_RETURN: u64 = 37;
-    /// alarm(nanoseconds) - SIGALRM to this process that long from now
-    /// (to the tick, rounded up), in place of any alarm it had set; 0
-    /// only cancels. Returns the nanoseconds the earlier one had left,
-    /// or 0. At most ALARM_MAX.
+    /// alarm(nanoseconds, interval, keep) - SIGALRM to this process that
+    /// long from now, in place of any alarm it had set; 0 only cancels.
+    /// Then, if `interval` is not 0, again every `interval` nanoseconds
+    /// (C's setitimer; stepped from the last, so it does not drift). With
+    /// `keep` 1 nothing changes - the other two are ignored - and the call
+    /// only reads (getitimer). Returns the nanoseconds the earlier one had
+    /// left, or 0. Each at most ALARM_MAX. Exact to the nanosecond the
+    /// timer can give since K24 (journal entry NNN), to the tick before.
     pub const ALARM: u64 = 38;
     /// random(buffer, length) - fills `length` bytes at `buffer` (at
     /// most RANDOM_MAX) with random bytes from the kernel's generator
@@ -286,6 +290,12 @@ pub mod call {
     /// sched_get(target, id, what) - what SCHED_SET sets, read back; and
     /// sched::THREAD_ID, the calling thread's own number.
     pub const SCHED_GET: u64 = 46;
+    /// sleep_until(nanoseconds) - sleeps until the monotonic clock
+    /// (clock::MONOTONIC) reads at least that: to the nanosecond the
+    /// timer gives, not to the tick (K24, journal entry NNN). Interrupted
+    /// if a caught signal or a kill cuts it short; 0 at once if the time
+    /// has passed.
+    pub const SLEEP_UNTIL: u64 = 47;
 }
 
 /// SCHED_SET's and SCHED_GET's words (journal entry 124). Priorities run

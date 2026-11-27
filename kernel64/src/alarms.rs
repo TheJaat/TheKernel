@@ -9,8 +9,10 @@
 //! Why a thread, and not the timer interrupt: sending a signal can wake
 //! threads and end a process, and wants locks the interrupt may already
 //! be inside (the scheduler's); and an alarm only needs to be as exact
-//! as a tick. The thread starts with the first alarm, so a system whose
-//! programs set none never has it.
+//! as the timer: since K24 (journal entry NNN) the thread sleeps to the
+//! nanosecond, as alarms are kept, so an alarm rings as soon as a timer
+//! interrupt can say so - not at the next tick. The thread starts at
+//! boot (`start`), and waits blocked until an alarm is set.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -21,11 +23,13 @@ use abi::Error;
 use crate::irqlock::IrqLock;
 use crate::process::{self, Process};
 use crate::threads::{self, WaitQueue};
-use crate::interrupts;
 
 struct Alarm {
-    /// The tick it rings at.
+    /// When it rings: nanoseconds of the clock (`threads::now_ns`).
     at: u64,
+    /// Then again every this many nanoseconds; 0: once (setitimer's
+    /// it_interval).
+    interval: u64,
     process: Weak<Process>,
 }
 
@@ -36,23 +40,29 @@ static CHANGES: AtomicU64 = AtomicU64::new(0);
 static CHANGED: WaitQueue = WaitQueue::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-const NANOS_PER_TICK: u64 = 1_000_000_000 / interrupts::HZ;
 
-/// The ALARM call: SIGALRM to this process `nanoseconds` from now
-/// (rounded up to a tick), in place of any alarm it had; 0 only cancels.
-/// Returns the nanoseconds the one before had left, or 0.
-pub fn set(nanoseconds: u64) -> Result<u64, Error> {
-    if nanoseconds > abi::ALARM_MAX {
+/// The ALARM call: SIGALRM to this process `nanoseconds` from now, in
+/// place of any alarm it had, and then every `interval` if that is not
+/// 0; 0 only cancels. With `keep` 1, nothing changes. Returns the
+/// nanoseconds the one before had left, or 0.
+pub fn set(nanoseconds: u64, interval: u64, keep: u64) -> Result<u64, Error> {
+    if nanoseconds > abi::ALARM_MAX || interval > abi::ALARM_MAX || keep > 1 {
         return Err(Error::InvalidArgument);
     }
     let me = process::current().ok_or(Error::InvalidArgument)?;
-    let now = interrupts::ticks();
+    let now = threads::now_ns();
     let left = {
         let mut alarms = ALARMS.lock();
         let mine = alarms.iter().position(|alarm| core::ptr::eq(alarm.process.as_ptr(), Arc::as_ptr(&me)));
-        let left = mine.map_or(0, |n| alarms.swap_remove(n).at.saturating_sub(now) * NANOS_PER_TICK);
+        let left = mine.map_or(0, |n| alarms[n].at.saturating_sub(now));
+        if keep == 1 {
+            return Ok(left);
+        }
+        if let Some(n) = mine {
+            alarms.swap_remove(n);
+        }
         if nanoseconds > 0 {
-            alarms.push(Alarm { at: now + nanoseconds.div_ceil(NANOS_PER_TICK), process: Arc::downgrade(&me) });
+            alarms.push(Alarm { at: now + nanoseconds, interval, process: Arc::downgrade(&me) });
         }
         // Gone processes' alarms go too - on any change, so the list
         // never holds more than the processes that set one since.
@@ -60,27 +70,45 @@ pub fn set(nanoseconds: u64) -> Result<u64, Error> {
         left
     };
     CHANGES.fetch_add(1, Ordering::AcqRel);
+    start();
+    CHANGED.wake_all();
+    Ok(left)
+}
+
+/// Starts the "alarms" thread, if it has not started. At boot, before
+/// init (journal entry NNN): it used to start with the first alarm, so
+/// that a system none set never had it; but then the first program that
+/// set one left a thread behind that was not there before - which the
+/// boot test's "ps before and after" counts as a leak. Waiting, it costs
+/// nothing: a tick looks only at the sleepers due (K96).
+pub fn start() {
     if !STARTED.swap(true, Ordering::AcqRel) {
         threads::spawn("alarms", ring);
     }
-    CHANGED.wake_all();
-    Ok(left)
 }
 
 /// The "alarms" thread.
 fn ring() {
     loop {
         let seen = CHANGES.load(Ordering::Acquire);
-        let now = interrupts::ticks();
+        let now = threads::now_ns();
         let (due, next): (Vec<Arc<Process>>, Option<u64>) = {
             let mut alarms = ALARMS.lock();
             let mut due = Vec::new();
-            alarms.retain(|alarm| {
+            alarms.retain_mut(|alarm| {
                 if alarm.at > now {
                     return true;
                 }
                 due.extend(alarm.process.upgrade());
-                false
+                if alarm.interval == 0 {
+                    return false;
+                }
+                // Again, stepped from when it was due, so that it does not
+                // drift; intervals missed meanwhile ring once, as on Linux
+                // (a signal pending is pending once).
+                let behind = (now - alarm.at) / alarm.interval;
+                alarm.at += (behind + 1) * alarm.interval;
+                alarm.process.strong_count() > 0
             });
             (due, alarms.iter().map(|alarm| alarm.at).min())
         };
@@ -89,6 +117,6 @@ fn ring() {
         }
         // Until the next is due, or the list changes. Rule 2 of
         // threads.rs: a change after `seen` was read is seen here.
-        let _ = threads::wait_any_until(&[&CHANGED], next, || CHANGES.load(Ordering::Acquire) == seen);
+        let _ = threads::wait_any_until_ns(&[&CHANGED], next, || CHANGES.load(Ordering::Acquire) == seen);
     }
 }

@@ -864,7 +864,13 @@ pub enum Waited {
 /// Whichever comes first, it then looks at the condition and the clock
 /// again.
 #[must_use = "a wait can be cut short: check before relying on the condition"]
-pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, mut condition: impl FnMut() -> bool) -> Waited {
+pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, condition: impl FnMut() -> bool) -> Waited {
+    wait_any_until_ns(queues, deadline.map(tick_ns), condition)
+}
+
+/// `wait_any_until`, the deadline in nanoseconds of the clock (`now_ns`)
+/// rather than a tick (K24, journal entry NNN).
+pub fn wait_any_until_ns(queues: &[&WaitQueue], deadline: Option<u64>, mut condition: impl FnMut() -> bool) -> Waited {
     loop {
         // Interrupts off from here to the switch: this thread must not
         // be taken off its CPU by the timer while it is marked as
@@ -877,14 +883,14 @@ pub fn wait_any_until(queues: &[&WaitQueue], deadline: Option<u64>, mut conditio
             queue.add(me);
         }
         // "I am waiting" - so that a wake-up from now on has an effect:
-        announce(deadline.map_or(State::Blocked, |tick| State::Sleeping(tick_ns(tick))));
+        announce(deadline.map_or(State::Blocked, State::Sleeping));
         // And only now, look. Whatever happens after this look comes
         // with a wake-up that finds the two steps above already done.
         let ended = if !condition() {
             Some(Waited::Done)
         } else if interrupted() {
             Some(Waited::Interrupted)
-        } else if deadline.is_some_and(|deadline| interrupts::ticks() >= deadline) {
+        } else if deadline.is_some_and(|deadline| now_ns() >= deadline) {
             Some(Waited::TimedOut)
         } else {
             None

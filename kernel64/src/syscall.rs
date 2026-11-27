@@ -71,7 +71,14 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::CLOCK => crate::clock::read(args[0]),
         call::SIGNAL_SETUP => process::signal_setup(args[0], args[1], args[2], args[3]),
         call::SIGNAL_SEND => ipc::signal(args[0], args[1]),
-        call::ALARM => crate::alarms::set(args[0]),
+        call::ALARM => crate::alarms::set(args[0], args[1], args[2]),
+        call::SLEEP_UNTIL => {
+            if threads::sleep_until_ns(args[0]) {
+                Ok(0)
+            } else {
+                Err(Error::Interrupted)
+            }
+        }
         call::RANDOM => crate::random::fill(args[0], args[1]),
         call::PROGRAM_HEADERS => process::program_headers(args[0], args[1]),
         call::SIGNAL_STACK => threads::set_signal_stack(args[0], args[1]),

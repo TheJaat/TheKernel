@@ -535,6 +535,7 @@ fn start_init(
         (from_kernel, Rights(abi::rights::RECEIVE)),
         (Object::System, Rights::ALL),
     ];
+    alarms::start();
     let (init, _) = process::spawn("init", programs::INIT, handles).expect("starting init");
     process::set_essential(&init);
     true
@@ -893,6 +894,7 @@ fn start_init(info: &BootInfo) {
     // In the fault-init test, "init" is a program that says hello and
     // ends - to see what the kernel does when init does.
     let program = if cfg!(feature = "fault-init") { programs::HELLO } else { programs::INIT };
+    alarms::start();
     let (init, _) = process::spawn("init", program, handles).expect("starting init");
     process::set_essential(&init);
 }
