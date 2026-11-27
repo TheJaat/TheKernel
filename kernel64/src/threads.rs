@@ -628,9 +628,9 @@ fn schedule() {
     // Rule 1: marked before `pick_next` may queue it - from that moment
     // another CPU may take it, and must wait until it is saved.
     let leaving = here();
-    // SAFETY (this and every `*leaving` below): the running thread's
-    // record, which lives while it runs (rule 4); its fields are this
-    // CPU's until `switched` clears the flag set here.
+    // SAFETY: the running thread's record, which lives while it runs
+    // (rule 4); its fields are this CPU's until `switched` clears the
+    // flag set here. The same holds for every `*leaving` below.
     unsafe { (*leaving).leaving.store(true, Ordering::SeqCst) };
     let mut decision = policy.pick_next_with_handles(cpu);
     // Nothing chosen, yet asked to choose again: the policy passed over a
@@ -649,6 +649,7 @@ fn schedule() {
     // The thread that gives way here may be one an idling CPU can run.
     tell_idle_cpus(policy, cpu);
     match decision {
+        // SAFETY: as above; it stays, so it is still this CPU's.
         None => unsafe { (*leaving).leaving.store(false, Ordering::Release) },
         Some((Switch { .. }, from, to)) => {
             debug_assert_eq!(from, leaving as usize);
@@ -657,8 +658,11 @@ fn schedule() {
             // leaving thread's. On x86_64 only `set_pointer` changes it,
             // and the record already has it.
             if let Some(value) = context::save_thread_pointer() {
+                // SAFETY: as above: not yet saved, so still this CPU's.
                 unsafe { (*leaving).pointer = value };
             }
+            // SAFETY: as above; only an address is taken here, written
+            // by the switch before `switched` clears the flag.
             let save = unsafe { &raw mut (*leaving).rsp };
             let next = at(to);
             // Rule 1: its last CPU may still be saving it. That CPU holds
