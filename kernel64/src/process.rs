@@ -87,7 +87,7 @@ pub struct Process {
     /// threads.rs when one of them leaves a CPU and at every tick
     /// (clock::PROCESS_CPU, journal entry 114).
     cpu_ns: AtomicU64,
-    /// Scheduling (journal entry 123): the priority its new threads get,
+    /// Scheduling (journal entry 124): the priority its new threads get,
     /// the CPUs they may run on, and its ceiling - the most important
     /// priority it may give itself, its threads or a process it started.
     sched_priority: AtomicI64,

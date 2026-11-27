@@ -10,7 +10,7 @@
 //! number of CPUs:
 //!   - each thread has a priority, from HIGHEST (-20) to LOWEST (19),
 //!     DEFAULT 0, and an affinity: the CPUs it may run on (journal entry
-//!     123). Runnable threads wait in ONE set of FIFO queues, one per
+//!     124). Runnable threads wait in ONE set of FIFO queues, one per
 //!     priority, shared by all CPUs: a CPU that needs a thread takes the
 //!     most important one allowed on it, and of those the one that has
 //!     waited longest. Work spreads over the CPUs by itself, and a
@@ -1182,7 +1182,7 @@ mod tests {
         }
         (moved, poked)
     }
-    // ---- Priorities and affinity (journal entry 123) ----------------------
+    // ---- Priorities and affinity (journal entry 124) ----------------------
 
     #[test]
     fn the_most_important_ready_thread_runs_first() {

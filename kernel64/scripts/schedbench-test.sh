@@ -59,7 +59,7 @@ for cpus in 1 2 4; do
     grep -aE '"schedbench" (killed|ended by signal)' "$T" && fail "a schedbench program was killed"
     grep -aiE 'panic|page fault in kernel' "$T" && fail "the kernel failed"
 
-    # Priorities and affinity (K20, journal entry 123) as behaviour, with
+    # Priorities and affinity (K20, journal entry 124) as behaviour, with
     # generous limits: on one or two CPUs the two programs at nice 0 keep
     # them, so the two at nice 10 get under a quarter of what they get;
     # pinned to one CPU, two busy threads get at most three quarters of
