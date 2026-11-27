@@ -43,7 +43,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kernel64::ioports::PortBitmap;
 use kernel64::sched::{Scheduler, State, Switch, ThreadId};
@@ -231,12 +231,37 @@ pub fn process_cpu_ns() -> Option<u64> {
     answer
 }
 
+/// Set when something done on a CPU - a wake-up, a new priority - asked
+/// that CPU to choose again: what the end of a system call reads before
+/// it takes the lock (`preempt_if_asked`). Without it, every call took
+/// the lock once more on its way out, about 130 ns a switch on MaK-WSL;
+/// with it, only calls that need to (journal entry 124).
+static ASKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
 fn with<R>(f: impl FnOnce(&mut Threads) -> R) -> R {
     let mut guard = THREADS.lock();
     let t = guard.as_mut().expect("threads not initialised");
     let result = f(t);
+    // The lock keeps interrupts off: this CPU is the one that did it.
+    let cpu = arch::cpu();
+    if t.policy.reschedule_pending(cpu) {
+        ASKED[cpu].store(true, Ordering::Relaxed);
+    }
     tell_idle_cpus(t);
     result
+}
+
+/// At the end of a system call: chooses again if the call asked this
+/// CPU to (a more important thread made ready here). Only the hint is
+/// read unless so; a request it misses - none should - is still taken
+/// at the next interrupt, which checks in full (`preempt_if_needed`).
+pub fn preempt_if_asked() {
+    let were_enabled = arch::disable_interrupts();
+    let asked = ASKED[arch::cpu()].swap(false, Ordering::Relaxed);
+    arch::restore_interrupts(were_enabled);
+    if asked {
+        preempt_if_needed();
+    }
 }
 
 /// Interrupts the idling CPUs the policy has just offered a thread to.
@@ -278,13 +303,17 @@ pub fn try_spawn_in(
     // SAFETY: a freshly mapped stack, nobody else's.
     let rsp = unsafe { context::initial_stack(stack.top()) };
     let stack_top = Some(stack.top());
+    // A program's new thread gets its process's priority and CPUs.
+    let (priority, affinity) = process
+        .as_ref()
+        .map_or((kernel64::sched::DEFAULT, kernel64::sched::ANY_CPU), |p| (p.sched_priority() as i8, p.sched_affinity()));
     let thread =
         Box::new(Thread { name, rsp, _stack: Some(stack), stack_top, process, entry: Some(Box::new(f)), pointer, signal_stack: (0, 0) });
     Some(with(|t| {
         let id = t.next_id;
         t.next_id += 1;
         t.table.insert(id, thread);
-        t.policy.add(id, arch::cpu());
+        t.policy.add_with(id, arch::cpu(), priority, affinity);
         id
     }))
 }
@@ -354,6 +383,30 @@ pub fn names() -> Vec<&'static str> {
 /// How many CPUs run threads.
 pub fn cpus() -> usize {
     with(|t| t.policy.cpu_count())
+}
+
+/// Gives thread `id` a new priority (journal entry 124). A thread more
+/// important than one running somewhere it may use takes that CPU: this
+/// one when the call returns (syscall.rs), another by an interrupt.
+pub fn set_priority(id: ThreadId, priority: i64) -> bool {
+    let were_enabled = arch::disable_interrupts();
+    let done = with(|t| t.policy.set_priority(id, priority as i8, arch::cpu()));
+    arch::restore_interrupts(were_enabled);
+    done
+}
+
+/// Gives thread `id` the CPUs it may run on; one on a CPU no longer
+/// allowed leaves it.
+pub fn set_affinity(id: ThreadId, affinity: u64) -> bool {
+    let were_enabled = arch::disable_interrupts();
+    let done = with(|t| t.policy.set_affinity(id, affinity, arch::cpu()));
+    arch::restore_interrupts(were_enabled);
+    done
+}
+
+/// Thread `id`'s priority and CPUs; None for an idle thread or none.
+pub fn scheduling(id: ThreadId) -> Option<(i64, u64)> {
+    with(|t| Some((t.policy.priority(id)? as i64, t.policy.affinity(id)?)))
 }
 
 pub fn count() -> usize {
