@@ -127,11 +127,13 @@ mod tests {
     #[test]
     fn no_lost_updates_under_contention() {
         let counter = Arc::new(SpinLock::new(0u64));
+        // Under Miri, which checks every access for a data race: 500 each.
+        let rounds = if cfg!(miri) { 500 } else { 20_000 };
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let counter = Arc::clone(&counter);
                 thread::spawn(move || {
-                    for _ in 0..20_000 {
+                    for _ in 0..rounds {
                         *counter.lock() += 1;
                     }
                 })
@@ -140,6 +142,6 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(*counter.lock(), 8 * 20_000);
+        assert_eq!(*counter.lock(), 8 * rounds);
     }
 }
