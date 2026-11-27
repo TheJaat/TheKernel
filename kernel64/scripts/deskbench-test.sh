@@ -17,7 +17,7 @@
 # The display prints each measurement as one line; this test checks
 # that each was printed - not how fast: a busy host and an emulated CPU
 # are slower, and a benchmark that fails on a slow machine is a flaky
-# test (entry 105). The numbers go in the journal (entry NNN), and are
+# test (entry 105). The numbers go in the journal (entry 147), and are
 # printed here.
 
 set -u
