@@ -105,7 +105,9 @@ mod tests {
     /// queue: every byte must arrive, once, in order.
     #[test]
     fn concurrent_producer_and_consumer() {
-        const COUNT: usize = 1_000_000;
+        // Under Miri, which checks every access for a data race, 20000
+        // bytes are plenty of interleavings (K187).
+        const COUNT: usize = if cfg!(miri) { 20_000 } else { 1_000_000 };
         let q: Arc<Queue<16>> = Arc::new(Queue::new());
         let producer = {
             let q = Arc::clone(&q);

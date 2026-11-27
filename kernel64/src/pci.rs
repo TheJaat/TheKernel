@@ -398,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe in this module: Miri checks nothing the test does not (K187)")]
     fn scan_finds_every_function() {
         let mut bus = Bus::default();
         bus.0.insert(at(0, 0, 0), function(0x8086, 0x1237, 0x06_00_00, false));
