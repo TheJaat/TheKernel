@@ -69,6 +69,17 @@ for test in $TESTS; do
     xorriso -as mkisofs -R -J -b stage1.bin -iso-level 3 -no-emul-boot \
         -boot-load-size 4 -o "$iso" "$iso_dir" 2>/dev/null
 
+    # Host CPUs: one per emulated CPU (qemu-boot.sh's default), but at
+    # most 4. page-20's machine has 20, and the kernel stops at its first
+    # fault, right after the CPUs start: they sit idle, and the four the
+    # kernel does not use the firmware keeps parked. Asking boot-slots.sh
+    # for 20 of the machine's 23 slots, it held the slots' gate while it
+    # waited for them - three and a half minutes in a race-hunt round -
+    # and every other boot waited behind it (night 5, TheTaaJ's journal
+    # entry on the slots; smp64-test, entry 117, runs alone for this).
+    slots=${cpus:-${SMP:-4}}
+    [ "$slots" -le 4 ] || slots=4
+
     # The same limit as an ordinary boot. It was 15 seconds while that
     # was plenty; the firmware and the loader take most of ten before
     # the kernel says a word, and a limit only matters to a boot that
@@ -77,9 +88,9 @@ for test in $TESTS; do
     # In the init test the kernel goes idle first, and init ends after:
     # the boot is over at the stop itself, not at "idle".
     if [ "$feature" = init ]; then
-        FINISHED_ONLY="THE SYSTEM HAS STOPPED" SMP=${cpus:-${SMP:-4}} "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
+        FINISHED_ONLY="THE SYSTEM HAS STOPPED" SMP=${cpus:-${SMP:-4}} SLOTS=$slots "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     else
-        SMP=${cpus:-${SMP:-4}} "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
+        SMP=${cpus:-${SMP:-4}} SLOTS=$slots "$HERE/scripts/qemu-boot.sh" "$iso" "$log" $LIMIT
     fi
     # Every one of these ends with the kernel stopped - and it must have
     # said so on the screen too, where a real machine's user would look.
