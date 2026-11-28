@@ -78,8 +78,14 @@ if [ "$MODE" = x86 ]; then
     # would otherwise end QEMU before the machine has started again.
     boot pc-reboot 60 "$(keys 'reboot') ret /" "-action reboot=reset" &
     boot pc-none 40 "$(keys 'poweroff') ret ~ $(keys 'echo still here') ret ~" "-machine pc,acpi=off" &
-    boot q35-off 90 "$(keys 'poweroff') ret" "$Q35" &
-    boot q35-reboot 120 "$(keys 'reboot') ret /" "$Q35 -action reboot=reset" &
+    # The q35's AHCI controller has no disk: its driver ends at once, five
+    # times, and init gives up on it (checked below). The shell is ready
+    # before that - typed at once, under load, `poweroff` came first, the
+    # services were stopped, and the give-up line never came: "ahci did
+    # not give up" (the second night, entry NNN). So: that line first.
+    GAVE_UP="see:ahci,ended,(code,5),5,times,in,30,s,-,giving,up,on,it"
+    boot q35-off 90 "$GAVE_UP $(keys 'poweroff') ret" "$Q35" &
+    boot q35-reboot 120 "$GAVE_UP $(keys 'reboot') ret /" "$Q35 -action reboot=reset" &
     wait
 
     # The kernel's part: what it found, and handed on.
