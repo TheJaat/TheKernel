@@ -54,6 +54,14 @@ keys() {
 }
 
 [ -f "$DISK" ] || fail "no test disk at $DISK"
+# The last run's logs go first: the host's side below waits for
+# "httpd: serving" in $LOG.net, and found the old run's line there - its
+# downloads were tried before QEMU was listening (bug 4).
+# Not "$LOG".*: the test disks are $LOG.disk and $LOG.net.disk.
+for part in net blk ahci nvme usb; do
+    rm -f "$LOG.$part" "$LOG.$part.out" "$LOG.$part.clean"
+done
+rm -f "$LOG.net.got1" "$LOG.net.got2" "$LOG.net.curl1" "$LOG.net.curl2"
 SETS="a:3 b:17 c:40"
 
 steps=""
@@ -95,15 +103,21 @@ port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0
 net_steps="$(keys 'niccheck crash 200') ret ~ $(keys 'httpd 80 /www 2') ret ~~ $(keys 'echo == end ==') ret ~"
 DISK="$NETDISK" KEYS="$net_steps" QEMU_ARGS="-netdev user,id=n0,hostfwd=tcp:127.0.0.1:$port-:80 -device virtio-net-pci,netdev=n0" SMP=1 \
     "$HERE/qemu-boot.sh" "$IMAGE" "$LOG.net" 150 > "$LOG.net.out" 2>&1 &
-# This host's side: once httpd serves, the two downloads.
+net_boot=$!
+# This host's side: once httpd serves, the two downloads. No time limit
+# of its own: qemu-boot.sh may first wait for free CPUs (boot-slots.sh),
+# under make test64 for minutes, with no QEMU yet and so nothing on the
+# port - a fixed 120 s here made the downloads run against nothing
+# (bug 4). It waits for the line, or for that boot to end.
 (
-    ticks=0
-    until grep -aq '^httpd: serving' "$LOG.net" 2>/dev/null || [ $ticks -ge 1200 ]; do
+    until grep -aq '^httpd: serving' "$LOG.net" 2>/dev/null; do
+        kill -0 $net_boot 2>/dev/null || break
         sleep 0.1
-        ticks=$((ticks + 1))
     done
     for n in 1 2; do
-        curl -s --max-time 90 -o "$LOG.net.got$n" -w '%{http_code} %{size_download}\n' "http://127.0.0.1:$port/big.bin" > "$LOG.net.curl$n" 2>&1
+        # -S: curl's own error, if any, goes in the log with the time it
+        # waited - "000 0" alone said nothing (bug 4).
+        curl -sS --max-time 90 -o "$LOG.net.got$n" -w '%{http_code} %{size_download} after %{time_total} s\n' "http://127.0.0.1:$port/big.bin" > "$LOG.net.curl$n" 2>&1
     done
 ) &
 wait
