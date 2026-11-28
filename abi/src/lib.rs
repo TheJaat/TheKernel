@@ -35,6 +35,10 @@
 /// time (the C library's `time` and `gettimeofday`).
 pub const TICKS_PER_SECOND: u64 = 100;
 
+/// The system log's ring, shared by the kernel and the log service
+/// (TheTaaJ K136).
+pub mod log;
+
 pub mod call {
     /// exit(code) - ends the process. Never returns.
     pub const EXIT: u64 = 0;

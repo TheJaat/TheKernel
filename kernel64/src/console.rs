@@ -87,6 +87,11 @@ impl Write for Console {
             self.ended = Some(text.ends_with('\n'));
         }
         crate::arch::console_write(text);
+        // And in the system log (K136) - not while stopping: last words
+        // must not wait for anything.
+        if !STOPPING.load(Ordering::Relaxed) {
+            crate::logtap::piece(Writer::Kernel, text.as_bytes());
+        }
         // And on the screen - once the kernel has taken it, to stop.
         #[cfg(target_arch = "x86_64")]
         crate::lastwords::echo(text);
@@ -155,6 +160,7 @@ struct Held<'a> {
 impl Write for Held<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         self.log.write(Writer::Kernel, text.as_bytes(), self.now);
+        crate::logtap::piece(Writer::Kernel, text.as_bytes());
         Ok(())
     }
 }
@@ -163,6 +169,7 @@ impl Write for Held<'_> {
 /// there is no room the message is dropped, and counted.
 pub fn write_later(pid: u64, bytes: &[u8]) {
     QUEUE.lock().write(Writer::Program(pid), bytes, crate::interrupts::ticks());
+    crate::logtap::piece(Writer::Program(pid), bytes);
 }
 
 /// Writes a little of what is queued; false if there was nothing. For

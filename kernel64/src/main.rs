@@ -43,6 +43,7 @@ mod interrupts;
 mod irqlock;
 #[cfg(target_arch = "x86_64")]
 mod lastwords;
+mod logtap;
 mod futex;
 mod ipc;
 mod memory_object;
@@ -109,6 +110,9 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
         lastwords::prepare(fb);
     }
 
+    // The system log's ring (K136): from here on, everything written to
+    // the debug log is kept for the log service, the self-tests too.
+    logtap::start();
     selftest::run();
 
     // Interrupts: find the controllers, set them up, switch on.
@@ -312,6 +316,9 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     }
     kprintln!("[tree] read again through the direct map: the same {} nodes, in memory kept out of the allocator", machine.nodes);
 
+    // The system log's ring (K136): from here on, everything written to
+    // the debug log is kept for the log service, the self-tests too.
+    logtap::start();
     selftest::run();
     arch::mmu::selftest();
 
@@ -526,6 +533,7 @@ fn start_init(
         }
     }
     power::offer(&to_init, machine.firmware_call);
+    logtap::offer(&to_init);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![
@@ -880,6 +888,7 @@ fn start_init(info: &BootInfo) {
     }
     devices::offer(&to_init);
     power::offer(&to_init, info.acpi_rsdp);
+    logtap::offer(&to_init);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![

@@ -705,6 +705,8 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
 pub fn start(loaded: &Loaded, handles: Vec<(Object, Rights)>, argument: u64) -> ThreadId {
     let process = &loaded.process;
     let count = handles.len() as u64;
+    // The system log names the program on its lines (K136).
+    crate::logtap::started(process.pid, &process.name);
     {
         let mut table = process.handles.lock();
         for (n, (object, rights)) in handles.into_iter().enumerate() {

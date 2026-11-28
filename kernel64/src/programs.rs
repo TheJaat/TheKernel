@@ -58,6 +58,8 @@ pub static REGISTRY: &[u8] = program!("registry");
 /// Switches the machine off and resets it, when init asks: ACPI's ports
 /// on a PC, the POWER call (PSCI) on AArch64 (src/power.rs).
 pub static POWER: &[u8] = program!("power");
+/// The system log service (K136): the kernel's log ring, kept in a file.
+pub static LOGD: &[u8] = program!("logd");
 
 /// PC only: they use I/O ports, a segment register, or devices only
 /// the PC kernel knows how to hand out so far.
@@ -138,6 +140,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("net", NET),
     ("registry", REGISTRY),
     ("power", POWER),
+    ("logd", LOGD),
     ("echod", ECHOD),
     ("echoc", ECHOC),
     ("hello", HELLO),
@@ -159,6 +162,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("net", NET),
     ("registry", REGISTRY),
     ("power", POWER),
+    ("logd", LOGD),
     ("echod", ECHOD),
     ("echoc", ECHOC),
     ("hello", HELLO),
