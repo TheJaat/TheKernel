@@ -150,6 +150,11 @@ impl Process {
     /// The CPU time its threads have used so far, in nanoseconds - up to
     /// each one's last switch or tick (threads::process_cpu_ns adds the
     /// part running now).
+    /// Its threads that have not ended (for `top`, K141).
+    pub fn thread_count(&self) -> usize {
+        self.threads.lock().len()
+    }
+
     pub fn cpu_ns(&self) -> u64 {
         self.cpu_ns.load(Ordering::Relaxed)
     }

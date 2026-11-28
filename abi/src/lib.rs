@@ -1417,22 +1417,38 @@ pub struct ProcessEntry {
     /// The CPU time its threads have used, in nanoseconds (as
     /// clock::PROCESS_CPU); for an ended process, all it ever used.
     pub cpu_ns: u64,
+    /// The memory charged to it, in bytes: its program's pages, its
+    /// stack, what it reserved and touched, the memory objects it made
+    /// (its account, TheTaaJ K141).
+    pub memory: u64,
+    /// Its threads that have not ended.
+    pub threads: u64,
+    /// The handles it holds.
+    pub handles: u64,
 }
 
 impl ProcessEntry {
-    pub const WORDS: usize = 5;
+    pub const WORDS: usize = 8;
     const RUNNING: u64 = i64::MIN as u64;
 
     pub fn to_words(&self) -> [u64; Self::WORDS] {
         let name = |half: usize| u64::from_le_bytes(self.name[half * 8..half * 8 + 8].try_into().unwrap());
-        [self.pid, name(0), name(1), self.exit_code.map_or(Self::RUNNING, |c| c as u64), self.cpu_ns]
+        [self.pid, name(0), name(1), self.exit_code.map_or(Self::RUNNING, |c| c as u64), self.cpu_ns, self.memory, self.threads, self.handles]
     }
 
     pub fn from_words(w: [u64; Self::WORDS]) -> ProcessEntry {
         let mut name = [0; 16];
         name[..8].copy_from_slice(&w[1].to_le_bytes());
         name[8..].copy_from_slice(&w[2].to_le_bytes());
-        ProcessEntry { pid: w[0], name, exit_code: (w[3] != Self::RUNNING).then_some(w[3] as i64), cpu_ns: w[4] }
+        ProcessEntry {
+            pid: w[0],
+            name,
+            exit_code: (w[3] != Self::RUNNING).then_some(w[3] as i64),
+            cpu_ns: w[4],
+            memory: w[5],
+            threads: w[6],
+            handles: w[7],
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -2692,7 +2708,7 @@ mod tests {
         let mut name = [0u8; 16];
         name[..7].copy_from_slice(b"cprimes");
         for exit_code in [None, Some(0), Some(-1), Some(i64::MAX)] {
-            let entry = super::ProcessEntry { pid: 42, name, exit_code, cpu_ns: 1_234_567_890 };
+            let entry = super::ProcessEntry { pid: 42, name, exit_code, cpu_ns: 1_234_567_890, memory: 3 << 20, threads: 4, handles: 9 };
             assert_eq!(super::ProcessEntry::from_words(entry.to_words()), entry);
         }
         assert_eq!(super::ProcessEntry::default().name(), "");
