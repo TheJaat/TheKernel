@@ -4,6 +4,10 @@
 #
 #   usage: fault-test.sh STAGE1_BIN STAGE2_BIN BUILD_DIR [test...]
 #
+# make test64 runs each test as a part of its own, in parallel
+# (fault64-page-test, ...; TheTaaJ's journal entry on splitting the long
+# parts): each has its own cargo target directory, ISO and log.
+#
 # A protection that silently fails to fault is exactly the kind of bug
 # nothing else would notice, so each one gets a boot of its own.
 
@@ -13,12 +17,12 @@ STAGE1=$1
 STAGE2=$2
 BUILD=$3
 shift 3
-TESTS=${*:-page page@20 double rodata nx stack thread-stack init}
+TESTS=${*:-page page-20 double rodata nx stack thread-stack init}
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 
-# A test is a fault-* feature, and after an @ how many CPUs to boot with
-# (otherwise qemu-boot.sh's 4). page@20: the page fault with 20 CPUs, 4
+# A test is a fault-* feature, and after an @ or a last "-" how many
+# CPUs to boot with (otherwise qemu-boot.sh's 4). page-20 (or page@20): the page fault with 20 CPUs, 4
 # more than the kernel uses - which the firmware keeps parked, and which
 # the NMI that stops the other CPUs must not reach: it was a triple
 # fault, and nothing of the report got out (journal entry 119).
@@ -39,12 +43,17 @@ expected() {
 
 failed=0
 for test in $TESTS; do
-    feature=${test%@*}
-    cpus=
-    [ "$feature" = "$test" ] || cpus=${test#*@}
     name=$(echo "$test" | tr @ -)
+    feature=$name
+    cpus=
+    case $name in
+        *-[0-9]|*-[0-9][0-9]) feature=${name%-*}; cpus=${name##*-} ;;
+    esac
     pattern=$(expected "$feature")
-    target="$HERE/target/fault-$feature"   # separate, so builds don't evict each other
+    # Separate, so builds don't evict each other - and one per test, not
+    # per feature: page and page-20 run at once, and fill-symbols.py
+    # writes into the kernel it was given.
+    target="$HERE/target/fault-$name"
     iso_dir="$BUILD/fault64-$name"
     iso="$BUILD/fault64-$name.iso"
     log="$BUILD/fault64-$name.log"
