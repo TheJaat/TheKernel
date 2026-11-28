@@ -509,6 +509,23 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
         if let Some(abort) = syndrome.abort() {
             kprintln!("[process]   {abort} at {:#x}: {}", fault_address(), abort.cause);
         }
+        // Its crash report, for the system log (K138).
+        let what = match syndrome.abort() {
+            Some(abort) => alloc::format!("{name} at {:#x}: {abort} at {:#x}: {}", frame.elr, fault_address(), abort.cause),
+            None => alloc::format!("{name} at {:#x}", frame.elr),
+        };
+        const NAMES: [&str; 31] = [
+            "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+            "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
+        ];
+        let mut registers = [("", 0u64); 34];
+        registers[0] = ("pc", frame.elr);
+        registers[1] = ("sp", frame.sp);
+        registers[2] = ("spsr", frame.spsr);
+        for (n, name) in NAMES.iter().enumerate() {
+            registers[3 + n] = (name, frame.x[n]);
+        }
+        crate::process::report_current(&what, &registers, frame.sp);
         crate::process::kill_current(name);
     }
 

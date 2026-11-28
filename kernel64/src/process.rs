@@ -705,6 +705,8 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
 pub fn start(loaded: &Loaded, handles: Vec<(Object, Rights)>, argument: u64) -> ThreadId {
     let process = &loaded.process;
     let count = handles.len() as u64;
+    // The system log names the program on its lines (K136).
+    crate::logtap::started(process.pid, &process.name);
     {
         let mut table = process.handles.lock();
         for (n, (object, rights)) in handles.into_iter().enumerate() {
@@ -875,6 +877,29 @@ fn stop_the_system(name: &str, how: core::fmt::Arguments) -> ! {
 /// Ends the current process with `code`.
 pub fn exit_current(code: i64) -> ! {
     end_current(code, format_args!("exited with code {code}"))
+}
+
+/// The current process broke a rule and is about to be ended: its
+/// crash report (K138, kernel64::crashreport) - `what` it did, its
+/// `registers`, the top of its stack and its memory - into the system
+/// log, for the log service to keep.
+pub fn report_current(what: &str, registers: &[(&str, u64)], stack_pointer: u64) {
+    let Some(process) = current() else { return };
+    let mut memory: Vec<(core::ops::Range<u64>, &str, &str)> =
+        kernel64::crashreport::segments(&process.headers).into_iter().map(|(range, allows)| (range, allows, "its program")).collect();
+    memory.push((process.stack.clone(), "rw-", "stack"));
+    for (range, mapping) in process.mappings.lock().iter() {
+        memory.push(match mapping {
+            Mapping::Object(_) => (range.clone(), "r??", "memory object"),
+            Mapping::Reserved(_) => (range.clone(), "r??", "reserved memory"),
+        });
+    }
+    memory.sort_by_key(|(range, _, _)| range.start);
+    // The top of the stack: up to 512 bytes, as far as the stack goes.
+    let length = process.stack.end.saturating_sub(stack_pointer).min(512);
+    let stack = if process.stack.contains(&stack_pointer) { copy_from_user(stack_pointer, length).unwrap_or_default() } else { Vec::new() };
+    let report = kernel64::crashreport::Report { what, registers, stack_pointer, stack: &stack, memory: &memory };
+    crate::logtap::report(process.pid, &kernel64::crashreport::format(&report));
 }
 
 /// Ends the current process for breaking the rules.

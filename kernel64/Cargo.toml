@@ -45,6 +45,7 @@ fault-stack = ["fault-tests"]       # overflow the boot stack
 fault-thread-stack = ["fault-tests"] # overflow a kernel thread's stack
 fault-init = ["fault-tests"]         # init is a program that ends
 fault-null = ["fault-tests"]         # read through a null pointer (AArch64 so far)
+fault-panic = ["fault-tests"]        # panic, reset, and find the crash record (K188)
 
 # A kernel made deliberately large, so that it ends well above 2 MiB:
 # checks that the bootloaders load all of a big kernel, and correctly.

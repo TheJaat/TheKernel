@@ -262,7 +262,9 @@ boot() {
         fail "the serial port was guessed though the tree describes it"
     fi
     free=$((mib - ${KEPT:-0}))
-    top=$(printf '%x' $((0x40000000 + free * 1048576 - 4096)))
+    # The highest free frame: below the crash record's 64 KiB, which is
+    # at the top of what is free (K188).
+    top=$(printf '%x' $((0x40000000 + free * 1048576 - 65536 - 4096)))
     need "$log" "\[memory\] [0-9]+ frames free of $((mib * 256 + 262144)) \(($((free - 4))|$((free - 3))|$((free - 2))|$((free - 1))) MiB\), bitmap [0-9]+ KiB at 0x4"
     need "$log" "\[memory\] own page tables at 0x4[0-9a-f]+: direct map 0xffff800000000000, NX on"
     need "$log" "\[memory\] heap at 0xffffc00000000000, 1024 KiB to start"
