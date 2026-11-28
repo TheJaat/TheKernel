@@ -209,6 +209,7 @@ pub fn timer_wake_by(at: u64) {
 /// disabled. Must acknowledge the interrupt (EOI) or the local APIC will
 /// deliver nothing more at this priority.
 pub fn handle_interrupt(vector: u8) {
+    crate::tracing::point(abi::trace::kind::INTERRUPT, u64::from(vector));
     match vector {
         // EOI before `interrupt_done`, which may switch threads: the
         // APIC must be ready for the next interrupt even if this thread

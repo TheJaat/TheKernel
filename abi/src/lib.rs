@@ -38,6 +38,9 @@ pub const TICKS_PER_SECOND: u64 = 100;
 /// The system log's ring, shared by the kernel and the log service
 /// (TheTaaJ K136).
 pub mod log;
+/// Tracing's per-CPU rings, shared by the kernel and whoever holds the
+/// tracing handle (TheTaaJ K139).
+pub mod trace;
 
 pub mod call {
     /// exit(code) - ends the process. Never returns.

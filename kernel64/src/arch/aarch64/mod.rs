@@ -305,6 +305,7 @@ pub fn rearm_interrupt(id: u32) {
 /// handler, and the interrupt "returns" when the thread next runs.
 fn interrupt() {
     while let Some((id, raw)) = gic::acknowledge() {
+        crate::tracing::point(abi::trace::kind::INTERRUPT, u64::from(id));
         if id == timer::interrupt() {
             timer::on_interrupt();
         } else if id == kernel64::gic::SOFTWARE_RESCHEDULE {

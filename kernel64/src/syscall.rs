@@ -19,6 +19,7 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
     // while (or sleep), so let the timer in - the thread is on its own
     // kernel stack and can be preempted like any other.
     arch::enable_interrupts();
+    crate::tracing::point(abi::trace::kind::SYSCALL, number);
     let result = match number {
         call::EXIT => process::exit_current(args[0] as i64),
         call::DEBUG_WRITE => debug_write(args[0], args[1]),

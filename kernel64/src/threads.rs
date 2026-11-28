@@ -707,6 +707,12 @@ fn schedule() {
                     None => arch::set_io_bitmap(&PortBitmap::NONE),
                 }
             }
+            // Traced while the leaving thread is still this CPU's: its
+            // process is the event's, the arriving one's is the value.
+            // (`next` is the record the policy gave this CPU, as above;
+            // only its process is read.)
+            let arriving = (*next).process.as_ref().map_or(0, |p| p.pid);
+            crate::tracing::point(abi::trace::kind::SWITCH, arriving);
             CURRENT[cpu].store(to, Ordering::Relaxed);
             PREVIOUS[cpu].store(from, Ordering::Relaxed);
             // SAFETY: interrupts are off; `save` is the leaving thread's,

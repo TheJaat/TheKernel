@@ -208,6 +208,7 @@ pub fn send(handle: Handle, data: u64, length: u64, handles: u64, count: u64) ->
     }
     drop(state);
     drop(table);
+    crate::tracing::point(abi::trace::kind::SEND, length);
     end.shared.readable[peer(end.end)].wake_all();
     Ok(0)
 }
@@ -244,6 +245,7 @@ pub fn receive(handle: Handle, buffer: u64, capacity: u64, handles: u64, handle_
         drop(table);
         process::copy_to_user(buffer, &message.data)?;
         process::copy_to_user(handles, &handles_to_bytes(&installed))?;
+        crate::tracing::point(abi::trace::kind::RECEIVE, length as u64);
         return Ok(length as u64 | (count as u64) << 32);
     }
 }

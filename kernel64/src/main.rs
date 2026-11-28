@@ -44,6 +44,7 @@ mod irqlock;
 #[cfg(target_arch = "x86_64")]
 mod lastwords;
 mod logtap;
+mod tracing;
 mod futex;
 mod ipc;
 mod memory_object;
@@ -579,6 +580,7 @@ fn start_init(
     }
     power::offer(&to_init, machine.firmware_call);
     logtap::offer(&to_init);
+    tracing::offer(&to_init);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![
@@ -934,6 +936,7 @@ fn start_init(info: &BootInfo) {
     devices::offer(&to_init);
     power::offer(&to_init, info.acpi_rsdp);
     logtap::offer(&to_init);
+    tracing::offer(&to_init);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 
     let handles = alloc::vec![

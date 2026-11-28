@@ -441,6 +441,7 @@ pub enum Fault {
 /// A user-mode access to `address` (a write if `write`) found no page.
 /// If the address is reserved, the page is filled now.
 pub fn fault_in(address: u64, write: bool) -> Fault {
+    crate::tracing::point(abi::trace::kind::FAULT, address);
     let Some(process) = current() else { return Fault::NotOurs };
     let mappings = process.mappings.lock();
     let mut tables = process.tables.lock();
