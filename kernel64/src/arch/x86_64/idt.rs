@@ -267,6 +267,11 @@ pub unsafe fn init() {
         let ist = if vector == 8 || vector == 2 { DOUBLE_FAULT_IST } else { 0 };
         (*idt)[vector] = gate((*stubs)[vector], ist);
     }
+    // A program may take the breakpoint (`int3`) itself - a debugger's
+    // breakpoint is one in its code (K142): its gate allows ring 3 (DPL
+    // 3). Any other vector a program raises with `int N` is still a
+    // general protection fault.
+    (*idt)[BREAKPOINT as usize].attributes = INTERRUPT_GATE | 0x60;
     let first = &raw const irq_stubs as u64;
     for vector in 32..256 {
         (*idt)[vector] = gate(first + IRQ_STUB_SIZE * (vector as u64 - 32), 0);
@@ -432,6 +437,12 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
     let name = NAMES.get(frame.vector as usize).copied().unwrap_or("unknown");
 
     if frame.vector == BREAKPOINT {
+        // A program's, under a debugger (K142): it stops here, at the
+        // `int3`'s address (the CPU reports the one after it).
+        if frame.cs & 3 == 3 && crate::debug::breakpoint(frame.rip - 1) {
+            crate::signals::on_return(frame);
+            return;
+        }
         kprintln!("[cpu] breakpoint at {:#x} - continuing", frame.rip);
         return;
     }

@@ -411,10 +411,10 @@ fn spawn_from(
     let moved = table.remove_all(&handles, Rights(rights::TRANSFER), |_| true)?;
     let given = moved.into_iter().zip(&pairs).map(|((object, _), &(_, wanted))| (object, wanted)).collect();
     process::start(&loaded, given, argument);
-    // The handle lets its holder wait for the process, and end it; and
-    // pass it on (the shell's `run` relies on it), so that whoever asked
-    // for the program can do both.
-    table.insert(Object::Process(Arc::clone(&loaded)), Rights(rights::TRANSFER | rights::KILL))
+    // The handle lets its holder wait for the process, end it, and debug
+    // it (K142); and pass it on (the shell's `run` relies on it), so that
+    // whoever asked for the program can do all three.
+    table.insert(Object::Process(Arc::clone(&loaded)), Rights(rights::TRANSFER | rights::KILL | rights::DEBUG))
 }
 
 /// SCHED_SET's and SCHED_GET's target process: this one (`id` 0), or

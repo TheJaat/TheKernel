@@ -453,6 +453,12 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
     let synchronous = vector.is_multiple_of(4);
 
     if synchronous && syndrome.class() == Syndrome::BREAKPOINT {
+        // A program's, under a debugger (K142): it stops here, at the
+        // `brk` (the address saved is its own).
+        if frame.spsr & 0xf == 0 && crate::debug::breakpoint(frame.elr) {
+            crate::signals::on_return(frame);
+            return;
+        }
         kprintln!("[cpu] breakpoint at {:#x} - continuing", frame.elr);
         // On AArch64 the saved address is that of the `brk` itself, not
         // of the instruction after it as on x86. Returning there would

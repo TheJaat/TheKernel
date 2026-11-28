@@ -54,6 +54,7 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::PROCESS_LIST => ipc::process_list(args[0], args[1], args[2]),
         call::PROCESS_SPAWN_IMAGE => ipc::spawn_image(args[0], args[1], args[2]),
         call::PROCESS_KILL => ipc::kill(args[0]),
+        call::PROCESS_DEBUG => crate::debug::call(args[0], args[1], args[2], args[3], args[4]),
         call::MEMORY_SIZE => ipc::memory_size(args[0]),
         call::OBJECT_WAIT_UNTIL => ipc::object_wait_until(args[0], args[1], Some(args[2])),
         call::POWER => crate::power::system_power(args[0], args[1]),

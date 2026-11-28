@@ -126,6 +126,8 @@ pub struct Process {
     mappings: IrqLock<Regions<Mapping>>,
     /// The stack of its first thread: reserved, filled as touched.
     stack: core::ops::Range<u64>,
+    /// Its debugging (K142, debug.rs): stopped threads, breakpoints.
+    pub debug: IrqLock<crate::debug::State>,
     /// The pages it has taken, and may (account.rs). Shared with the
     /// memory objects it made, which give theirs back when they go.
     pub account: Arc<Account>,
@@ -150,6 +152,49 @@ impl Process {
     /// The CPU time its threads have used so far, in nanoseconds - up to
     /// each one's last switch or tick (threads::process_cpu_ns adds the
     /// part running now).
+    /// For its debugger (K142): reads `bytes.len()` bytes of this
+    /// process's memory at `address` into `bytes`, or writes them there
+    /// (`write`) - wherever the program may reach, its code included:
+    /// how a breakpoint is set. Pages it never touched are not there.
+    /// Its code is its own copy (each process's pages are its own), so
+    /// no other process sees a change.
+    pub fn debug_memory(&self, address: u64, bytes: &mut [u8], write: bool) -> Result<(), Error> {
+        let end = address.checked_add(bytes.len() as u64).ok_or(Error::BadAddress)?;
+        if end > abi::USER_END {
+            return Err(Error::BadAddress);
+        }
+        let mut tables = self.tables.lock();
+        let tables = tables.as_mut().ok_or(Error::BadAddress)?;
+        let mut at = address;
+        while at < end {
+            let translation = tables.translate(VirtAddr::new(at)).ok_or(Error::BadAddress)?;
+            if !translation.flags.contains(Flags::USER) {
+                return Err(Error::BadAddress);
+            }
+            let chunk = ((PAGE_SIZE - at % PAGE_SIZE).min(end - at)) as usize;
+            let done = (at - address) as usize;
+            let there = phys_to_virt(translation.physical).as_mut_ptr::<u8>();
+            // SAFETY: `chunk` bytes of one of the process's pages,
+            // through the direct map; the tables' lock keeps it mapped.
+            unsafe {
+                if write {
+                    core::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), there, chunk);
+                } else {
+                    core::ptr::copy_nonoverlapping(there, bytes[done..].as_mut_ptr(), chunk);
+                }
+            }
+            at += chunk as u64;
+        }
+        // Code written through another address than the program's: on
+        // AArch64 the instruction cache must forget what it held.
+        #[cfg(target_arch = "aarch64")]
+        if write {
+            // SAFETY: cache maintenance only.
+            unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack)) };
+        }
+        Ok(())
+    }
+
     /// Its threads that have not ended (for `top`, K141).
     pub fn thread_count(&self) -> usize {
         self.threads.lock().len()
@@ -700,6 +745,7 @@ pub fn load_limited(name: &str, file: &(impl elf::Source + ?Sized), limit: Optio
         mappings: IrqLock::new(Regions::new(MAPPING_AREA)),
         stack: USER_STACK_TOP - image.stack..USER_STACK_TOP,
         account,
+        debug: IrqLock::new(crate::debug::State::default()),
     });
     ALL.lock().push(Arc::downgrade(&process));
     Ok(Loaded { process, entry: image.entry })

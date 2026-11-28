@@ -45,6 +45,7 @@ mod irqlock;
 mod lastwords;
 mod logtap;
 mod tracing;
+mod debug;
 mod futex;
 mod ipc;
 mod memory_object;

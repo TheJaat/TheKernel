@@ -92,6 +92,8 @@ pub fn return_from(frame: &mut impl UserFrame, pointer: u64) {
 /// What every return to user mode does: the process ends there if it
 /// was asked to; otherwise a caught signal is delivered there.
 pub fn on_return(frame: &mut impl UserFrame) {
+    // Stopped by a debugger (K142): here, until let go.
+    crate::debug::checkpoint(frame);
     process::stop_if_killed();
     deliver_pending(frame);
 }

@@ -41,6 +41,9 @@ pub mod log;
 /// Tracing's per-CPU rings, shared by the kernel and whoever holds the
 /// tracing handle (TheTaaJ K139).
 pub mod trace;
+/// The debugger's call: its operations and why a process stopped
+/// (TheTaaJ K142).
+pub mod debug;
 /// The kernel's symbol table: its format and lookup, shared by the
 /// kernel's backtraces and the profiler (TheTaaJ K140).
 pub mod symbols;
@@ -306,6 +309,10 @@ pub mod call {
     /// if a caught signal or a kill cuts it short; 0 at once if the time
     /// has passed.
     pub const SLEEP_UNTIL: u64 = 47;
+    /// process_debug(process, op, a, b, c) - the debugger's call (K142):
+    /// `op` is one of `debug::op`, on a process handle with DEBUG - which
+    /// only whoever started it holds. See `debug`.
+    pub const PROCESS_DEBUG: u64 = 48;
 }
 
 /// SCHED_SET's and SCHED_GET's words (journal entry 124). Priorities run
@@ -1037,7 +1044,11 @@ pub mod rights {
     /// End a process. Whoever started it holds this; a copy of the
     /// handle made without it can only wait.
     pub const KILL: u32 = 1 << 6;
-    pub const ALL: u32 = SEND | RECEIVE | DUPLICATE | TRANSFER | READ | WRITE | KILL;
+    /// Debug a process: stop it, read and write its memory and its
+    /// registers, set breakpoints (K142, `call::PROCESS_DEBUG`). Whoever
+    /// started it holds this, as KILL; a copy made without it cannot.
+    pub const DEBUG: u32 = 1 << 7;
+    pub const ALL: u32 = SEND | RECEIVE | DUPLICATE | TRANSFER | READ | WRITE | KILL | DEBUG;
 }
 
 /// Most bytes in one message.
