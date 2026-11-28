@@ -161,8 +161,12 @@ pub fn kill() {
             // (under KVM with every host CPU busy, 4 boots in 40 did);
             // a kill that really is slow is slow every time (journal
             // entry 105).
+            // Every try's ticks, for the message: one slow try among
+            // fast ones is the host; slow every time, by about as much,
+            // is this kernel (K?-slow-kill, TheTaaJ entry NNN).
+            let mut tries = [0u64; 3];
             let mut took = 0;
-            for _ in 0..3 {
+            for n in 0..3 {
                 let (process, thread) = start(mode);
                 if mode != "unborn" {
                     threads::sleep(3); // long enough to get where it is going
@@ -173,6 +177,7 @@ pub fn kill() {
                 process::kill(&process); // asking twice is asking once
                 threads::join(thread);
                 took = interrupts::ticks() - asked;
+                tries[n] = took;
                 assert_eq!(process.exit_code(), Some(abi::STOPPED), "forever {mode} after the kill");
                 process::kill(&process); // already ended: nothing happens
                 assert_eq!(process.exit_code(), Some(abi::STOPPED));
@@ -180,7 +185,7 @@ pub fn kill() {
                     break;
                 }
             }
-            assert!(took <= 3, "forever {mode} took {took} ticks to end, three times over");
+            assert!(took <= 3, "forever {mode} took {took} ticks to end, three times over (the tries: {tries:?} ticks)");
         }
     };
 
