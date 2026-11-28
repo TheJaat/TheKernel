@@ -9,12 +9,19 @@
 //!
 //! The kernel keeps its own reference to the memory, so the ring stays
 //! whatever init or the log service do with theirs.
+//!
+//! And the crash record (K188, kernel64::crashrecord): while the kernel
+//! is stopping, what it says is also written into an area of memory a
+//! reset does not clear; the next boot finds it there and puts it in
+//! the ring, first, as the "crash" lines of the log.
 
 use crate::irqlock::IrqLock;
 use crate::memory_object::MemoryObject;
 use abi::log::{kind, Ring};
 use alloc::sync::Arc;
 use kernel64::logmerge::Writer;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use kernel64::crashrecord;
 use kernel64::memory::addr::{phys_to_virt, PhysAddr, PAGE_SIZE};
 
 /// 256 KiB: some minutes of a busy boot's messages, if the log service
@@ -26,12 +33,80 @@ static RING: IrqLock<Option<Ring>> = IrqLock::new(None);
 /// The memory, kept from `start` to `offer`.
 static MEMORY: IrqLock<Option<Arc<MemoryObject>>> = IrqLock::new(None);
 
+/// The crash record's place: physical (set before memory management
+/// starts), then virtual, through the direct map (set by `start`); 0
+/// for none. No lock: they are read while the kernel stops, when a lock
+/// may never be let go.
+static CRASH_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+static CRASH_AREA: AtomicUsize = AtomicUsize::new(0);
+/// Whether this boot's record was begun.
+static CRASH_BEGUN: AtomicBool = AtomicBool::new(false);
+/// Whether the boot before this one left a record.
+static FOUND: AtomicBool = AtomicBool::new(false);
+
+/// Whether the boot before this one left a crash record (it is in the
+/// ring now). For the crash-record test (`fault-panic`).
+#[cfg(feature = "fault-tests")]
+pub fn found_last_boot() -> bool {
+    FOUND.load(Ordering::Relaxed)
+}
+
+/// Where the crash record is, physically: memory the caller keeps out
+/// of the allocator, `crashrecord::AREA` bytes.
+pub fn set_crash_area(physical: u64) {
+    CRASH_PHYSICAL.store(physical, Ordering::Relaxed);
+}
+
+fn crash_area() -> Option<&'static mut [u8]> {
+    let base = CRASH_AREA.load(Ordering::Relaxed);
+    // SAFETY: the area set aside by `set_crash_area`, through the direct
+    // map; only this module touches it - at start, then while stopping,
+    // when nothing else runs.
+    (base != 0).then(|| unsafe { core::slice::from_raw_parts_mut(base as *mut u8, crashrecord::AREA as usize) })
+}
+
+/// The last boot's record, if it left one: into the ring, as the log's
+/// first lines, and said on the serial line. Then this boot's place is
+/// empty, ready.
+fn last_boot() {
+    let physical = CRASH_PHYSICAL.load(Ordering::Relaxed);
+    if physical == 0 {
+        return;
+    }
+    CRASH_AREA.store(phys_to_virt(PhysAddr::new(physical)).as_mut_ptr::<u8>() as usize, Ordering::Relaxed);
+    let Some(area) = crash_area() else { return };
+    if let Some((time, text)) = crashrecord::read(area) {
+        FOUND.store(true, Ordering::Relaxed);
+        if let Some(ring) = RING.lock().as_ref() {
+            ring.put(kind::CRASH, 0, time, b"", text);
+        }
+        let first = text.split(|&b| b == b'\n').find(|line| !line.is_empty()).unwrap_or(b"");
+        kprintln!(
+            "[kernel] the boot before this one stopped: \"{}\" - its last words ({} bytes) are in the system log (log -s crash)",
+            core::str::from_utf8(first).unwrap_or("?").trim(),
+            text.len()
+        );
+    }
+    crashrecord::clear(area);
+}
+
+/// What the kernel says while it stops (console.rs calls this instead
+/// of `piece` then): into the crash record. No locks.
+pub fn last_words(bytes: &[u8]) {
+    let Some(area) = crash_area() else { return };
+    if !CRASH_BEGUN.swap(true, Ordering::Relaxed) {
+        crashrecord::begin(area, now());
+    }
+    crashrecord::append(area, bytes);
+}
+
 /// Makes the ring, as early as the kernel can: everything written to the
 /// debug log from then on is in it. With no memory for it there is no
 /// system log - the serial line is all there is.
 pub fn start() {
     let Some((memory, physical)) = MemoryObject::contiguous(PAGES) else {
         kprintln!("[kernel] no memory for the system log's ring: the serial line only");
+        last_boot();
         return;
     };
     let base = phys_to_virt(PhysAddr::new(physical)).as_mut_ptr::<u8>();
@@ -44,6 +119,7 @@ pub fn start() {
     core::mem::forget(memory.clone());
     *MEMORY.lock() = Some(memory);
     *RING.lock() = Some(ring);
+    last_boot();
 }
 
 /// Offers the ring to init, as "log" with the memory - to read only:

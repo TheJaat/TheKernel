@@ -181,6 +181,7 @@ extern "C" fn kernel_main(boot_info_address: u64) -> ! {
 fn start_memory(info: &'static BootInfo, info_address: u64) -> &'static BootInfo {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
+    use kernel64::bootinfo::{MemoryRegion, MEMORY_RESERVED};
 
     let regions = info.memory_map();
     let info_range = info_address..info_address + size_of::<BootInfo>() as u64;
@@ -197,6 +198,35 @@ fn start_memory(info: &'static BootInfo, info_address: u64) -> &'static BootInfo
         let size = u64::from(fb.pitch) * u64::from(fb.height);
         fb.address..fb.address + size
     });
+    // The crash record's place (K188): the loader's map, and one more
+    // region over it - reserved, so the allocator never hands it out
+    // (where regions overlap, the one that is not usable wins). Below
+    // 4 GiB, which is all in the direct map.
+    const REGIONS_MAX: usize = 256;
+    let mut with_crash = [MemoryRegion::new(0, 0, MEMORY_RESERVED); REGIONS_MAX + 1];
+    let usable = regions.iter().filter(|r| r.is_usable()).map(|r| r.base..r.base + r.length);
+    // Clear of what is in use: below 1 MiB, the ramdisk, the boot info
+    // and its map, the screen, the kernel, and what is not usable.
+    let mut avoid: [core::ops::Range<u64>; REGIONS_MAX + 6] = core::array::from_fn(|_| 0..0);
+    let mut avoided = 0;
+    let kernel = info.kernel_physical..info.kernel_physical + info.kernel_size;
+    let ramdisk = info.ramdisk_address..info.ramdisk_address + info.ramdisk_size;
+    let not_usable = regions.iter().filter(|r| !r.is_usable()).map(|r| r.base..r.base + r.length);
+    for range in [0..MIB, ramdisk, info_range.clone(), map_range.clone(), screen.clone(), kernel].into_iter().chain(not_usable) {
+        if avoided < avoid.len() {
+            avoid[avoided] = range;
+            avoided += 1;
+        }
+    }
+    let regions = match kernel64::crashrecord::place(usable, &avoid[..avoided], 4 * GIB) {
+        Some(area) if regions.len() <= REGIONS_MAX => {
+            with_crash[..regions.len()].copy_from_slice(regions);
+            with_crash[regions.len()] = MemoryRegion::new(area.start, area.end - area.start, MEMORY_RESERVED);
+            logtap::set_crash_area(area.start);
+            &with_crash[..regions.len() + 1]
+        }
+        _ => regions,
+    };
     mm::init(&mm::BootMemory {
         regions,
         taken: [
@@ -279,13 +309,28 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     // come after the memory they lie in; where regions overlap, the
     // one that is not usable wins.
     kprintln!();
-    let mut regions = [MemoryRegion::new(0, 0, MEMORY_RESERVED); Machine::MEMORY_MAX + Machine::RESERVED_MAX];
+    let mut regions = [MemoryRegion::new(0, 0, MEMORY_RESERVED); Machine::MEMORY_MAX + Machine::RESERVED_MAX + 1];
     let mut count = 0;
     let usable = machine.memory().iter().map(|range| MemoryRegion::new(range.start, range.size, MEMORY_USABLE));
     let reserved = machine.reserved().iter().map(|range| MemoryRegion::new(range.start, range.size, MEMORY_RESERVED));
     for region in usable.chain(reserved) {
         regions[count] = region;
         count += 1;
+    }
+    // The crash record's place (K188): kept out of the allocator, and in
+    // the direct map, where the kernel writes its last words.
+    // Clear of what firmware keeps (the tree's reserved ranges) and of
+    // the tree itself; the kernel is at the bottom of memory.
+    let mut avoid: [core::ops::Range<u64>; Machine::RESERVED_MAX + 1] = core::array::from_fn(|_| 0..0);
+    for (n, range) in machine.reserved().iter().enumerate().take(Machine::RESERVED_MAX) {
+        avoid[n] = range.start..range.start + range.size;
+    }
+    avoid[Machine::RESERVED_MAX] = device_tree..device_tree + tree.as_ref().map_or(0, |t| t.as_ref().map_or(0, |t| u64::from(t.header.total_size)));
+    let crash = kernel64::crashrecord::place(machine.memory().iter().map(|range| range.start..range.start + range.size), &avoid, u64::MAX);
+    if let Some(area) = &crash {
+        regions[count] = MemoryRegion::new(area.start, area.end - area.start, MEMORY_RESERVED);
+        count += 1;
+        logtap::set_crash_area(area.start);
     }
     // The tree itself is in memory the tree calls free.
     let tree_range = match &tree {
@@ -296,7 +341,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     mm::init(&mm::BootMemory {
         regions: &regions[..count],
         taken: [tree_range, 0..0, 0..0, 0..0],
-        also_mapped: [0..0, 0..0],
+        also_mapped: [crash.unwrap_or(0..0), 0..0],
     });
 
     // The low addresses are gone, and the tree was read through them:
@@ -915,6 +960,15 @@ fn run_fault_test() {
         kprintln!("[test] init is a program that ends: the kernel must stop, and say so");
         return; // it runs once this thread lets it
     }
+    if cfg!(feature = "fault-panic") {
+        // The first boot panics (and resets); the next one finds the
+        // crash record, and goes on as usual - init, logd, the shell.
+        if logtap::found_last_boot() {
+            kprintln!("[test] the boot before this one left its last words: going on as usual");
+            return;
+        }
+        panic!("a deliberate panic, for the crash record (fault-panic)");
+    }
     if cfg!(feature = "fault-double") {
         kprintln!("[test] forcing a double fault...");
         test::double_fault();
@@ -1014,5 +1068,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     kprintln!();
     kprintln!("*** KERNEL PANIC: {info}");
     backtrace::report(None, None, arch::frame_pointer());
+    // The crash-record test (K188): the machine is reset, so that the
+    // next boot - in the same memory - finds these last words.
+    #[cfg(all(target_arch = "x86_64", feature = "fault-panic"))]
+    {
+        kprintln!("[test] resetting, for the next boot to find the crash record");
+        // SAFETY: the PC's reset control register (0xCF9, "full reset");
+        // nothing runs after it.
+        unsafe { core::arch::asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x06u8, options(nomem, nostack)) };
+    }
     arch::halt_forever()
 }

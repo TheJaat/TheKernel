@@ -91,6 +91,9 @@ impl Write for Console {
         // must not wait for anything.
         if !STOPPING.load(Ordering::Relaxed) {
             crate::logtap::piece(Writer::Kernel, text.as_bytes());
+        } else {
+            // Last words: into the crash record the next boot finds (K188).
+            crate::logtap::last_words(text.as_bytes());
         }
         // And on the screen - once the kernel has taken it, to stop.
         #[cfg(target_arch = "x86_64")]

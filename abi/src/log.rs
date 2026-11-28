@@ -58,6 +58,10 @@ pub mod kind {
     /// A program started: its process id and its name, no text - so
     /// the log service can name the program in its later records.
     pub const STARTED: u8 = 2;
+    /// The boot before this one stopped, and these were its last words
+    /// (K188): the crash record the kernel found at start. The time is
+    /// when that kernel began to stop.
+    pub const CRASH: u8 = 3;
 }
 
 const SIZE_AT: usize = 8;
