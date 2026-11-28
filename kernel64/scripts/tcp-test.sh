@@ -62,13 +62,17 @@ $(keys "tcpsend 10.0.2.2 $ask_port fill 300000") ret ~~ $(keys "cnet send 10.0.2
 $(keys "tcpsend 10.0.2.2 $closed_port") ret ~ $(keys 'tcpsend 10.0.2.99 80') ret ~ $(keys 'cnet serve 7 1') ret ~ \
 $(keys 'cnet serve 8000 2') ret ~~ $(keys 'netinfo') ret ~"
 NETDEV="user,id=n0,hostfwd=tcp:127.0.0.1:$echo_port-:7,hostfwd=tcp:127.0.0.1:$serve_port-:8000"
+# Every packet to LOG.pcap: when netinfo counts a "no such connection"
+# answer, tcp-resets.py says which segment it answered (TheTaaJ K52).
+DUMP="-object filter-dump,id=dump0,netdev=n0,file=$LOG.pcap"
+rm -f "$LOG.pcap"
 
 echo "Booting $ARCH on QEMU's own network, for TCP (log: $LOG)..."
 if [ "$ARCH" = aarch64 ]; then
-    KEYS="$KEYS" QEMU_ARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -netdev $NETDEV -device virtio-net-device,netdev=n0" \
+    KEYS="$KEYS" QEMU_ARGS="-drive file=$DISK,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0 -netdev $NETDEV -device virtio-net-device,netdev=n0 $DUMP" \
         "$HERE/aarch64-boot.sh" "$IMAGE" "$LOG" 60
 else
-    DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="-netdev $NETDEV -device ${NIC:-virtio-net-pci},netdev=n0" \
+    DISK="$DISK" SMP=1 KEYS="$KEYS" QEMU_ARGS="-netdev $NETDEV -device ${NIC:-virtio-net-pci},netdev=n0 $DUMP" \
         "$HERE/qemu-boot.sh" "$IMAGE" "$LOG" 60
 fi
 kill -TERM $peer 2>/dev/null
@@ -94,7 +98,10 @@ said 'tcpecho: 1000000 bytes echoed to 10\.0\.2\.2:[0-9]+' "tcpecho did not echo
 said 'tcpecho: 0 bytes echoed to 10\.0\.2\.2' "tcpecho did not end the empty connection"
 said '\[process\] [0-9]+ "tcpecho" exited with code 0' "tcpecho did not end after five connections"
 [ "$(grep -ac 'cnet: [0-9]* bytes from 10\.0\.2\.2:[0-9]*, answered' "$LOG")" -eq 2 ] || fail "cnet serve did not answer two connections"
-said '^tcp +[0-9]+ segments in, [0-9]+ sent again, 0 answered "no such connection"' "netinfo did not count the segments"
+if ! grep -aEq '^tcp +[0-9]+ segments in, [0-9]+ sent again, 0 answered "no such connection"' "$LOG"; then
+    python3 -I "$HERE/tcp-resets.py" "$LOG.pcap"
+    fail "netinfo did not count the segments, or the machine answered \"no such connection\" (packets: $LOG.pcap)"
+fi
 grep -a 'broke' "$LOG" && fail "a connection broke"
 grep -a 'has not answered for' "$LOG" && fail "a service stopped answering during the test"
 exit 0
