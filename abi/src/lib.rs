@@ -1739,6 +1739,36 @@ pub mod block {
     /// as soon as it has the data; without this, "written" says nothing
     /// about surviving. Only on the channel that may write.
     pub const FLUSH: u8 = 7;
+    /// Payload: a count of writes, N (u64 LE, 1 to CRASH_MAX). A test
+    /// (K82): answered, and then the driver dies in the middle of the
+    /// Nth WRITE or WRITE_MANY it is asked for from now - after writing
+    /// the first half of a WRITE_MANY's sectors, before answering - as a
+    /// driver killed mid-I/O would. On either channel, as STALL: the
+    /// shell, which may only read the disk, asks; the writes counted are
+    /// fs's.
+    pub const CRASH: u8 = 8;
+    pub const CRASH_MAX: u64 = 1_000_000;
+
+    /// A CRASH request: none for a count of 0 or past CRASH_MAX.
+    pub fn crash_request(writes: u64) -> Option<[u8; REQUEST_SIZE]> {
+        if !(1..=CRASH_MAX).contains(&writes) {
+            return None;
+        }
+        let mut request = [0u8; REQUEST_SIZE];
+        request[0] = CRASH;
+        request[1..].copy_from_slice(&writes.to_le_bytes());
+        Some(request)
+    }
+
+    /// The count a CRASH request carries, if it is one.
+    pub fn crash_count(request: &[u8]) -> Option<u64> {
+        let request: &[u8; REQUEST_SIZE] = request.try_into().ok()?;
+        if request[0] != CRASH {
+            return None;
+        }
+        let writes = u64::from_le_bytes(request[1..].try_into().ok()?);
+        (1..=CRASH_MAX).contains(&writes).then_some(writes)
+    }
 
     pub const OK: u8 = 0;
     /// The disk reported an error.
@@ -1836,6 +1866,33 @@ pub mod nic {
     pub const STALL: u8 = 6;
     /// The pieces so far are of a frame that will not be finished.
     pub const DROP: u8 = 7;
+    /// Payload: a count of frames, N (u64 LE, 1 to CRASH_MAX). A test
+    /// (K82): answered, and then the driver dies in the middle of the
+    /// Nth frame it is given to send from now - the frame whole, not
+    /// yet on the wire - as a driver killed mid-I/O would.
+    pub const CRASH: u8 = 8;
+    pub const CRASH_MAX: u64 = 1_000_000;
+
+    /// A CRASH request: none for a count of 0 or past CRASH_MAX.
+    pub fn crash_request(frames: u64) -> Option<[u8; 9]> {
+        if !(1..=CRASH_MAX).contains(&frames) {
+            return None;
+        }
+        let mut request = [0u8; 9];
+        request[0] = CRASH;
+        request[1..].copy_from_slice(&frames.to_le_bytes());
+        Some(request)
+    }
+
+    /// The count a CRASH request carries, if it is one.
+    pub fn crash_count(request: &[u8]) -> Option<u64> {
+        let request: &[u8; 9] = request.try_into().ok()?;
+        if request[0] != CRASH {
+            return None;
+        }
+        let frames = u64::from_le_bytes(request[1..].try_into().ok()?);
+        (1..=CRASH_MAX).contains(&frames).then_some(frames)
+    }
 
     pub const OK: u8 = 0;
     pub const BAD_REQUEST: u8 = 1;
@@ -2777,6 +2834,40 @@ mod tests {
         assert_eq!(layout_message(&[b'x'; LAYOUT_NAME_MAX + 1]), None);
         assert_eq!(layout_message(b""), None);
         assert_eq!(layout_message("\u{e9}".as_bytes()), None);
+    }
+
+    #[test]
+    fn a_crash_request_carries_its_count() {
+        use crate::block::{crash_count, crash_request, CRASH, CRASH_MAX, REQUEST_SIZE, STALL};
+        let request = crash_request(5).unwrap();
+        assert_eq!(request[0], CRASH);
+        assert_eq!(crash_count(&request), Some(5));
+        assert_eq!(crash_count(&crash_request(CRASH_MAX).unwrap()), Some(CRASH_MAX));
+        assert_eq!(crash_request(0), None);
+        assert_eq!(crash_request(CRASH_MAX + 1), None);
+        // Not a CRASH, the wrong length, or a count out of range: none.
+        let mut stall = request;
+        stall[0] = STALL;
+        assert_eq!(crash_count(&stall), None);
+        assert_eq!(crash_count(&request[..REQUEST_SIZE - 1]), None);
+        let mut zero = request;
+        zero[1..].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(crash_count(&zero), None);
+    }
+
+    #[test]
+    fn a_nic_crash_request_carries_its_count() {
+        use crate::nic::{crash_count, crash_request, CRASH, CRASH_MAX, STALL};
+        let request = crash_request(300).unwrap();
+        assert_eq!(request[0], CRASH);
+        assert_eq!(crash_count(&request), Some(300));
+        assert_eq!(crash_count(&crash_request(CRASH_MAX).unwrap()), Some(CRASH_MAX));
+        assert_eq!(crash_request(0), None);
+        assert_eq!(crash_request(CRASH_MAX + 1), None);
+        let mut stall = request;
+        stall[0] = STALL;
+        assert_eq!(crash_count(&stall), None);
+        assert_eq!(crash_count(&request[..8]), None);
     }
 
     #[test]
