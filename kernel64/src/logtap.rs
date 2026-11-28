@@ -161,3 +161,11 @@ pub fn started(pid: u64, name: &str) {
         ring.put(kind::STARTED, pid as u32, now(), name.as_bytes(), b"");
     }
 }
+
+/// A program's crash report (K138): for the log service, which adds
+/// the last lines the program printed.
+pub fn report(pid: u64, text: &str) {
+    if let Some(ring) = RING.lock().as_ref() {
+        ring.put(kind::REPORT, pid as u32, now(), b"", text.as_bytes());
+    }
+}

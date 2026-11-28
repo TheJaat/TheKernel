@@ -83,6 +83,12 @@ impl<T> Regions<T> {
         if range.contains(&address) { Some((&*range, value)) } else { None }
     }
 
+    /// Every region and its value, lowest first - for a program's crash
+    /// report (K138), which lists its memory.
+    pub fn iter(&self) -> impl Iterator<Item = (&Range<u64>, &T)> {
+        self.used.iter().map(|(range, value)| (range, value))
+    }
+
     pub fn len(&self) -> usize {
         self.used.len()
     }

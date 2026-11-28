@@ -23,6 +23,7 @@ pub mod acpi;
 pub mod bootinfo;
 pub mod chacha;
 pub mod crashrecord;
+pub mod crashreport;
 pub mod cap;
 pub mod channel;
 pub mod devicetree;

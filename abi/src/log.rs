@@ -62,6 +62,10 @@ pub mod kind {
     /// (K188): the crash record the kernel found at start. The time is
     /// when that kernel began to stop.
     pub const CRASH: u8 = 3;
+    /// A program broke a rule and was ended: the kernel's report of it
+    /// (K138) - its registers, its stack, its memory - for the log
+    /// service to keep with the last lines the program printed.
+    pub const REPORT: u8 = 4;
 }
 
 const SIZE_AT: usize = 8;

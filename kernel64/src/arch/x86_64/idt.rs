@@ -464,6 +464,23 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         if frame.vector == PAGE_FAULT {
             report_page_fault(frame.error_code);
         }
+        // Its crash report, for the system log (K138).
+        let what = if frame.vector == PAGE_FAULT {
+            let access = if frame.error_code & 16 != 0 { "running" } else if frame.error_code & 2 != 0 { "writing" } else { "reading" };
+            let cause = if frame.error_code & 1 != 0 { "not allowed" } else { "nothing there" };
+            alloc::format!("{name} at {:#x}, {access} {:#x}: {cause}", frame.rip, read_cr2())
+        } else {
+            alloc::format!("{name} at {:#x}", frame.rip)
+        };
+        let f = &*frame;
+        let registers = [
+            ("rip", f.rip), ("rsp", f.rsp), ("rbp", f.rbp), ("rflags", f.rflags),
+            ("rax", f.rax), ("rbx", f.rbx), ("rcx", f.rcx), ("rdx", f.rdx),
+            ("rsi", f.rsi), ("rdi", f.rdi), ("r8", f.r8), ("r9", f.r9),
+            ("r10", f.r10), ("r11", f.r11), ("r12", f.r12), ("r13", f.r13),
+            ("r14", f.r14), ("r15", f.r15), ("error", f.error_code),
+        ];
+        crate::process::report_current(&what, &registers, f.rsp);
         crate::process::kill_current(name);
     }
 
