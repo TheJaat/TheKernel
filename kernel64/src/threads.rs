@@ -12,7 +12,7 @@
 //!
 //! With several CPUs that is no longer enough: interrupts off stops this
 //! CPU from being interrupted, not another CPU from running. The policy
-//! locks for itself - a lock per CPU since K193 (journal entry NNN; see
+//! locks for itself - a lock per CPU since K193 (journal entry 153; see
 //! "Locks" in sched.rs) - and the table of threads has its own lock,
 //! THREADS, which no switch takes. Four rules exist only because of the
 //! other CPUs:
@@ -639,7 +639,7 @@ fn schedule() {
     // lock let go so that the other can finish, rather than keep the
     // thread here a whole slice: kept, a woken thread waited for the one
     // CPU whose queue it was in, 15 ms instead of 1-7 on four CPUs
-    // (journal entry NNN, bug 6). A few times, then as before.
+    // (journal entry 153, bug 6). A few times, then as before.
     for _ in 0..RETRIES {
         if decision.is_some() || !policy.take_reschedule(cpu) {
             break;
@@ -751,7 +751,7 @@ fn reap() {
     // once, one takes each - but forgotten by the policy only after its
     // stack is freed: `join` waits for the policy to forget it, and must
     // then find the stack back. The other order let a joiner count the
-    // free frames one stack short (journal entry NNN, bug 9). Off its CPU
+    // free frames one stack short (journal entry 153, bug 9). Off its CPU
     // (`leaving` clear) is asked first: removable before that, it could
     // still be saving onto that stack.
     let dead: Vec<(ThreadId, Box<Thread>)> = {

@@ -38,7 +38,7 @@
 //! becomes runnable again, and when it gets to the switch it finds it
 //! has no reason to leave.
 //!
-//! ## Locks (K193, journal entry NNN)
+//! ## Locks (K193, journal entry 153)
 //!
 //! Until K193 the caller held one lock around every call here, on every
 //! CPU, and across every switch. Now the policy locks for itself, and
@@ -1066,7 +1066,7 @@ impl Scheduler {
     /// looked into, and by what was found there after: its first thread
     /// may be one this CPU may not run, and then what it has for this CPU
     /// is further back - possibly behind another queue's first (the bug
-    /// this way of looking fixes: journal entry NNN, bug 2). A queue is
+    /// this way of looking fixes: journal entry 153, bug 2). A queue is
     /// taken from only when what it has for this CPU beats every other
     /// queue's, as far as is known; otherwise the next is looked into,
     /// and a queue seen and let go is locked again only if it is then
@@ -1168,7 +1168,7 @@ impl Scheduler {
     /// in no queue. Nothing is changed - the mechanism frees the thread's
     /// stack first and only then forgets it, so that whoever waits for
     /// it to be gone (`join`) finds the stack already back (journal
-    /// entry NNN, bug 9).
+    /// entry 153, bug 9).
     pub fn removable(&self, id: ThreadId) -> bool {
         self.rec(id).is_some_and(|rec| rec.kind.load(SeqCst) == EXITED && rec.rq.load(SeqCst) == NOWHERE)
     }
@@ -2365,7 +2365,7 @@ mod tests {
         }
     }
 
-    // ---- CPUs at once (K193, journal entry NNN) -------------------------
+    // ---- CPUs at once (K193, journal entry 153) -------------------------
 
     /// The policy as the kernel uses it, on host threads: one host thread
     /// per CPU, each doing what that CPU does - ticks, waits, wake-ups of
@@ -2538,7 +2538,7 @@ mod tests {
     }
 
     /// "Nobody sleeps with work waiting", the order the CPUs-at-once
-    /// tests cannot catch (journal entry NNN, bug 3): CPU 1 looks, finds
+    /// tests cannot catch (journal entry 153, bug 3): CPU 1 looks, finds
     /// nothing, and - before it says it idles - CPU 0 wakes a thread.
     /// CPU 1 is not idle yet, so the thread waits in busy CPU 0's queue
     /// and nobody is asked. Without its second look CPU 1 idled past it,
