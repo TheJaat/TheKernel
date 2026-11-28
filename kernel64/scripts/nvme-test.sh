@@ -102,8 +102,8 @@ for machine in pc q35; do
     grep -aq '\[blk\]' "$LOG.$machine.text" && fail "$machine: blk ran - there should be no virtio disk"
     # 0x2000: the registers and the first doorbells, and not the MSI-X
     # table QEMU puts after them in the same BAR.
-    logged $machine '^\[pci\] [0-9a-f:.]+ NVMe controller: registers 0x[0-9a-f]+\+0x2000, 148 KiB DMA at 0x[0-9a-f]+, MSI-X - handed to init$' \
-        "the kernel did not hand the NVMe controller to init, its registers short of the MSI-X table, with an MSI-X interrupt"
+    logged $machine '^\[nvme\] [0-9a-f:.]+ [0-9a-f]{4}:[0-9a-f]{4}: registers 0x[0-9a-f]+\+0x2000 \(BAR 0\), 148 KiB DMA at 0x[0-9a-f]+, MSI-X$' \
+        "nvme was not given the controller's registers short of the MSI-X table, and an MSI-X interrupt"
     logged $machine '^\[init\] started: .* nvme ' "init did not start nvme"
     # Not at the start of a line: the shell may echo the first key typed
     # just before it, on the same line.

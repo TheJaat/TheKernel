@@ -23,7 +23,9 @@ if [ "$ARCH" = aarch64 ]; then
     INPUT_READY="\[serial\] serial port ready"
     # A CPU there is named by its affinity register, not an APIC id.
     CPU_AWAKE="named 0x"
-    DISK_OFFERED="\[virtio\] .* block device: handed to init"
+    # The disk's driver says what it was given (K75: the kernel hands
+    # every device over the same way, and blk asks for its resources).
+    DISK_OFFERED="\[blk\] 0x[0-9a-f]* virtio kind 2: registers in the page at"
     # What is expected of the commands typed is the PC's list. A few
     # lines of it name the PC's drivers: there the serial port's one
     # driver is keyboard and screen both, and the disk's interrupt is
@@ -47,7 +49,7 @@ else
     INPUT_DRIVER=kbd
     INPUT_READY="\[kbd\] PS/2 keyboard ready"
     CPU_AWAKE="APIC id"
-    DISK_OFFERED="\[pci\] .* virtio block device: .* handed to init"
+    DISK_OFFERED="\[blk\] [0-9a-f:.]* 1af4:[0-9a-f]*: ports 0x[0-9a-f]*+0x[0-9a-f]* (BAR 0)"
 fi
 
 fail() {
@@ -140,7 +142,7 @@ sys.exit(1 if re.search(rb"^taaj:/> .*([a-z])\1([a-z])\2([a-z])\3([a-z])\4", ope
     fi
 fi
 if [ -n "${DISK:-}" ]; then
-    grep -q "$DISK_OFFERED" "$LOG" || fail "the kernel did not offer the disk"
+    grep -q "$DISK_OFFERED" "$LOG" || fail "blk was not given the disk"
     grep -q "\[blk\] virtio disk" "$LOG"           || fail "the disk driver did not start"
     if [ -n "${TFSTOOL:-}" ]; then
         # Proof that files reached the disk itself, in a form another

@@ -205,26 +205,38 @@ pub fn kill() {
 /// the device must have interrupted, or the driver was not waiting for
 /// it but asking over and over.
 #[cfg(target_arch = "aarch64")]
-pub fn disk(device: Option<&crate::mmio_devices::Ready>) {
+pub fn disk(found: Option<&(abi::MmioDeviceInfo, alloc::sync::Arc<crate::device::Device>)>) {
+    use crate::memory_object::MemoryObject;
     use crate::{arch, ipc, process, programs};
     use kernel64::cap::Rights;
 
-    let Some(device) = device else {
+    let Some((described, device)) = found else {
         kprintln!("[selftest] disk: no block device a driver exists for - not run");
         return;
     };
+    // What init gives blk (K75): the device's handle - blk asks it for
+    // the registers and the interrupt - and DMA memory, as much as
+    // init's table says for blk (user/src/bin/init.rs, DRIVERS).
+    const BLK_DMA_PAGES: u64 = 48;
+    // The same device object init will be handed: one interrupt line.
+    let device = ipc::Object::Device(alloc::sync::Arc::clone(device));
+    let (dma, dma_physical) = MemoryObject::contiguous(BLK_DMA_PAGES).expect("contiguous memory for the disk's DMA");
+    let info = abi::MmioDeviceInfo { dma_physical, dma_size: dma.size(), ..*described };
+    let dma = ipc::Object::Memory(alloc::sync::Arc::new(dma));
     let run = || {
         let (to_driver, description) = ipc::channel();
-        ipc::kernel_send(&to_driver, &device.info.to_bytes(), Vec::new()).expect("sending the description");
+        ipc::kernel_send(&to_driver, &info.to_bytes(), Vec::new()).expect("sending the description");
         let (writers, write_requests) = ipc::channel();
         let (readers, read_requests) = ipc::channel();
-        // The driver's handles, in the order it expects: registers,
-        // DMA memory, the description, its two request channels, and
-        // last the interrupt.
-        let mut handles = device.handles.clone();
-        let interrupt = (handles.len() > 2).then(|| handles.remove(2));
-        handles.extend([(description, Rights::ALL), (write_requests, Rights::ALL), (read_requests, Rights::ALL)]);
-        handles.extend(interrupt);
+        // The driver's handles, in the order it expects: the device,
+        // DMA memory, the description, its two request channels.
+        let handles = alloc::vec![
+            (device.clone(), Rights::ALL),
+            (dma.clone(), Rights::ALL),
+            (description, Rights::ALL),
+            (write_requests, Rights::ALL),
+            (read_requests, Rights::ALL),
+        ];
         let (driver, driver_thread) = process::spawn("blk", programs::BLK, handles).expect("loading blk");
         let (client, client_thread) =
             process::spawn("blkcheck", programs::BLKCHECK, alloc::vec![(writers, Rights::ALL), (readers, Rights::ALL)])
@@ -255,7 +267,7 @@ pub fn disk(device: Option<&crate::mmio_devices::Ready>) {
     let second = arch::device_interrupts() - before - first;
     assert_eq!(mm::unused_frames(), frames, "the disk driver leaked frames");
     assert_eq!(ipc::live_channels(), 0, "channels leaked");
-    if device.info.interrupt {
+    if info.interrupt {
         // Each run makes well over a hundred requests of the device. Not
         // each is an interrupt of its own - one that finishes while the
         // line is off shares the next - but most are.

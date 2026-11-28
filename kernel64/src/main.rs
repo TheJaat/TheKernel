@@ -37,6 +37,7 @@ mod console; // first, so its macros are visible in every later module
 mod alarms;
 mod arch;
 mod clock;
+mod device;
 #[cfg(target_arch = "x86_64")]
 mod devices;
 mod interrupts;
@@ -320,13 +321,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
     // interrupt, and so waits for the controller.
     kprintln!();
     let devices = mmio_devices::find(&machine);
+    let handed = mmio_devices::hand_out(&devices);
 
     // Interrupts: the controller the tree describes, and the CPU's
     // own timer.
     kprintln!();
-    let mut disk = None;
-    let mut network = None;
-    let mut inputs = alloc::vec::Vec::new();
     let mut screen = None;
     // SAFETY: once, on the only CPU running, interrupts still masked.
     let threads_run = match unsafe { arch::init_interrupts(&machine) } {
@@ -376,17 +375,11 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
             selftest::files();
             selftest::kill();
 
-            // A device, driven by a program.
+            // A device, driven by a program: the first disk. The
+            // others - and this one again - go to init, every one the
+            // same way (K75): it picks their drivers.
             kprintln!();
-            disk = mmio_devices::first_disk(&devices);
-            selftest::disk(disk.as_ref());
-            // A network card is only made ready here: its driver needs
-            // someone on the wire to be tested against, which is a
-            // test of the whole system's.
-            network = mmio_devices::first_network(&devices);
-            // Keyboards, mice and tablets: each made ready for the one
-            // driver that serves them all.
-            inputs = mmio_devices::inputs(&devices);
+            selftest::disk(handed.iter().find(|(info, _)| info.device == virtio::mmio::DEVICE_BLOCK && info.version == 1));
             // And a screen, if the machine was given one.
             screen = match &tree {
                 Some(Ok(tree)) => ramfb(tree),
@@ -448,7 +441,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 
     // The rest is programs: init, and what init starts. They need
     // threads, and a terminal to be of any use.
-    if threads_run && start_init(&machine, screen, disk.into_iter().chain(network).chain(inputs)) {
+    if threads_run && start_init(&machine, screen, handed) {
         idle()
     }
     kprintln!();
@@ -479,7 +472,7 @@ extern "C" fn kernel_main(device_tree: u64, entered_at: u64, loaded_at: u64, mmu
 fn start_init(
     machine: &kernel64::devicetree::Machine,
     screen: Option<(abi::FramebufferInfo, memory_object::MemoryObject)>,
-    devices: impl IntoIterator<Item = mmio_devices::Ready>,
+    devices: alloc::vec::Vec<(abi::MmioDeviceInfo, alloc::sync::Arc<device::Device>)>,
 ) -> bool {
     use ipc::Object;
     use kernel64::cap::Rights;
@@ -512,19 +505,18 @@ fn start_init(
             Err(error) => kprintln!("framebuffer: could not hand it to init: {error:?}"),
         }
     }
-    for device in devices {
-        let what = match device.info.device {
-            virtio::mmio::DEVICE_NETWORK => "network card",
-            virtio::mmio::DEVICE_INPUT => "input device",
-            _ => "block device",
-        };
+    // Every device found, the same way (K75): init picks the drivers.
+    let found = devices.len();
+    let mut handed = 0;
+    for (info, device) in devices {
         let mut message = b"mmio".to_vec();
-        message.extend_from_slice(&device.info.to_bytes());
-        match ipc::kernel_send(&to_init, &message, device.handles) {
-            Ok(()) => kprintln!("[virtio] {:#x} {what}: handed to init", device.info.registers),
-            Err(error) => kprintln!("[virtio] {:#x} {what}: could not hand it to init: {error:?}", device.info.registers),
+        message.extend_from_slice(&info.to_bytes());
+        match ipc::kernel_send(&to_init, &message, alloc::vec![(Object::Device(device), Rights::ALL)]) {
+            Ok(()) => handed += 1,
+            Err(error) => kprintln!("[virtio] {:#x}: could not hand it to init: {error:?}", info.registers),
         }
     }
+    kprintln!("[virtio] {handed} of {found} devices handed to init, each with a handle to ask for its registers, interrupt and DMA memory");
     power::offer(&to_init, machine.firmware_call);
     drop(to_init); // what was sent stays readable; the kernel keeps nothing
 

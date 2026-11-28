@@ -296,6 +296,14 @@ pub mod call {
     /// if a caught signal or a kill cuts it short; 0 at once if the time
     /// has passed.
     pub const SLEEP_UNTIL: u64 = 47;
+    /// device(handle, op, argument, out) - asks the device a handle
+    /// names (a device the kernel found and handed to init: one PCI
+    /// function, or one place in memory the device tree describes) for
+    /// one of its resources, `op` one of `device`'s: its configuration
+    /// space read, a BAR, its interrupt, DMA memory. The kernel knows no
+    /// kind of device: a driver asks for what its device needs (K75,
+    /// TheTaaJ entry NNN). WrongType if the handle is not a device.
+    pub const DEVICE: u64 = 48;
 }
 
 /// SCHED_SET's and SCHED_GET's words (journal entry 124). Priorities run
@@ -1525,6 +1533,94 @@ impl PciDeviceInfo {
     }
 }
 
+/// What a device handle (call::DEVICE) can be asked (K75, TheTaaJ
+/// entry NNN). The kernel hands every PCI function and every virtio
+/// place it finds to init, the same way: a description and this one
+/// handle. Which driver gets it is init's business, and what the
+/// device needs - which BAR, which kind of interrupt, how much DMA
+/// memory - the driver's and init's: no kind of device is known to the
+/// kernel, and a new driver needs no change to it.
+pub mod device {
+    /// Reads its configuration space (PCI only): `argument` is the
+    /// offset, plus the width (1, 2 or 4 bytes, aligned to it) shifted
+    /// left by 16. The value. Reading changes nothing a driver can use
+    /// against anyone else, so any of its first 256 bytes may be read
+    /// (the PC's configuration ports reach no further);
+    /// writing is not offered - the BARs, the command register and the
+    /// interrupt structures are the kernel's.
+    pub const CONFIG_READ: u64 = 1;
+    /// BAR `argument` (0 to 5; for a place in memory, 0 is its
+    /// registers): a handle to it - I/O ports, or a memory object of it,
+    /// mapped uncached - and a `Bar` at `out`. The first BAR asked for
+    /// turns the device's decoding and bus mastering on. A memory BAR
+    /// holding MSI-X structures stops short of the first, whole pages
+    /// only: an interrupt message is a memory write, and whoever could
+    /// write the table could make the device write anywhere - unless
+    /// the device's interrupt is MSI (asked for first), and MSI-X then
+    /// stays off for good, its table inert. InvalidArgument for a BAR
+    /// that is not there.
+    pub const BAR: u64 = 2;
+    /// Its interrupt, of the kind `argument` says (MSIX, MSI; WIRED
+    /// for a place in memory, the line the device tree names): a
+    /// handle to wait for it. A device has one interrupt for good: asked
+    /// again - a restarted driver - the same one, if of the same kind;
+    /// NotFound if of another, as if the device had none of that kind
+    /// (as it has not, from then on), and if it has none of that kind.
+    pub const INTERRUPT: u64 = 3;
+    /// `argument` pages of physically contiguous memory for the device
+    /// to read and write: a memory object, and its physical address (a
+    /// u64) at `out`. At most DMA_PAGES_MAX pages for one device in all.
+    /// Whoever asks keeps it: init does, so that a restarted driver
+    /// gets the same memory, and memory the device may still write is
+    /// never freed (journal entry 66).
+    pub const DMA: u64 = 4;
+
+    /// The kinds of interrupt.
+    pub const MSIX: u64 = 1;
+    pub const MSI: u64 = 2;
+    pub const WIRED: u64 = 3;
+
+    /// Most DMA pages for one device: 2 MiB.
+    pub const DMA_PAGES_MAX: u64 = 512;
+
+    /// CONFIG_READ's argument.
+    pub const fn config(offset: u64, width: u64) -> u64 {
+        offset | width << 16
+    }
+
+    /// A BAR, as BAR describes it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Bar {
+        /// Its first port, or its physical address.
+        pub base: u64,
+        /// How many ports, or bytes - for memory, what the handle
+        /// covers (short of any MSI-X structure).
+        pub size: u64,
+        /// I/O ports, not memory.
+        pub io: bool,
+    }
+
+    impl Bar {
+        pub const SIZE: usize = 17;
+
+        pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+            let mut b = [0; Self::SIZE];
+            b[0..8].copy_from_slice(&self.base.to_le_bytes());
+            b[8..16].copy_from_slice(&self.size.to_le_bytes());
+            b[16] = u8::from(self.io);
+            b
+        }
+
+        pub fn from_bytes(b: &[u8]) -> Option<Bar> {
+            if b.len() != Self::SIZE {
+                return None;
+            }
+            let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+            Some(Bar { base: u64_at(0), size: u64_at(8), io: b[16] != 0 })
+        }
+    }
+}
+
 /// Switching the machine off and resetting it.
 ///
 /// The kernel describes the machine's way to `power` (the program) as a
@@ -2674,6 +2770,17 @@ pub mod net {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_device_bar_survives_its_bytes() {
+        use super::device::{config, Bar};
+        for bar in [Bar::default(), Bar { base: 0xc000, size: 0x40, io: true }, Bar { base: 0xfebf_0000, size: 0x2000, io: false }] {
+            assert_eq!(Bar::from_bytes(&bar.to_bytes()), Some(bar));
+        }
+        assert_eq!(Bar::from_bytes(&[0; Bar::SIZE - 1]), None, "a short one is no BAR");
+        assert_eq!(config(0x34, 1), 0x1_0034, "the offset low, the width above");
+        assert_eq!(config(0x100, 4) >> 16, 4);
+    }
+
     #[test]
     fn a_priority_survives_its_level() {
         for priority in super::sched::HIGHEST..=super::sched::LOWEST {

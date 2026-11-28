@@ -97,8 +97,10 @@ for machine in pc q35; do
     grep -aq '^== end ==$' "$LOG.$machine.text" || fail "$machine: the steps did not all run"
     grep -aEq 'KERNEL PANIC|CPU EXCEPTION|THE SYSTEM HAS STOPPED' "$LOG.$machine.text" && fail "$machine: the kernel stopped"
     grep -aq '\[blk\]' "$LOG.$machine.text" && fail "$machine: blk ran - there should be no virtio disk"
-    logged $machine '^\[pci\] [0-9a-f:.]+ AHCI controller: registers 0x[0-9a-f]+\+0x[0-9a-f]+, 132 KiB DMA at 0x[0-9a-f]+, MSI - handed to init$' \
-        "the kernel did not hand the AHCI controller to init, with its registers and an MSI interrupt"
+    # K75: ahci asks for BAR 5 and an interrupt (MSI-X, else MSI: this
+    # controller has MSI), and says what it got.
+    logged $machine '^\[ahci\] [0-9a-f:.]+ [0-9a-f]{4}:[0-9a-f]{4}: registers 0x[0-9a-f]+\+0x[0-9a-f]+ \(BAR 5\), 132 KiB DMA at 0x[0-9a-f]+, MSI$' \
+        "ahci was not given the controller's registers and an MSI interrupt"
     logged $machine '^\[init\] started: .* ahci ' "init did not start ahci"
     # Not at the start of a line: the shell may echo the first key typed
     # just before it, on the same line.

@@ -1,313 +1,203 @@
 //! Devices on the PCI bus: found by the kernel, driven from user space.
 //!
-//! The kernel's part is mechanism. It scans the bus, logs what is there,
-//! and for each device it knows how to hand out, gathers what a driver
-//! needs and turns each piece into a capability:
+//! The kernel's part is mechanism, the same for every device (K75,
+//! TheTaaJ entry NNN). It scans the bus, logs what is there, sizes each
+//! function's BARs while nothing is using them, and hands every function
+//! to init: its description (where it is, its vendor, device and class)
+//! and a device handle (device.rs). Which program drives it is init's
+//! business; that program asks through the handle for what its device
+//! needs, and the kernel sets each up the same way whatever the device:
 //!
-//!   - its registers: an IoPorts object for an I/O BAR's range, or a
-//!     memory object of a memory BAR, mapped uncached
-//!   - memory it can DMA to: a contiguous memory object, and its
-//!     physical address (devices know no other kind)
-//!   - its interrupt: MSI-X message 0, or else MSI's one message,
-//!     pointed at a fresh vector, and an Interrupt object for it
+//!   - a BAR: an IoPorts object for an I/O BAR's range, or a memory
+//!     object of a memory BAR, mapped uncached - short of any MSI-X
+//!     structure in it (`bar`)
+//!   - its interrupt: MSI-X message 0, or MSI's one message, as the
+//!     driver asks, pointed at a fresh vector (`interrupt`)
+//!   - memory it can DMA to (device.rs): asked for by init, which keeps
+//!     it across the driver's restarts
 //!
-//! and sends them to init, which decides which driver gets them - policy
-//! is init's. The kernel never talks to the device again.
+//! Until K75 the kernel decided which devices were handed out - AHCI,
+//! NVMe and xHCI by their class, Intel's e1000 cards by their numbers,
+//! virtio's by theirs - and knew each one's BAR, interrupt and DMA size:
+//! every new driver was a kernel change. Those choices are the drivers'
+//! now (`user/src/device.rs` and each driver's start).
 //!
 //! What this does not protect against: a device does DMA to whatever
 //! physical address its driver tells it, so a malicious disk driver could
 //! have the disk overwrite the kernel. Confining DMA needs an IOMMU
 //! (Intel VT-d, AMD-Vi), programmed so that each device can reach only
-//! its own memory objects - a later step. Until then, a user-space driver
+//! its own memory objects - Era 15's K78. Until then, a user-space driver
 //! is protected from by the CPU (it cannot touch anything else directly)
 //! but not by the bus.
-//!
-//! Offered so far: virtio block devices (disks) and virtio network
-//! cards, both of the kind that speaks the legacy interface; and AHCI
-//! (SATA) controllers and NVMe controllers, by their class - any
-//! vendor's; and Intel's e1000 Ethernet cards, by their numbers. What is
-//! on an AHCI controller's ports, or behind an NVMe controller's
-//! namespaces, the kernel does not look at: that is the driver's
-//! business.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use abi::PciDeviceInfo;
+use abi::device::{self as op, Bar as BarInfo};
+use abi::{Error, PciDeviceInfo};
 use kernel64::cap::Rights;
 use kernel64::paging::Flags;
-use kernel64::pci::{self, Bar, Device};
+use kernel64::pci::{self, Address, Bar, ConfigSpace};
 
 use crate::arch::{pci::Ports, platform};
+use crate::device::{Bus, Device};
 use crate::ipc::{self, Object};
 use crate::memory_object::MemoryObject;
 use crate::{interrupts, mm};
 
-/// DMA memory for a block driver: its virtqueue and request buffers -
-/// 36 KiB, then room for abi::block::SECTORS_MAX sectors (128 KiB;
-/// `user/src/bin/blk.rs` says where each lies).
-const BLOCK_DMA_PAGES: u64 = 48;
-/// And for a network card's: two queues, and forty buffers of a frame
-/// each (`user/src/bin/nic.rs` says where each lies).
-const NETWORK_DMA_PAGES: u64 = 40;
-/// And for an AHCI controller's: a page for one port's command list,
-/// received FISes and a command table, then the same 128 KiB of data
-/// as a virtio disk's (`ahci/src/lib.rs`, `layout`).
-const AHCI_DMA_PAGES: u64 = 1 + 32;
-/// And for an NVMe controller's: a page each for the admin queues and
-/// one I/O queue pair, one for a PRP list, then 128 KiB of data
-/// (`nvme/src/lib.rs`, `layout`).
-const NVME_DMA_PAGES: u64 = 5 + 32;
-/// And for an Intel Ethernet card's: two descriptor rings (a page
-/// each), 32 receive and 16 transmit buffers of 2048 bytes
-/// (`e1000/src/lib.rs`, `layout`).
-const INTEL_DMA_PAGES: u64 = 2 + (32 + 16) / 2;
-/// And for an xHCI controller's: five pages of its own (the device
-/// context array, the command and event rings, the event ring's table,
-/// a page for control transfers), four for each of 8 devices, and up
-/// to 32 scratchpad pages the controller may ask for; then a USB
-/// stick's: a page for its commands and statuses, and 32 for its data
-/// (128 KiB, abi::block::SECTORS_MAX sectors) - `usb/src/xhci.rs`,
-/// `layout`.
-const XHCI_DMA_PAGES: u64 = 5 + 8 * 4 + 32 + 1 + 32;
-/// The most memory a BAR of registers is taken to be: AHCI's is 4 or
-/// 8 KiB, NVMe's 8 or 16. More is a BAR this kernel does not understand.
-const REGISTERS_MAX: u64 = 1 << 20;
+/// The most memory a BAR handed out may cover: 256 MiB, the biggest a
+/// PC's 32-bit PCI hole commonly gives one device (a display's).
+const BAR_MAX: u64 = 256 << 20;
 
-/// The PCI class of an AHCI controller: storage, SATA, AHCI 1.0.
-const AHCI_CLASS: (u8, u8, u8) = (0x01, 0x06, 0x01);
-/// And where its registers are: BAR 5 ("ABAR").
-const AHCI_BAR: u8 = 5;
-/// The PCI class of an NVMe controller: storage, non-volatile memory,
-/// NVMe.
-const NVME_CLASS: (u8, u8, u8) = (0x01, 0x08, 0x02);
-/// Its registers: BAR 0 (64 bits wide).
-const NVME_BAR: u8 = 0;
-/// Intel's Ethernet cards of the e1000 family that `e1000` drives: the
-/// 82540EM, 82545EM, 82543GC and 82574L (`e1000::MODELS`). Their
-/// registers are in BAR 0, 128 KiB.
-const INTEL_VENDOR: u16 = 0x8086;
-const INTEL_NICS: [u16; 4] = [0x100E, 0x100F, 0x1004, 0x10D3];
-/// The PCI class of an xHCI (USB 3) host controller: serial bus, USB,
-/// xHCI. Its registers are in BAR 0.
-const XHCI_CLASS: (u8, u8, u8) = (0x0C, 0x03, 0x30);
-/// An NVMe driver needs the registers (a page) and the doorbells of two
-/// queue pairs after them: two pages when the doorbells are 4 bytes
-/// apart, as nearly always. (Wider, and the driver finds them out of
-/// its reach and says so.)
-const NVME_REGISTERS_MIN: u64 = 0x2000;
+/// The BARs of each function found, sized at boot (device.rs: sizing
+/// switches decoding off for a moment, which a device in use must never
+/// see - so it is done once, before any driver runs).
+static BARS: kernel64::sync::SpinLock<Vec<(Address, [Option<Bar>; 6])>> = kernel64::sync::SpinLock::new(Vec::new());
 
-/// How a device is handed on.
-#[derive(Clone, Copy)]
-enum Kind {
-    /// Registers in I/O ports (BAR 0); MSI-X or polled.
-    VirtioLegacy,
-    /// Registers in memory (BAR 5); MSI-X, MSI or polled.
-    Ahci,
-    /// Registers in memory (BAR 0, cut short of any MSI-X structure in
-    /// it); MSI-X, MSI or polled.
-    Nvme,
-    /// Registers in memory (BAR 0); MSI or polled. Not MSI-X: an
-    /// 82574L in MSI-X mode routes each cause to a vector of its own
-    /// (IVAR), which `e1000` does not set up; with MSI it behaves as the
-    /// 82540EM does.
-    Intel,
-    /// Registers in memory (BAR 0); MSI, else MSI-X, else polled. MSI
-    /// first: an xHCI controller's MSI-X table is usually in BAR 0 among
-    /// its registers, and with MSI-X never turned on the table is inert
-    /// (writing it makes no interrupt and no memory write), so the
-    /// whole BAR can be the driver's. Only a controller without MSI
-    /// (QEMU's `qemu-xhci`) gets MSI-X, and the BAR cut short at the
-    /// table as an NVMe controller's is; the driver checks that its
-    /// registers are all before the cut.
-    Xhci,
-}
-
-/// What a device this kernel can hand on is called, how, and how much
-/// DMA memory its driver gets. None: no driver for it.
-fn offered(device: &Device) -> Option<(&'static str, Kind, u64)> {
-    if (device.class, device.subclass, device.prog_if) == AHCI_CLASS {
-        return Some(("AHCI controller", Kind::Ahci, AHCI_DMA_PAGES));
-    }
-    if (device.class, device.subclass, device.prog_if) == NVME_CLASS {
-        return Some(("NVMe controller", Kind::Nvme, NVME_DMA_PAGES));
-    }
-    if device.vendor == INTEL_VENDOR && INTEL_NICS.contains(&device.device) {
-        return Some(("Intel Ethernet card", Kind::Intel, INTEL_DMA_PAGES));
-    }
-    if (device.class, device.subclass, device.prog_if) == XHCI_CLASS {
-        return Some(("USB controller", Kind::Xhci, XHCI_DMA_PAGES));
-    }
-    if device.vendor != virtio::PCI_VENDOR {
-        return None;
-    }
-    match device.device {
-        virtio::PCI_DEVICE_BLOCK => Some(("virtio block device", Kind::VirtioLegacy, BLOCK_DMA_PAGES)),
-        virtio::PCI_DEVICE_NETWORK => Some(("virtio network card", Kind::VirtioLegacy, NETWORK_DMA_PAGES)),
-        _ => None,
-    }
-}
-
-/// Scans the bus and sends init a message for each device it can drive.
+/// Scans the bus and hands every function to init.
 pub fn offer(to_init: &Object) {
     let mut config = Ports;
     let devices = pci::scan(&mut config);
+    let mut handed = 0;
     for d in &devices {
         kprintln!(
-            "[pci] {} {:04x}:{:04x} class {:02x}.{:02x} {}",
-            d.address, d.vendor, d.device, d.class, d.subclass, d.kind()
+            "[pci] {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x}",
+            d.address, d.vendor, d.device, d.class, d.subclass, d.prog_if
         );
-    }
-    for (device, (what, kind, dma_pages)) in devices.iter().filter_map(|device| Some((device, offered(device)?))) {
-        match prepare(&mut config, device, kind, dma_pages) {
-            Ok((info, handles)) => {
-                let mut message = b"pci".to_vec();
-                message.extend_from_slice(&info.to_bytes());
-                match ipc::kernel_send(to_init, &message, handles) {
-                    Ok(()) => kprintln!(
-                        "[pci] {} {what}: {}, {} KiB DMA at {:#x}, {} - handed to init",
-                        device.address,
-                        Registers(&info),
-                        info.dma_size / 1024,
-                        info.dma_physical,
-                        match (info.msix, info.msi) {
-                            (true, _) => "MSI-X",
-                            (_, true) => "MSI",
-                            _ => "no interrupt (polled)",
-                        }
-                    ),
-                    Err(error) => kprintln!("[pci] {}: could not hand it to init: {error:?}", device.address),
-                }
-            }
-            Err(why) => kprintln!("[pci] {} {what} not usable: {why}", device.address),
+        BARS.lock().push((d.address, size_bars(&mut config, d)));
+        let info = PciDeviceInfo {
+            bus: d.address.bus,
+            device: d.address.device,
+            function: d.address.function,
+            vendor_id: d.vendor,
+            device_id: d.device,
+            class: d.class,
+            subclass: d.subclass,
+            interface: d.prog_if,
+            ..PciDeviceInfo::default()
+        };
+        let mut message = b"pci".to_vec();
+        message.extend_from_slice(&info.to_bytes());
+        let handle = Object::Device(Arc::new(Device::new(Bus::Pci(d.address))));
+        match ipc::kernel_send(to_init, &message, alloc::vec![(handle, Rights::ALL)]) {
+            Ok(()) => handed += 1,
+            Err(error) => kprintln!("[pci] {}: could not hand it to init: {error:?}", d.address),
         }
     }
+    kprintln!("[pci] {handed} of {} functions handed to init, each with a handle to ask for its BARs, interrupt and DMA memory", devices.len());
 }
 
-type Handles = Vec<(Object, Rights)>;
-
-/// The registers part of a boot-log line.
-struct Registers<'a>(&'a PciDeviceInfo);
-
-impl core::fmt::Display for Registers<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let info = self.0;
-        if info.registers_in_memory() {
-            write!(f, "registers {:#x}+{:#x}", info.registers, info.registers_size)
-        } else {
-            write!(f, "ports {:#x}+{:#x}", info.io_base, info.io_size)
-        }
+/// Every BAR of an ordinary device (header type 0); a bridge's are the
+/// bus's, not a driver's, and it gets none. A 64-bit memory BAR takes
+/// two slots: the second is not one of its own.
+fn size_bars(config: &mut Ports, device: &pci::Device) -> [Option<Bar>; 6] {
+    let mut bars = [None; 6];
+    if device.header_type & 0x7F != 0 {
+        return bars;
     }
+    let mut index = 0;
+    while index < 6 {
+        let raw = config.read32(device.address, 0x10 + 4 * index);
+        bars[usize::from(index)] = pci::bar(config, device.address, index);
+        let wide = raw & 1 == 0 && (raw >> 1) & 0x3 == 0x2;
+        index += if wide { 2 } else { 1 };
+    }
+    bars
 }
 
-fn prepare(config: &mut Ports, device: &Device, kind: Kind, dma_pages: u64) -> Result<(PciDeviceInfo, Handles), &'static str> {
-    let address = device.address;
-    let mut info = PciDeviceInfo {
-        bus: address.bus,
-        device: address.device,
-        function: address.function,
-        vendor_id: device.vendor,
-        device_id: device.device,
-        class: device.class,
-        subclass: device.subclass,
-        interface: device.prog_if,
-        ..PciDeviceInfo::default()
+/// abi::device::CONFIG_READ.
+pub fn config_read(address: Address, offset: u64, width: u64) -> Result<u64, Error> {
+    if !matches!(width, 1 | 2 | 4) || offset % width != 0 || offset + width > 256 {
+        return Err(Error::InvalidArgument);
+    }
+    let word = Ports.read32(address, (offset & !3) as u8);
+    let shift = 8 * (offset & 3);
+    let mask = if width == 4 { u64::from(u32::MAX) } else { (1 << (8 * width)) - 1 };
+    Ok((u64::from(word) >> shift) & mask)
+}
+
+/// abi::device::BAR.
+pub fn bar(device: &Device, n: u64) -> Result<(Object, BarInfo), Error> {
+    let Bus::Pci(address) = device.bus;
+    let found = BARS.lock().iter().find(|(at, _)| *at == address).map(|(_, bars)| bars.get(n as usize).copied().flatten());
+    let Some(Some(found)) = found else {
+        return Err(Error::InvalidArgument);
     };
-    // Whether MSI-X is the device's interrupt (see Kind).
-    let use_msix = match kind {
-        Kind::Intel => false,
-        Kind::Xhci => pci::msi(config, address).is_none(),
-        _ => true,
-    };
-    // The registers, as a capability.
-    let registers = match kind {
-        Kind::VirtioLegacy => {
-            let Some(Bar::Io { base, size }) = pci::bar(config, address, 0) else {
-                return Err("BAR 0 is not I/O ports (not a legacy-capable device)");
-            };
+    let mut config = Ports;
+    let handed = match found {
+        Bar::Io { base, size } => {
             if base == 0 || base + size > 0x1_0000 {
-                return Err("BAR 0 has no usable port range");
+                return Err(Error::InvalidArgument);
             }
-            info.io_base = base as u16;
-            info.io_size = size as u16;
-            Object::IoPorts(base..base + size)
+            (Object::IoPorts(base..base + size), BarInfo { base: u64::from(base), size: u64::from(size), io: true })
         }
-        Kind::Ahci | Kind::Nvme | Kind::Intel | Kind::Xhci => {
-            let (bar, missing) = match kind {
-                Kind::Nvme => (NVME_BAR, "BAR 0 is not memory (no NVMe registers)"),
-                Kind::Intel => (0, "BAR 0 is not memory (no e1000 registers)"),
-                Kind::Xhci => (0, "BAR 0 is not memory (no xHCI registers)"),
-                _ => (AHCI_BAR, "BAR 5 is not memory (no AHCI registers)"),
-            };
-            let Some(Bar::Memory { base, mut size, .. }) = pci::bar(config, address, bar) else {
-                return Err(missing);
-            };
-            if base == 0 || size > REGISTERS_MAX {
-                return Err("the registers' BAR has no usable memory range");
+        Bar::Memory { base, mut size, .. } => {
+            if base == 0 || size > BAR_MAX {
+                return Err(Error::InvalidArgument);
             }
-            // An MSI-X table in the same BAR (NVMe controllers often put
-            // it after the doorbells) is the kernel's: a driver that
-            // could write it could make the device write any memory it
-            // likes - an interrupt message is a memory write. So the
-            // driver gets the BAR up to the first MSI-X structure in it,
-            // whole pages only (the page is what a mapping protects).
-            // Not where MSI-X stays off (an xHCI controller with MSI).
-            if let Some(start) = pci::msix(config, address).and_then(|msix| msix.first_in(bar)).filter(|_| use_msix) {
+            // An MSI-X table in this BAR (NVMe controllers often put it
+            // after the doorbells) is the kernel's: a driver that could
+            // write it could make the device write any memory it likes
+            // - an interrupt message is a memory write. So the driver
+            // gets the BAR up to the first MSI-X structure in it, whole
+            // pages only (the page is what a mapping protects) - unless
+            // the device's interrupt is MSI, given before: MSI-X then
+            // stays off for good, and its table is inert (writing it
+            // makes no interrupt and no memory write). An xHCI
+            // controller's table is usually among its registers.
+            let msi_for_good = device.interrupt_kind() == Some(op::MSI);
+            if let Some(start) = pci::msix(&mut config, address).and_then(|msix| msix.first_in(n as u8)).filter(|_| !msi_for_good) {
                 size = size.min(u64::from(start) & !0xFFF);
             }
-            if matches!(kind, Kind::Nvme) && size < NVME_REGISTERS_MIN {
-                return Err("BAR 0 leaves no room for the doorbells before the MSI-X table");
+            if size == 0 {
+                return Err(Error::AccessDenied); // all of it the kernel's
             }
-            info.registers = base;
-            info.registers_size = size;
             // Device registers: never cached - every read must reach
             // the device, every write leave at once and in order.
             let memory = MemoryObject::device(base, size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
-            Object::Memory(Arc::new(memory))
+            (Object::Memory(Arc::new(memory)), BarInfo { base, size, io: false })
         }
     };
+    decode(device, &mut config, address);
+    Ok(handed)
+}
 
-    // Decode its registers, let it do DMA, and no pin interrupts.
-    let command = pci::command(config, address);
-    pci::set_command(
-        config,
-        address,
-        command | pci::COMMAND_IO | pci::COMMAND_MEMORY | pci::COMMAND_BUS_MASTER | pci::COMMAND_INTX_DISABLE,
-    );
+/// Decoding of its registers on, DMA allowed, no pin interrupts - the
+/// first time a BAR or an interrupt is asked for. (K77 will tie bus
+/// mastering to a handle; until then it stays on.)
+fn decode(device: &Device, config: &mut Ports, address: Address) {
+    device.decode(|| {
+        let command = pci::command(config, address);
+        pci::set_command(
+            config,
+            address,
+            command | pci::COMMAND_IO | pci::COMMAND_MEMORY | pci::COMMAND_BUS_MASTER | pci::COMMAND_INTX_DISABLE,
+        );
+    });
+}
 
-    let (dma, dma_physical) = MemoryObject::contiguous(dma_pages).ok_or("no contiguous memory for DMA")?;
-    info.dma_physical = dma_physical;
-    info.dma_size = dma.size();
-    let mut handles: Handles = alloc::vec![(registers, Rights::ALL), (Object::Memory(Arc::new(dma)), Rights::ALL)];
-
-    // A legacy virtio device is told which MSI-X entry to use, and has
-    // no other way; AHCI and NVMe controllers take whichever they have;
-    // an Intel card gets MSI or nothing, a USB controller MSI first (see
-    // Kind::Intel and Kind::Xhci).
-    let msix = if use_msix { msix_to_new_line(config, device) } else { None };
-    let line = match msix {
-        Some(line) => {
-            info.msix = true;
-            Some(line)
-        }
-        None if matches!(kind, Kind::Ahci | Kind::Nvme | Kind::Intel | Kind::Xhci) => {
-            let line = msi_to_new_line(config, device);
-            info.msi = line.is_some();
-            line
-        }
-        None => None,
+/// abi::device::INTERRUPT, the first time: a new line, and the device's
+/// message pointed at it.
+pub fn interrupt(device: &Device, kind: u64) -> Result<&'static interrupts::InterruptLine, Error> {
+    let Bus::Pci(address) = device.bus;
+    let mut config = Ports;
+    // Its MSI-X table is in a BAR, which must decode for the table to
+    // be written.
+    decode(device, &mut config, address);
+    let line = match kind {
+        op::MSIX => msix_to_new_line(&mut config, address),
+        op::MSI => msi_to_new_line(&mut config, address),
+        _ => return Err(Error::InvalidArgument),
     };
-    if let Some(line) = line {
-        handles.push((Object::Interrupt(line), Rights::ALL));
-    }
-    Ok((info, handles))
+    line.ok_or(Error::NotFound)
 }
 
 /// Points the device's MSI-X message 0 at a new device line, and turns
 /// MSI-X on. None if it has no MSI-X, or no line is left.
-fn msix_to_new_line(config: &mut Ports, device: &Device) -> Option<&'static interrupts::InterruptLine> {
-    let msix = pci::msix(config, device.address)?;
-    let Some(Bar::Memory { base, size, .. }) = pci::bar(config, device.address, msix.table_bar) else {
+fn msix_to_new_line(config: &mut Ports, address: Address) -> Option<&'static interrupts::InterruptLine> {
+    let msix = pci::msix(config, address)?;
+    let table_bar = BARS.lock().iter().find(|(at, _)| *at == address).and_then(|(_, bars)| bars[usize::from(msix.table_bar)]);
+    let Some(Bar::Memory { base, size, .. }) = table_bar else {
         return None;
     };
     if u64::from(msix.table_offset) + pci::MSIX_ENTRY_SIZE > size {
@@ -327,17 +217,17 @@ fn msix_to_new_line(config: &mut Ports, device: &Device) -> Option<&'static inte
         table.add(2).write_volatile(message_data);
         table.add(3).write_volatile(0);
     }
-    pci::enable_msix(config, device.address, &msix);
+    pci::enable_msix(config, address, &msix);
     Some(line)
 }
 
 /// Points the device's MSI message at a new device line, and turns MSI
 /// on. None if it has no MSI, or no line is left.
-fn msi_to_new_line(config: &mut Ports, device: &Device) -> Option<&'static interrupts::InterruptLine> {
-    let msi = pci::msi(config, device.address)?;
+fn msi_to_new_line(config: &mut Ports, address: Address) -> Option<&'static interrupts::InterruptLine> {
+    let msi = pci::msi(config, address)?;
     let (n, line) = interrupts::allocate_device_line()?;
     let (vector, cpu) = platform::device_vector(n);
     let (message_address, message_data) = pci::msi_message(cpu, vector);
-    pci::enable_msi(config, device.address, &msi, message_address, message_data);
+    pci::enable_msi(config, address, &msi, message_address, message_data);
     Some(line)
 }

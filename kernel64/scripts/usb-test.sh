@@ -113,7 +113,7 @@ wait
 
 for machine in pc q35 polled hot; do
     L="$LOG.$machine"
-    has "$L" '^\[pci\] .* USB controller: registers 0x[0-9a-f]+\+0x[0-9a-f]+, [0-9]+ KiB DMA at 0x[0-9a-f]+, .* - handed to init$' "the kernel did not hand the xHCI controller on"
+    has "$L" '^\[usb\] [0-9a-f:.]+ [0-9a-f]{4}:[0-9a-f]{4}: registers 0x[0-9a-f]+\+0x[0-9a-f]+ \(BAR 0\), [0-9]+ KiB DMA at 0x[0-9a-f]+, ' "usb was not given the xHCI controller's registers"
     has "$L" '^\[usb\] xHCI [0-9]+\.[0-9a-f]+ controller at ..:..\..: [0-9]+ ports, [0-9]+ scratchpad pages, ' "the driver did not start the controller"
     has "$L" '^\[usb\] port [0-9]+: keyboard \(0627:0001, [a-zA-Z ]+\) ready$' "the keyboard was not enumerated"
     text "$L" | grep -aEq 'KERNEL PANIC|CPU EXCEPTION|\[init\] usb ended|has not answered for|^\[usb\] .*(fails every time|cannot be asked)' && fail "$L: something failed"

@@ -59,6 +59,9 @@ pub enum Object {
     /// has none: its power is ACPI's ports.)
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     Power,
+    /// A device the kernel found, which its holder may ask for the
+    /// device's BARs, interrupt and DMA memory (device.rs, K75).
+    Device(Arc<crate::device::Device>),
 }
 
 /// A handle in flight: the object and the rights it travels with.

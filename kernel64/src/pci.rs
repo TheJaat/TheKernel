@@ -82,30 +82,6 @@ pub struct Device {
     pub header_type: u8,
 }
 
-impl Device {
-    /// A short name for the boot log.
-    pub fn kind(&self) -> &'static str {
-        match (self.class, self.subclass) {
-            (0x01, 0x00) => "SCSI storage",
-            (0x01, 0x01) => "IDE controller",
-            (0x01, 0x06) => "SATA controller",
-            (0x01, 0x08) => "NVMe controller",
-            (0x01, _) => "storage",
-            (0x02, _) => "network",
-            (0x03, _) => "display",
-            (0x04, _) => "multimedia",
-            (0x06, 0x00) => "host bridge",
-            (0x06, 0x01) => "ISA bridge",
-            (0x06, 0x04) => "PCI bridge",
-            (0x06, _) => "bridge",
-            (0x0C, 0x03) => "USB controller",
-            (0x0C, 0x05) => "SMBus",
-            (0x0C, _) => "serial bus",
-            _ => "other",
-        }
-    }
-}
-
 /// Every function on every bus. Brute force - 256 buses x 32 devices -
 /// rather than following bridges: simpler, and still only a few thousand
 /// reads, once, at boot.
@@ -415,7 +391,7 @@ mod tests {
         let virtio = found[4];
         assert_eq!((virtio.vendor, virtio.device, virtio.class, virtio.subclass), (0x1AF4, 0x1001, 1, 0));
         assert_eq!(found[2].prog_if, 0x80);
-        assert_eq!(found[2].kind(), "IDE controller");
+        assert_eq!((found[2].class, found[2].subclass), (0x01, 0x01), "an IDE controller");
     }
 
     #[test]

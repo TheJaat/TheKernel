@@ -13,16 +13,14 @@
 //! the kernel looks at each place: the first registers say whether
 //! anything is there, and what (`virtio::mmio::identify`).
 //!
-//! Then, as on the PC, a device is made ready for a driver (`prepare`):
-//! what a driver needs, each piece a capability -
-//!
-//!   - its registers: a memory object over the page they are in
-//!   - memory it can DMA to: a contiguous memory object, and its
-//!     physical address
-//!   - its interrupt: a shared interrupt of the controller's, set up
-//!     as the tree says, and an Interrupt object for it
-//!
-//! and the kernel does not touch the device again.
+//! Then, as on the PC, every device found is handed to init the same
+//! way (K75, TheTaaJ entry NNN): its description - which virtio kind it
+//! says it is, which interface, where - and a device handle
+//! (device.rs). Which program drives it is init's choice; that program
+//! asks through the handle for its registers (`bar`) and its interrupt
+//! (`interrupt`), and init for its DMA memory. Until K75 the kernel
+//! picked the first disk, the first network card and up to four input
+//! devices, and knew how much DMA memory each kind's driver wanted.
 //!
 //! What this does not protect against. The DMA problem of devices.rs,
 //! unchanged: the device writes wherever its driver tells it. And one
@@ -32,129 +30,76 @@
 //! seven beside it. Real hardware gives each device its own pages; a
 //! kernel that had to share a page between drivers would have to do
 //! the register accesses itself.
-//!
-//! Legacy block, network and input devices are made ready.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use abi::MmioDeviceInfo;
-use kernel64::cap::Rights;
+use abi::device::{self as op, Bar};
+use abi::{Error, MmioDeviceInfo};
 use kernel64::devicetree::{DeviceSlot, Machine};
 use kernel64::paging::Flags;
 use virtio::mmio::{self, Identity, Nothing};
 
+use crate::device::{Bus, Device};
+use crate::interrupts::InterruptLine;
 use crate::ipc::Object;
 use crate::memory_object::MemoryObject;
 use crate::{arch, mm};
 
-/// DMA memory for a block driver: its virtqueue and request buffers -
-/// 36 KiB, then room for abi::block::SECTORS_MAX sectors (128 KiB;
-/// `user/src/bin/blk.rs` says where each lies).
-const BLOCK_DMA_PAGES: u64 = 48;
-/// And for a network card's: two queues, and forty buffers of a frame
-/// each (`user/src/bin/nic.rs` says where each lies).
-const NETWORK_DMA_PAGES: u64 = 40;
-/// And for an input device's: one small queue of events (two pages),
-/// and the events themselves (one).
-const INPUT_DMA_PAGES: u64 = 3;
-/// The most input devices made ready: a keyboard and a pointer, and
-/// room for one more of each.
-const INPUTS_MAX: usize = 4;
-
-/// A device made ready: its description, and the handles a driver is
-/// started with - registers, DMA memory, then the interrupt if there
-/// is one. They can be given again: to the next driver, if one stops.
-pub struct Ready {
-    pub info: MmioDeviceInfo,
-    pub handles: Vec<(Object, Rights)>,
+/// Every device found, as handed to init: its description, and its
+/// device. One device object for each place, made once: whoever else
+/// drives one first (the disk self-test) must use the same object, or
+/// the place's interrupt would be set up twice, two lines for one
+/// interrupt, and only the first would ever hear it.
+pub fn hand_out(found: &[Found]) -> Vec<(MmioDeviceInfo, Arc<Device>)> {
+    found.iter().map(|device| (describe(device), Arc::new(handle(device)))).collect()
 }
 
-/// Makes `found` ready for a driver. After the interrupt controller is
-/// set up: the device's interrupt is one of its lines.
-pub fn prepare(found: &Found) -> Result<Ready, &'static str> {
-    let dma_pages = match found.identity.device {
-        mmio::DEVICE_BLOCK => BLOCK_DMA_PAGES,
-        mmio::DEVICE_NETWORK => NETWORK_DMA_PAGES,
-        mmio::DEVICE_INPUT => INPUT_DMA_PAGES,
-        _ => return Err("no driver for this kind of device yet"),
-    };
-    if found.identity.version != 1 {
-        return Err("the modern interface - no driver speaks it yet");
-    }
-    let slot = &found.slot;
-    let registers = MemoryObject::device(slot.registers.start, slot.registers.size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
-    let (dma, dma_physical) = MemoryObject::contiguous(dma_pages).ok_or("no contiguous memory for DMA")?;
-    let dma_size = dma.size();
-    let mut handles = alloc::vec![
-        (Object::Memory(Arc::new(registers)), Rights::ALL),
-        (Object::Memory(Arc::new(dma)), Rights::ALL),
-    ];
-    // Without an interrupt the driver asks the device again and again
-    // (it polls): slower, and correct.
-    let line = slot.interrupt.and_then(|id| arch::device_interrupt(id, slot.edge));
-    if let Some(line) = line {
-        handles.push((Object::Interrupt(line), Rights::ALL));
-    }
-    let info = MmioDeviceInfo {
+/// The description of a device found: what it says it is, and where.
+/// No DMA memory yet (init asks for it), and `interrupt` says whether
+/// the tree names one to ask for.
+pub fn describe(found: &Found) -> MmioDeviceInfo {
+    MmioDeviceInfo {
         device: found.identity.device,
         version: found.identity.version,
-        registers: slot.registers.start,
-        registers_size: slot.registers.size as u32,
-        dma_physical,
-        dma_size,
-        interrupt: line.is_some(),
-    };
-    kprintln!(
-        "[virtio] {:#x} {}: registers in the page at {:#x}, {} KiB DMA at {:#x}, {} - ready for a driver",
-        slot.registers.start,
-        found.identity.kind(),
-        slot.registers.start & !0xFFF,
-        dma_size / 1024,
-        dma_physical,
-        match (line, slot.interrupt) {
-            (Some(_), Some(id)) => alloc::format!("interrupt {id}, off until its driver waits"),
-            _ => alloc::string::String::from("no interrupt (polled)"),
-        }
-    );
-    Ok(Ready { info, handles })
-}
-
-/// The first block device among `found` that a driver exists for, made
-/// ready; what stands in the way of the others is said.
-pub fn first_disk(found: &[Found]) -> Option<Ready> {
-    first(found, mmio::DEVICE_BLOCK)
-}
-
-/// The same for the first network card.
-pub fn first_network(found: &[Found]) -> Option<Ready> {
-    first(found, mmio::DEVICE_NETWORK)
-}
-
-/// Every input device among `found`, made ready - up to INPUTS_MAX.
-pub fn inputs(found: &[Found]) -> Vec<Ready> {
-    let mut ready = Vec::new();
-    for device in found.iter().filter(|device| device.identity.device == mmio::DEVICE_INPUT) {
-        if ready.len() == INPUTS_MAX {
-            kprintln!("[virtio] {:#x} input device: {INPUTS_MAX} are ready already - not this one", device.slot.registers.start);
-            continue;
-        }
-        match prepare(device) {
-            Ok(device) => ready.push(device),
-            Err(why) => kprintln!("[virtio] {:#x} input device: {why}", device.slot.registers.start),
-        }
+        registers: found.slot.registers.start,
+        registers_size: found.slot.registers.size as u32,
+        dma_physical: 0,
+        dma_size: 0,
+        interrupt: found.slot.interrupt.is_some(),
     }
-    ready
 }
 
-fn first(found: &[Found], kind: u32) -> Option<Ready> {
-    for device in found.iter().filter(|device| device.identity.device == kind) {
-        match prepare(device) {
-            Ok(ready) => return Some(ready),
-            Err(why) => kprintln!("[virtio] {:#x} {}: {why}", device.slot.registers.start, device.identity.kind()),
-        }
+/// A device handle for a device found.
+pub fn handle(found: &Found) -> Device {
+    let slot = &found.slot;
+    Device::new(Bus::Mmio { start: slot.registers.start, size: slot.registers.size, interrupt: slot.interrupt, edge: slot.edge })
+}
+
+/// abi::device::BAR: a place has one, its registers - a memory object
+/// over the page they are in.
+pub fn bar(device: &Device, n: u64) -> Result<(Object, Bar), Error> {
+    let Bus::Mmio { start, size, .. } = device.bus;
+    if n != 0 {
+        return Err(Error::InvalidArgument);
     }
-    None
+    let registers = MemoryObject::device(start, size, Flags::NO_CACHE | Flags::WRITE_THROUGH);
+    Ok((Object::Memory(Arc::new(registers)), Bar { base: start, size, io: false }))
+}
+
+/// abi::device::INTERRUPT, the first time: the line the tree names, set
+/// up as it says (edge or level). Off until its driver waits.
+pub fn interrupt(device: &Device, kind: u64) -> Result<&'static InterruptLine, Error> {
+    let Bus::Mmio { start, interrupt, edge, .. } = device.bus;
+    if kind != op::WIRED {
+        return Err(Error::InvalidArgument);
+    }
+    let id = interrupt.ok_or(Error::NotFound)?;
+    let line = arch::device_interrupt(id, edge).ok_or(Error::NotFound)?;
+    // Not "[virtio] 0x...: " - that is how each device found is
+    // reported, once, and aarch64-test.sh counts those lines.
+    kprintln!("[virtio] interrupt {id} set up for the device at {start:#x}'s driver, off until it waits");
+    Ok(line)
 }
 
 /// A virtio device found in one of the tree's places.

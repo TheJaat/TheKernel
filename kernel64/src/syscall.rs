@@ -87,6 +87,7 @@ pub fn dispatch(number: u64, args: [u64; 6]) -> u64 {
         call::MEMORY_DISCARD => process::discard_memory(args[0], args[1]),
         call::SCHED_SET => ipc::sched_set(args[0], args[1], args[2], args[3]),
         call::SCHED_GET => ipc::sched_get(args[0], args[1], args[2]),
+        call::DEVICE => crate::device::call(args[0], args[1], args[2], args[3]),
         // Taken before dispatch, by the architecture's own code: it
         // changes every register. Here only if that code did not.
         call::SIGNAL_RETURN => Err(Error::UnknownCall),

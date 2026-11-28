@@ -233,7 +233,10 @@ boot() {
             else
                 did="read-only - every write refused"; mode=", read-only"; checks=340
             fi
-            need "$log" "\[virtio\] 0xa003e00 block device: registers in the page at 0xa003000, 192 KiB DMA at 0x4[0-9a-f]+000, interrupt 79, off until its driver waits - ready for a driver"
+            # K75: the kernel sets the interrupt up when blk asks for it,
+            # and blk says what it was given.
+            need "$log" "\[virtio\] interrupt 79 set up for the device at 0xa003e00's driver, off until it waits"
+            need "$log" "\[blk\] 0xa003e00 virtio kind 2: registers in the page at 0xa003000, 192 KiB DMA at 0x4[0-9a-f]+000, an interrupt"
             need "$log" "\[blk\] virtio disk at 0xa003e00: 6143 sectors \(3071 KiB\)$mode(, a write cache \(flushed on commit\))?, queue of 1024, interrupts"
             need "$log" "\[blkcheck\] $checks checks, all passed: 6143 sectors, $did"
             # Twice: the second driver takes over the device the first left.
@@ -432,9 +435,10 @@ DEVICES=1 DISK_TEST=untouched DISK_IMAGE="$OUT/disk-ro.img" QEMU_ARGS="$(disk di
 "$HERE/scripts/dtb-set.py" "$OUT/virt.dtb" "$OUT/level.dtb" virtio_mmio@a003e00 interrupts 0 0x2f 4
 DEVICES=1 DISK_TEST=written DISK_IMAGE="$OUT/disk-level.img" QEMU_ARGS="-dtb $OUT/level.dtb $(disk disk-level)" ALSO="$FOUND \(level\)" job disk-level boot disk-level 1 512 1 2 hvc
 # The same disk on a machine told to offer the newer interface: found,
-# said to have no driver, and not touched.
+# said to have no driver (by init, which picks the drivers: K75),
+# and not touched.
 DEVICES=1 DISK_TEST=unrun DISK_IMAGE="$OUT/modern.img" QEMU_ARGS="-global virtio-mmio.force-legacy=false $(disk modern)" ALSO="\[virtio\] 0xa003e00: block device \(modern interface\), 6143 sectors \(3071 KiB\), interrupt 79 \(edge\)
-\[virtio\] 0xa003e00 block device: the modern interface - no driver speaks it yet
+\[init\] no driver for the device at 0xa003e00 \(virtio kind 2\): the modern interface - no driver speaks it yet
 \[selftest\] disk: no block device a driver exists for - not run" job modern boot modern 1 512 1 2 hvc
 
 # ---- the faults -------------------------------------------------------
