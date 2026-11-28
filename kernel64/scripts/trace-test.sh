@@ -33,13 +33,13 @@ has '^\[kernel\] tracing: 2 rings of [0-9]+ events, handed to init$' "the kernel
 has '^trace: [12]\.[0-9]{2} s on 2 CPUs: [0-9]+ events \(0 lost\)$' "trace did not record two seconds on both CPUs, none lost"
 # Every kind, more than none.
 KINDS=$(text | grep -a '^  by kind:') || fail "trace did not count the events by kind"
-for k in syscall send receive switch fault interrupt; do
+for k in syscall send receive switch fault interrupt sample; do
     echo "$KINDS" | grep -Eq "  $k [1-9][0-9]*( |$)" || fail "no $k events: $KINDS"
 done
 has '^  by CPU:  cpu0 [1-9][0-9]*  cpu1 [1-9][0-9]*$' "trace did not see events on both CPUs"
 has '^ +[0-9]+ kernel +[0-9]+$' "trace did not count the kernel's own events"
 has '^  the last 12 events \(ms from the start, CPU, process, what, value\):$' "trace did not show the last events"
-[ "$(text | grep -acE '^ +[0-9]+\.[0-9]{3}  cpu[01] +[0-9]+ [^ ]+ +(syscall|send|receive|switch|fault|interrupt) +0x[0-9a-f]+$')" -eq 12 ] \
+[ "$(text | grep -acE '^ +[0-9]+\.[0-9]{3}  cpu[01] +[0-9]+ [^ ]+ +(syscall|send|receive|switch|fault|interrupt|sample) +0x[0-9a-f]+$')" -eq 12 ] \
     || fail "the last events did not each have their time, CPU, process, kind and value"
 has '^usage: trace \[-s SECONDS\] \[-e EVENTS\]$' "trace -x did not say how to use it"
 text | grep -aEq 'KERNEL PANIC|CPU EXCEPTION|THE SYSTEM HAS STOPPED|^trace: (this program was not|the handle is not)' && fail "something failed"

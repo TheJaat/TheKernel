@@ -65,7 +65,16 @@ pub fn offer(to_init: &crate::ipc::Object) {
     core::mem::forget(memory.clone());
     TRACE.store(Box::into_raw(Box::new(trace)), Ordering::Release);
     let rights = Rights(abi::rights::READ | abi::rights::WRITE | abi::rights::DUPLICATE | abi::rights::TRANSFER);
-    match crate::ipc::kernel_send(to_init, b"trace", alloc::vec![(Object::Memory(memory), rights)]) {
+    let mut handles = alloc::vec![(Object::Memory(memory), rights)];
+    // And a copy of the kernel's symbols, for the profiler to name the
+    // kernel's functions (K140) - read only.
+    let block = crate::backtrace::block();
+    if let Some((symbols, at)) = MemoryObject::contiguous((block.len() as u64).div_ceil(PAGE_SIZE)) {
+        // SAFETY: fresh frames of our own, through the direct map.
+        unsafe { core::ptr::copy_nonoverlapping(block.as_ptr(), phys_to_virt(PhysAddr::new(at)).as_mut_ptr::<u8>(), block.len()) };
+        handles.push((Object::Memory(Arc::new(symbols)), Rights(abi::rights::READ | abi::rights::DUPLICATE | abi::rights::TRANSFER)));
+    }
+    match crate::ipc::kernel_send(to_init, b"trace", handles) {
         Ok(()) => kprintln!("[kernel] tracing: {cpus} rings of {SLOTS} events, handed to init"),
         Err(error) => kprintln!("[kernel] could not hand tracing to init: {error:?}"),
     }

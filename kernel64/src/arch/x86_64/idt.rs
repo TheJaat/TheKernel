@@ -409,6 +409,10 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
     // 0xFFFF...FFxx; the low byte is the vector.
     let vector = frame.vector & 0xFF;
     if vector >= 32 {
+        // The profiler's sample (K140): where the timer found this CPU.
+        if vector == u64::from(super::platform::TIMER_VECTOR) {
+            crate::tracing::point(abi::trace::kind::SAMPLE, frame.rip);
+        }
         super::platform::handle_interrupt(vector as u8);
         // About to return to user mode - possibly long after the
         // interrupt, if it took the CPU away. A program that never

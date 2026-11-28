@@ -18,6 +18,15 @@ pub struct Block {
 #[used]
 pub static TAAJ_SYMBOLS: Block = Block { magic: MAGIC, rest: [0; BLOCK_SIZE - 8] };
 
+/// The block as the build filled it in: for the profiler's copy (K140).
+pub fn block() -> &'static [u8] {
+    // `black_box`, as in `table`: the bytes the fill script wrote.
+    let at = core::hint::black_box(&raw const TAAJ_SYMBOLS).cast::<u8>();
+    // SAFETY: BLOCK_SIZE bytes of the kernel's read-only data, mapped for
+    // as long as the kernel runs.
+    unsafe { core::slice::from_raw_parts(at, BLOCK_SIZE) }
+}
+
 /// The table, or None in a kernel whose block was never filled in.
 fn table() -> Option<Table<'static>> {
     // The compiler knows what TAAJ_SYMBOLS was compiled as - zeros after

@@ -60,6 +60,11 @@ pub mod kind {
     pub const FAULT: u16 = 5;
     /// An interrupt: its number (the vector on a PC, the GIC's id on Arm).
     pub const INTERRUPT: u16 = 6;
+    /// Where the CPU was when the timer interrupted it (K140, the
+    /// profiler): the address - the kernel's (high) or the event's
+    /// process's (low). On AArch64, at every interrupt (mostly the
+    /// timer's).
+    pub const SAMPLE: u16 = 7;
 
     /// Its name, for showing.
     pub fn name(kind: u16) -> &'static str {
@@ -70,6 +75,7 @@ pub mod kind {
             SWITCH => "switch",
             FAULT => "fault",
             INTERRUPT => "interrupt",
+            SAMPLE => "sample",
             _ => "?",
         }
     }

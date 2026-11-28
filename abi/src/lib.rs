@@ -41,6 +41,9 @@ pub mod log;
 /// Tracing's per-CPU rings, shared by the kernel and whoever holds the
 /// tracing handle (TheTaaJ K139).
 pub mod trace;
+/// The kernel's symbol table: its format and lookup, shared by the
+/// kernel's backtraces and the profiler (TheTaaJ K140).
+pub mod symbols;
 
 pub mod call {
     /// exit(code) - ends the process. Never returns.

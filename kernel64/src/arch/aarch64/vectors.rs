@@ -435,6 +435,9 @@ extern "C" fn exception(vector: u64, frame: &mut Frame) {
     }
     // Slots 1, 5, 9 and 13 are interrupts.
     if vector % 4 == 1 {
+        // The profiler's sample (K140): where the interrupt found this
+        // CPU - at every interrupt here, which is mostly the timer's.
+        crate::tracing::point(abi::trace::kind::SAMPLE, frame.elr);
         super::interrupt();
         // About to return to a program - possibly long after the
         // interrupt, if it took the CPU away. A program that never
