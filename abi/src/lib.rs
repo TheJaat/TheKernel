@@ -1205,6 +1205,26 @@ pub mod display {
         [KEY, code[0], code[1], u8::from(down)]
     }
 
+    /// Followed by a keyboard layout's name (ASCII, 1 to LAYOUT_NAME_MAX
+    /// bytes, "us" or "dvorak"): the characters keys make from now on
+    /// (K116). The display turns every keyboard's keys into characters
+    /// itself, so the layout is chosen there, while running. Sent by the
+    /// shell (`display layout NAME`), which checks the name first.
+    pub const LAYOUT: u8 = 8;
+    pub const LAYOUT_NAME_MAX: usize = 16;
+
+    /// A LAYOUT message and its length; None for a name that is empty,
+    /// too long, or not ASCII.
+    pub fn layout_message(name: &[u8]) -> Option<([u8; 1 + LAYOUT_NAME_MAX], usize)> {
+        if name.is_empty() || name.len() > LAYOUT_NAME_MAX || !name.is_ascii() {
+            return None;
+        }
+        let mut message = [0u8; 1 + LAYOUT_NAME_MAX];
+        message[0] = LAYOUT;
+        message[1..1 + name.len()].copy_from_slice(name);
+        Some((message, 1 + name.len()))
+    }
+
     /// A pointer's report: moved by (x, y) pixels (`absolute` false,
     /// right and down positive), or is at (x, y), each 0..=ABSOLUTE_MAX
     /// across the screen (`absolute` true); and the buttons held, a bit
@@ -2740,6 +2760,19 @@ mod tests {
             assert_eq!(u16::from_le_bytes([message[1], message[2]]), code);
             assert_eq!(message[3] == 1, down);
         }
+    }
+
+    #[test]
+    fn a_layout_message_is_its_name() {
+        use crate::display::{layout_message, LAYOUT, LAYOUT_NAME_MAX};
+        let (message, n) = layout_message(b"dvorak").unwrap();
+        assert_eq!(&message[..n], b"\x08dvorak");
+        assert_eq!(message[0], LAYOUT);
+        let longest = [b'x'; LAYOUT_NAME_MAX];
+        assert_eq!(layout_message(&longest).unwrap().1, 1 + LAYOUT_NAME_MAX);
+        assert_eq!(layout_message(&[b'x'; LAYOUT_NAME_MAX + 1]), None);
+        assert_eq!(layout_message(b""), None);
+        assert_eq!(layout_message("\u{e9}".as_bytes()), None);
     }
 
     #[test]

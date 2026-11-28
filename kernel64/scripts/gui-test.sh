@@ -23,8 +23,13 @@
 #   counter &                  window 2 opens on top, with the focus
 #   click (265, 247)           "+1": clicks 1
 #   type + and a               to counter, not the shell: clicks 2
+#   hold b for 1.2 s           repeated by the display (K116): b, then
+#                              about 17 more after half a second; one up
 #   click (600, 500)           on the terminal: the focus goes back to it
 #   echo back                  the shell gets exactly that - no "+a"
+#   display layout dvorak      then the keys d i j s spc h . s o a v: the
+#                              shell gets "echo dvorak" (K116); and back,
+#                              typed on Dvorak's keys: "display layout us"
 #   drag (100, 90) to (600, 340)   the terminal by its title bar, to (519, 330)
 #   click (430, 162)           counter's close box: it is asked, and closes
 #   echo done                  the focus is the terminal's again
@@ -87,6 +92,9 @@ steps="$(keys 'counter') spc shift-7 ret see:[counter],window"
 go 265 247; steps="$steps $MOVES $(click) see:clicks:,1 shift-equal a see:key,a"
 # Shift alone and Control alone (K42): no byte, but the window is told.
 steps="$steps shift see:key,code,42,up ctrl see:key,code,29,up"
+# A held key (K116): QEMU holds b down for 1.2 s and repeats nothing
+# itself; the display repeats it, the same on every keyboard.
+steps="$steps !sendkey,b,1200 see:key,code,48,up"
 # The wheel turned up once over counter's content (K46): on the PC
 # QEMU's monitor (`mouse_move 0 0 1`: a positive dz is wheel up, which
 # QEMU's PS/2 mouse sends as -1 and the decoder reads as +1, Linux's
@@ -99,6 +107,11 @@ else
 fi
 go 600 500; steps="$steps $MOVES $(click) see:lost,the,focus"
 steps="$steps $(keys 'echo back') ret ~"
+# The layout (K116): Dvorak, typed on its keys, and back to US.
+# Their keys through key-names.py: `keys` above spells only letters and
+# spaces, and "." and ";" are QEMU's "dot" and "semicolon".
+steps="$steps $(keys 'display layout dvorak') ret ~ $(python3 -I "$HERE/key-names.py" 'dijs h.soav') ret ~"
+steps="$steps $(python3 -I "$HERE/key-names.py" 'hg;rpat patsfk f;') ret ~"
 go 100 90; steps="$steps $MOVES $(press)"
 go 600 340; steps="$steps $MOVES $(release) see:moved,to"
 go 430 162; steps="$steps $MOVES $(click) see:window,2,closed"
@@ -128,11 +141,28 @@ said '\[counter\] key code 42 down \(modifiers 1\)' "counter was not told Shift 
 said '\[counter\] key code 42 up \(modifiers 0\)' "counter was not told Shift came up (K42)"
 said '\[counter\] key code 29 down \(modifiers 2\)' "counter was not told Control alone went down (K42)"
 said '\[counter\] key code 29 up \(modifiers 0\)' "counter was not told Control came up (K42)"
+# Repeat (K116): b held 1.2 s - about 17 repeats after the first half
+# second; at least 5, for a loaded host, and no more than 40 (the
+# keyboard's own repeats, if a PS/2 one sent them, are dropped, so a key
+# does not repeat twice over). Each repeat tells the window the key went
+# down again; one up.
+B_KEYS=$(grep -ac '\[counter\] key b' "$LOG")
+B_DOWNS=$(grep -ac '\[counter\] key code 48 down' "$LOG")
+B_UPS=$(grep -ac '\[counter\] key code 48 up' "$LOG")
+[ "$B_KEYS" -ge 6 ] && [ "$B_KEYS" -le 41 ] || fail "b held for 1.2 s came $B_KEYS times, not 6 to 41: the display did not repeat it (K116)"
+[ "$B_DOWNS" -eq "$B_KEYS" ] || fail "b came $B_KEYS times but counter was told it went down $B_DOWNS times (K116)"
+[ "$B_UPS" -eq 1 ] || fail "counter was told b came up $B_UPS times, not once (K116)"
+# The Enter that started counter went down in the terminal: counter is
+# not told it came up (K116; seen in entry 151's first log).
+grep -aq '\[counter\] key code 28 up' "$LOG" && fail "counter was told Enter came up, but its down went to the terminal (K116)"
 said '\[counter\] wheel 1 at \(64, 74\)' "counter was not told the wheel turned up once, under the pointer at (265, 247) (K46)"
 said '\[display\] focus: window 1 "terminal"' "the click on the terminal did not give it the focus"
 said '\[counter\] lost the focus' "counter was not told it lost the focus"
 said '\[shell\] line: "echo back"' "the shell did not get exactly the line typed after the focus came back"
 grep -aq '\[shell\] line: ".*[+a]echo back' "$LOG" && fail "keys typed into counter reached the shell"
+said '\[display\] keyboard layout: dvorak' "the display did not take the Dvorak layout (K116)"
+said '\[shell\] line: "echo dvorak"' "keys typed on Dvorak did not make \"echo dvorak\" (K116)"
+said '\[display\] keyboard layout: us' "\"display layout us\", typed on Dvorak's keys, did not bring US back (K116)"
 said '\[display\] window 1 moved to \(519, 330\)' "the terminal was not dragged to (519, 330)"
 said '\[display\] window 2: its program is asked to close it' "the close box did not ask counter to close"
 said '\[counter\] closed by its close box' "counter did not hear its close box"

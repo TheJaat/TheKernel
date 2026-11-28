@@ -10,6 +10,12 @@ which line ran: under emulation the shell falls behind the typing, and the
 The shell logs each line it runs as `[shell] ran "TEXT"`, TEXT quoted as
 Rust quotes a string; this works out that line from the keys.
 
+The keys name places on the keyboard, and the characters they make
+depend on the layout the display has (K116): after a line that ran
+`display layout dvorak`, the lines after it are worked out in Dvorak,
+until one runs `display layout us`. (Only the display has layouts: the
+serial terminal's keys are the host's, and its tests type no such line.)
+
 As a program: prints, for each "ret" among the keys, the line the shell
 logs when it has run that line - or an empty line when the keys since the
 last Enter are not plain text (arrows, F-keys), and only the old count can
@@ -32,6 +38,14 @@ _SHIFTED = {"1": "!", "2": "@", "3": "#", "4": "$", "6": "^", "8": "*", "9": "("
             "bracket_left": "{", "bracket_right": "}", "semicolon": ":", "slash": "?", "grave_accent": "~"}
 NAMED.update({name: text.encode() for name, text in _PLAIN.items()})
 NAMED.update({"shift-" + name: text.encode() for name, text in _SHIFTED.items()})
+
+# Dvorak (K116), key for key: the character each US character's key
+# makes on it - as input/src/lib.rs's DVORAK_PLAIN and DVORAK_SHIFTED.
+_US = "1234567890-=qwertyuiop[]asdfghjkl;'`\\zxcvbnm,./" + "!@#$%^&*()_+QWERTYUIOP{}ASDFGHJKL:\"~|ZXCVBNM<>?"
+_DVORAK = "1234567890[]',.pyfgcrl/=aoeuidhtns-`\\;qjkxbmwvz" + "!@#$%^&*(){}\"<>PYFGCRL?+AOEUIDHTNS_~|:QJKXBMWVZ"
+assert len(_US) == len(_DVORAK) == 94
+DVORAK = {ord(us): ord(dvorak) for us, dvorak in zip(_US, _DVORAK)}
+LAYOUTS = {b"display layout us": None, b"display layout dvorak": DVORAK}
 
 # Tokens that are not keys: waits, and the typers' own commands.
 NOT_KEYS = ("/", "~", "~~")
@@ -61,6 +75,7 @@ def lines(keys):
     what was typed since the Enter before, or None if that was not plain
     text."""
     text, plain = b"", True
+    layout = None  # US: the keys' own characters
     for key in keys:
         if key in NOT_KEYS or key[:4] == "see:":
             continue
@@ -72,6 +87,8 @@ def lines(keys):
             continue
         if key == "ret":
             yield ran_line(text) if plain and text else None
+            if plain and text in LAYOUTS:
+                layout = LAYOUTS[text]
             text, plain = b"", True
         elif key == "backspace":
             text = text[:-1]
@@ -87,7 +104,7 @@ def lines(keys):
             if typed is None or any(b < 0x20 or b == 0x7f for b in typed):
                 plain = False
             else:
-                text += typed
+                text += bytes(layout.get(b, b) for b in typed) if layout else typed
 
 
 if __name__ == "__main__":
