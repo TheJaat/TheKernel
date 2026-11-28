@@ -1191,6 +1191,19 @@ pub mod display {
     pub const KEYS: u8 = 6;
     /// The most keys one KEYS measures.
     pub const KEYS_MAX: u32 = 200;
+    /// Followed by a key code (u16 LE, Linux's numbering: 42 left Shift,
+    /// 29 left Control, 30 A) and 1 if it went down, 0 if up: every key
+    /// pressed or released, Shift and Control alone included - besides
+    /// the bytes the same key makes for a terminal (K42). Sent by the
+    /// keyboard drivers (kbd, hid, usb) on their copy of this channel.
+    pub const KEY: u8 = 7;
+    pub const KEY_SIZE: usize = 4;
+
+    /// A KEY message.
+    pub fn key_message(code: u16, down: bool) -> [u8; KEY_SIZE] {
+        let code = code.to_le_bytes();
+        [KEY, code[0], code[1], u8::from(down)]
+    }
 
     /// A pointer's report: moved by (x, y) pixels (`absolute` false,
     /// right and down positive), or is at (x, y), each 0..=ABSOLUTE_MAX
@@ -1202,6 +1215,8 @@ pub mod display {
         pub x: i32,
         pub y: i32,
         pub buttons: u8,
+        /// The scroll wheel's clicks, positive away from the user (K46).
+        pub wheel: i8,
     }
 
     /// The range of an absolute position on each axis.
@@ -1209,8 +1224,8 @@ pub mod display {
 
     impl Pointer {
         /// The whole message: POINTER, then whether absolute (0 or 1),
-        /// x and y (i32 LE), the buttons.
-        pub const SIZE: usize = 1 + 1 + 4 + 4 + 1;
+        /// x and y (i32 LE), the buttons, the wheel (i8, K46).
+        pub const SIZE: usize = 1 + 1 + 4 + 4 + 1 + 1;
 
         pub fn to_message(&self) -> [u8; Pointer::SIZE] {
             let mut message = [0u8; Pointer::SIZE];
@@ -1219,6 +1234,7 @@ pub mod display {
             message[2..6].copy_from_slice(&self.x.to_le_bytes());
             message[6..10].copy_from_slice(&self.y.to_le_bytes());
             message[10] = self.buttons;
+            message[11] = self.wheel as u8;
             message
         }
 
@@ -1235,7 +1251,7 @@ pub mod display {
             if absolute && !((0..=ABSOLUTE_MAX).contains(&x) && (0..=ABSOLUTE_MAX).contains(&y)) {
                 return None;
             }
-            Some(Pointer { absolute, x, y, buttons: message[10] })
+            Some(Pointer { absolute, x, y, buttons: message[10], wheel: message[11] as i8 })
         }
     }
 }
@@ -2679,18 +2695,18 @@ mod tests {
     fn a_pointer_message_goes_there_and_back() {
         use crate::display::{self, Pointer, ABSOLUTE_MAX};
         for pointer in [
-            Pointer { absolute: false, x: -256, y: 255, buttons: 1 },
-            Pointer { absolute: false, x: i32::MIN, y: i32::MAX, buttons: 7 },
-            Pointer { absolute: true, x: 0, y: ABSOLUTE_MAX, buttons: 0 },
+            Pointer { absolute: false, x: -256, y: 255, buttons: 1, wheel: 0 },
+            Pointer { absolute: false, x: i32::MIN, y: i32::MAX, buttons: 0x1F, wheel: -128 },
+            Pointer { absolute: true, x: 0, y: ABSOLUTE_MAX, buttons: 0, wheel: 0 },
         ] {
             let message = pointer.to_message();
             assert_eq!(message[0], display::POINTER);
             assert_eq!(Pointer::from_message(&message), Some(pointer));
         }
-        let good = Pointer { absolute: true, x: 5, y: 6, buttons: 2 }.to_message();
-        assert_eq!(Pointer::from_message(&good[..10]), None);
-        let mut longer = [0u8; 12];
-        longer[..11].copy_from_slice(&good);
+        let good = Pointer { absolute: true, x: 5, y: 6, buttons: 2, wheel: 0 }.to_message();
+        assert_eq!(Pointer::from_message(&good[..Pointer::SIZE - 1]), None);
+        let mut longer = [0u8; Pointer::SIZE + 1];
+        longer[..Pointer::SIZE].copy_from_slice(&good);
         assert_eq!(Pointer::from_message(&longer), None);
         let mut wrong = good;
         wrong[0] = display::TEXT;
@@ -2699,10 +2715,31 @@ mod tests {
         wrong[1] = 2;
         assert_eq!(Pointer::from_message(&wrong), None);
         // Absolute, and off the range: refused. Relative: any number.
-        let outside = Pointer { absolute: true, x: ABSOLUTE_MAX + 1, y: 0, buttons: 0 }.to_message();
+        let outside = Pointer { absolute: true, x: ABSOLUTE_MAX + 1, y: 0, buttons: 0, wheel: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
-        let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0 }.to_message();
+        let outside = Pointer { absolute: true, x: 0, y: -1, buttons: 0, wheel: 0 }.to_message();
         assert_eq!(Pointer::from_message(&outside), None);
+    }
+
+    // K42's KEY message, byte for byte as display.rs reads it (KEY, the
+    // code u16 LE, 1 down / 0 up). The night run's coverage floor found
+    // it untested (kernel/abi 86.6% < 87%, 2026-11-28).
+    #[test]
+    fn a_key_message_is_its_code_and_whether_down() {
+        use crate::display::{key_message, KEY, KEY_SIZE};
+        assert_eq!(key_message(42, true), [KEY, 42, 0, 1]);
+        assert_eq!(key_message(29, false), [KEY, 29, 0, 0]);
+        // Codes past 255 (KEY_OK is 352): the high byte second.
+        assert_eq!(key_message(0x0160, true), [KEY, 0x60, 0x01, 1]);
+        assert_eq!(key_message(u16::MAX, false), [KEY, 0xFF, 0xFF, 0]);
+        for (code, down) in [(0u16, false), (30, true), (0x1234, true), (u16::MAX, true)] {
+            let message = key_message(code, down);
+            assert_eq!(message.len(), KEY_SIZE);
+            assert_eq!(message[0], KEY);
+            assert!(message[3] <= 1);
+            assert_eq!(u16::from_le_bytes([message[1], message[2]]), code);
+            assert_eq!(message[3] == 1, down);
+        }
     }
 
     #[test]
